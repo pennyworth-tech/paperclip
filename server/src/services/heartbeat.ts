@@ -542,6 +542,30 @@ export const WORKSPACE_BUSY_HOLDER_STALE_AFTER_MS = RECOVERY_ACTIVE_RUN_OUTPUT_S
 // other value — including agent_default and an absent mode — may still resolve
 // to the shared workspace and counts as a holder.
 const ISOLATED_EXECUTION_WORKSPACE_MODES = ["isolated_workspace", "operator_branch", "isolated"] as const;
+
+// Anti-starvation ceiling for queued-run selection. Selection orders an agent's
+// queued runs by (readiness rank, issue priority, createdAt) and claims only
+// availableSlots of them, so priority dominates age absolutely: while an agent's
+// higher-priority arrival rate meets its service rate, a lower-priority run is
+// outranked forever rather than merely slowly. Once a *claimable* queued run has
+// waited this long it is escalated ahead of the priority tiers and ordered
+// against its escalated peers by createdAt alone. Priority is deliberately not a
+// key inside the escalated set: a steady stream of newly escalated
+// higher-priority runs would otherwise re-starve an older escalated run and the
+// bound would not hold.
+const QUEUED_RUN_STARVATION_CEILING_DEFAULT_MS = 30 * 60 * 1000;
+
+// Resolved per selection pass so an operator can retune the ceiling without a
+// restart. `0` disables the escalation entirely and restores strict
+// priority-over-age selection; anything unparseable or negative falls back to
+// the default rather than silently disabling the bound.
+function resolveQueuedRunStarvationCeilingMs() {
+  const configured = readNonEmptyString(process.env.PAPERCLIP_QUEUED_RUN_STARVATION_CEILING_MS);
+  if (!configured) return QUEUED_RUN_STARVATION_CEILING_DEFAULT_MS;
+  const parsed = Number.parseInt(configured, 10);
+  if (!Number.isFinite(parsed) || parsed < 0) return QUEUED_RUN_STARVATION_CEILING_DEFAULT_MS;
+  return parsed;
+}
 type CodexTransientFallbackMode =
   | "same_session"
   | "safer_invocation"
@@ -12649,7 +12673,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return Number(count ?? 0);
   }
 
-  async function claimQueuedRun(run: typeof heartbeatRuns.$inferSelect, companyAgents?: AgentOrgRow[]) {
+  // `options.claimSlot === false` runs every eligibility check and every
+  // cancellation path below but stops short of taking the run — the caller has
+  // no free slot and only wants permanently-ineligible runs made terminal.
+  async function claimQueuedRun(
+    run: typeof heartbeatRuns.$inferSelect,
+    companyAgents?: AgentOrgRow[],
+    options?: { claimSlot?: boolean },
+  ) {
     if (run.status !== "queued") return run;
     const agent = await getAgent(run.agentId);
     if (!agent) {
@@ -12737,6 +12768,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         return null;
       }
     }
+
+    // Eligibility-only pass: the run survived every cancellation path, so it is
+    // claimable and simply has to wait for a slot.
+    if (options?.claimSlot === false) return null;
 
     const claimedAt = new Date();
     const responsibleUserId = await resolveResponsibleUserIdForRun({
@@ -14107,27 +14142,57 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         );
       const issueById = new Map(issueRows.map((row) => [row.id, row]));
       const companyAgents = await listCompanyAgentOrgRows(agent.companyId);
-      const prioritizedRuns = [...queuedRuns].sort((left, right) => {
-        const leftIssueId = readNonEmptyString(parseObject(left.contextSnapshot).issueId);
-        const rightIssueId = readNonEmptyString(parseObject(right.contextSnapshot).issueId);
-        const leftReadiness = leftIssueId ? dependencyReadiness.get(leftIssueId) : null;
-        const rightReadiness = rightIssueId ? dependencyReadiness.get(rightIssueId) : null;
-        const leftReady = leftIssueId ? (leftReadiness?.isDependencyReady ?? true) : true;
-        const rightReady = rightIssueId ? (rightReadiness?.isDependencyReady ?? true) : true;
-        const leftIssue = leftIssueId ? issueById.get(leftIssueId) : null;
-        const rightIssue = rightIssueId ? issueById.get(rightIssueId) : null;
-        const leftRank = leftIssueId ? (leftReady ? (leftIssue?.status === "in_progress" ? 0 : 1) : 3) : 2;
-        const rightRank = rightIssueId ? (rightReady ? (rightIssue?.status === "in_progress" ? 0 : 1) : 3) : 2;
-        if (leftRank !== rightRank) return leftRank - rightRank;
-        const leftPriorityRank = issueRunPriorityRank(leftIssue?.priority);
-        const rightPriorityRank = issueRunPriorityRank(rightIssue?.priority);
-        if (leftPriorityRank !== rightPriorityRank) return leftPriorityRank - rightPriorityRank;
-        return left.createdAt.getTime() - right.createdAt.getTime();
+      // Decorate once, before sorting: the escalation flag is derived from the
+      // clock, and re-reading it inside the comparator could flip a run's
+      // standing mid-sort, which makes the comparator inconsistent.
+      const selectionNowMs = Date.now();
+      const starvationCeilingMs = resolveQueuedRunStarvationCeilingMs();
+      const rankedRuns = queuedRuns.map((run) => {
+        const context = parseObject(run.contextSnapshot);
+        const issueId = readNonEmptyString(context.issueId);
+        const readiness = issueId ? dependencyReadiness.get(issueId) : null;
+        const ready = issueId ? (readiness?.isDependencyReady ?? true) : true;
+        const issue = issueId ? issueById.get(issueId) : null;
+        const rank = issueId ? (ready ? (issue?.status === "in_progress" ? 0 : 1) : 3) : 2;
+        // A dependency-blocked run is normally unclaimable, but claimQueuedRun's
+        // interaction-wake carve-out lets one through, so it can starve exactly
+        // like a ready run and has to be escalated like one. Runs that genuinely
+        // cannot be claimed are never escalated — the cancellation sweep below
+        // is what resolves those.
+        const claimable = ready || allowsIssueInteractionWake(context);
+        const escalated = starvationCeilingMs > 0
+          && claimable
+          && selectionNowMs - run.createdAt.getTime() >= starvationCeilingMs;
+        return { run, rank, priorityRank: issueRunPriorityRank(issue?.priority), escalated };
       });
+      rankedRuns.sort((left, right) => {
+        // Starvation ceiling: an escalated run outranks every non-escalated run,
+        // and escalated runs are ordered by createdAt alone. Below the ceiling
+        // nothing changes — readiness, then priority, then age — so priority
+        // still wins every ordinary contested case.
+        if (left.escalated !== right.escalated) return left.escalated ? -1 : 1;
+        if (!left.escalated) {
+          if (left.rank !== right.rank) return left.rank - right.rank;
+          if (left.priorityRank !== right.priorityRank) return left.priorityRank - right.priorityRank;
+        }
+        return left.run.createdAt.getTime() - right.run.createdAt.getTime();
+      });
+      const prioritizedRuns = rankedRuns.map((ranked) => ranked.run);
 
       const claimedRuns: Array<typeof heartbeatRuns.$inferSelect> = [];
       for (const queuedRun of prioritizedRuns) {
-        if (claimedRuns.length >= availableSlots) break;
+        if (claimedRuns.length >= availableSlots) {
+          // Out of slots, but every cancellation path lives inside
+          // claimQueuedRun, which selection reaches only for the runs it can
+          // claim. A run that can never be claimed — agent gone or not
+          // invokable, budget or daily cap exhausted, subtree pause hold,
+          // unresolved blockers, stale issue — would otherwise stay queued
+          // forever and keep holding its issue's executionRunId. Evaluate its
+          // eligibility without taking a slot so it still becomes terminal,
+          // with the same errorCode selection would have produced.
+          await claimQueuedRun(queuedRun, companyAgents, { claimSlot: false });
+          continue;
+        }
         const claimed = await claimQueuedRun(queuedRun, companyAgents);
         if (claimed) claimedRuns.push(claimed);
       }
