@@ -718,6 +718,9 @@ type PaperclipWakePayload = {
   missingCount: number;
   truncated: boolean;
   fallbackFetchNeeded: boolean;
+  // True when this wake is an @-mention that carries no comment grant, so the
+  // woken agent cannot write to the issue thread it was woken for.
+  mentionThreadReadOnly: boolean;
 };
 
 function normalizePaperclipWakeRecovery(value: unknown): PaperclipWakeRecovery | null {
@@ -1407,6 +1410,7 @@ export function normalizePaperclipWakePayload(value: unknown): PaperclipWakePayl
     missingCount: asNumber(commentWindow.missingCount, 0),
     truncated: asBoolean(payload.truncated, false),
     fallbackFetchNeeded: asBoolean(payload.fallbackFetchNeeded, false),
+    mentionThreadReadOnly: asBoolean(payload.mentionThreadReadOnly, false),
   };
 }
 
@@ -1573,6 +1577,7 @@ export function renderPaperclipWakePrompt(
         ]
       : []),
     `- fallback fetch needed: ${normalized.fallbackFetchNeeded ? "yes" : "no"}`,
+    ...(normalized.mentionThreadReadOnly ? ["- issue thread writable by you: no"] : []),
     ...(recoveryScoped
       ? [
           `- recovery cause: ${recovery?.cause ?? "unknown"}`,
@@ -1626,6 +1631,13 @@ export function renderPaperclipWakePrompt(
   }
   if (normalized.issue?.priority) {
     lines.push(`- issue priority: ${normalized.issue.priority}`);
+  }
+  if (normalized.mentionThreadReadOnly) {
+    lines.push(
+      "",
+      "You were mentioned on this issue, but an authorization check run when this wake was enqueued said you may not comment on it. Expect comments, issue updates and work products on this thread to be refused — do not spend the run retrying them.",
+      "The check is advisory: it runs before your run exists, so it cannot see run-scoped policy and can be wrong in either direction. Read the thread and act on what the mention asks of you. If you need to reply and a write here is refused, reference this issue from one you can write to.",
+    );
   }
   const issueDescription = normalized.issue?.description ?? null;
   // Resume deltas skip the description: the session already received the brief

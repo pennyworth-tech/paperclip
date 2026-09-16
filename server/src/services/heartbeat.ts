@@ -5654,6 +5654,14 @@ export function mergeCoalescedContextSnapshot(
   if (!hasInteractionContinuationWakeContext(incoming)) {
     clearInteractionContinuationWakeContext(merged);
   }
+  // Thread writability is a property of the wake being merged in, not a sticky
+  // fact about the run. A later wake that does not claim a read-only thread —
+  // a mention that does carry a grant, or any non-mention wake — must clear an
+  // earlier mention's flag, or a spread-merge would keep warning the agent off
+  // a thread it can now write to.
+  if (incoming.mentionThreadReadOnly !== true) {
+    delete merged.mentionThreadReadOnly;
+  }
   return merged;
 }
 
@@ -5972,6 +5980,7 @@ export async function buildPaperclipWakePayload(input: {
     checkboxSelection: Object.keys(checkboxSelection).length > 0 ? checkboxSelection : null,
     checkedOutByHarness: input.contextSnapshot[PAPERCLIP_HARNESS_CHECKOUT_KEY] === true,
     simplifiedEnglishInteractions: input.simplifiedEnglishInteractions === true,
+    mentionThreadReadOnly: input.contextSnapshot.mentionThreadReadOnly === true,
     dependencyBlockedInteraction: input.contextSnapshot.dependencyBlockedInteraction === true,
     treeHoldInteraction: input.contextSnapshot.treeHoldInteraction === true,
     activeTreeHold: parseObject(input.contextSnapshot.activeTreeHold),

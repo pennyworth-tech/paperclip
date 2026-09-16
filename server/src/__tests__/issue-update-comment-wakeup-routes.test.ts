@@ -26,6 +26,29 @@ const mockHeartbeatService = vi.hoisted(() => ({
   getActiveRunForAgent: vi.fn(async () => null),
   cancelRun: vi.fn(async () => null),
 }));
+type DecideInput = { action?: string; actor?: { type?: string; agentId?: string | null } };
+
+const allowDecision = (action: string | undefined) => ({
+  allowed: true,
+  action,
+  reason: "allow_explicit_grant",
+  explanation: "Allowed by test grant.",
+});
+
+// Hoisted so a test can control the verdict. `issueRoutes` calls
+// `accessService(db)` once at router construction, so an inline factory that
+// returns a fresh object per call leaves nothing to configure.
+const mockAccessService = vi.hoisted(() => ({
+  canUser: vi.fn(async () => true),
+  decide: vi.fn(async (input: { action?: string }) => ({
+    allowed: true,
+    action: input.action,
+    reason: "allow_explicit_grant",
+    explanation: "Allowed by test grant.",
+  })),
+  hasPermission: vi.fn(async () => true),
+}));
+
 const mockIssueThreadInteractionService = vi.hoisted(() => ({
   expirePendingInteractionsForTerminalIssue: vi.fn(async () => []),
   expireRequestConfirmationsSupersededByComment: vi.fn(async () => []),
@@ -36,16 +59,7 @@ vi.mock("../services/index.js", () => ({
   companyService: () => ({
     getById: vi.fn(async () => ({ id: "company-1" })),
   }),
-  accessService: () => ({
-    canUser: vi.fn(async () => true),
-    decide: vi.fn(async (input: { action?: string }) => ({
-      allowed: true,
-      action: input.action,
-      reason: "allow_explicit_grant",
-      explanation: "Allowed by test grant.",
-    })),
-    hasPermission: vi.fn(async () => true),
-  }),
+  accessService: () => mockAccessService,
   agentService: () => ({
     getById: vi.fn(async () => null),
     resolveByReference: vi.fn(async (_companyId: string, raw: string) => ({
@@ -108,16 +122,7 @@ function registerModuleMocks() {
     companyService: () => ({
       getById: vi.fn(async () => ({ id: "company-1" })),
     }),
-    accessService: () => ({
-      canUser: vi.fn(async () => true),
-      decide: vi.fn(async (input: { action?: string }) => ({
-        allowed: true,
-        action: input.action,
-        reason: "allow_explicit_grant",
-        explanation: "Allowed by test grant.",
-      })),
-      hasPermission: vi.fn(async () => true),
-    }),
+    accessService: () => mockAccessService,
     agentService: () => ({
       getById: vi.fn(async () => null),
       resolveByReference: vi.fn(async (_companyId: string, raw: string) => ({
@@ -229,6 +234,9 @@ describe("issue update comment wakeups", () => {
     vi.doUnmock("../middleware/index.js");
     registerModuleMocks();
     vi.clearAllMocks();
+    // clearAllMocks keeps implementations, so a verdict installed by one test
+    // would otherwise leak into the next.
+    mockAccessService.decide.mockImplementation(async (input: DecideInput) => allowDecision(input.action));
     mockIssueService.findMentionedAgents.mockResolvedValue([]);
     mockIssueService.getByIdForUpdate.mockImplementation(async () => mockIssueService.getById());
     mockIssueService.getRelationSummaries.mockResolvedValue({ blockedBy: [], blocks: [] });
@@ -680,5 +688,146 @@ describe("issue update comment wakeups", () => {
         }),
       }),
     );
+  });
+
+  // A mention only carries a comment grant when its author is the issue's
+  // current assignee (or an active company user). Without one, the woken agent
+  // can do nothing on the thread but collect a 403, so the wake has to say so.
+  const denyMentionedAgentComments = () => {
+    mockAccessService.decide.mockImplementation(async (input: DecideInput) => {
+      if (
+        input.action === "issue:comment" &&
+        input.actor?.type === "agent" &&
+        input.actor?.agentId === MENTIONED_AGENT_ID
+      ) {
+        return {
+          allowed: false,
+          action: input.action,
+          reason: "deny_missing_grant",
+          explanation: "Mention carries no comment grant.",
+        };
+      }
+      return allowDecision(input.action);
+    });
+  };
+
+  it("marks a comment mention wake read-only when the mention carries no comment grant", async () => {
+    denyMentionedAgentComments();
+    const existing = makeIssue({
+      assigneeAgentId: ASSIGNEE_AGENT_ID,
+      assigneeUserId: null,
+      status: "in_progress",
+    });
+    mockIssueService.getById.mockResolvedValue(existing);
+    mockIssueService.addComment.mockResolvedValue({
+      id: "comment-ungranted-mention",
+      issueId: existing.id,
+      companyId: existing.companyId,
+      body: "[@QA](/agents/33333333-3333-4333-8333-333333333333) heads up",
+    });
+    mockIssueService.findMentionedAgents.mockResolvedValue([MENTIONED_AGENT_ID]);
+
+    const res = await request(await createApp())
+      .post(`/api/issues/${existing.id}/comments`)
+      .send({ body: "[@QA](/agents/33333333-3333-4333-8333-333333333333) heads up" });
+
+    expect(res.status).toBe(201);
+    await vi.waitFor(() => expect(mockHeartbeatService.wakeup).toHaveBeenCalledTimes(2));
+    // The wake is still dispatched — the mention may be informative — but the
+    // payload tells the agent the thread is not writable by it.
+    expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
+      MENTIONED_AGENT_ID,
+      expect.objectContaining({
+        reason: "issue_comment_mentioned",
+        contextSnapshot: expect.objectContaining({
+          wakeReason: "issue_comment_mentioned",
+          mentionThreadReadOnly: true,
+        }),
+      }),
+    );
+    expect(mockAccessService.decide).toHaveBeenCalledWith(
+      expect.objectContaining({
+        action: "issue:comment",
+        actor: expect.objectContaining({ type: "agent", agentId: MENTIONED_AGENT_ID }),
+        resource: expect.objectContaining({
+          type: "issue",
+          issueId: existing.id,
+          assigneeAgentId: ASSIGNEE_AGENT_ID,
+        }),
+      }),
+    );
+  });
+
+  it("leaves a comment mention wake writable when the mention does carry a grant", async () => {
+    const existing = makeIssue({
+      assigneeAgentId: ASSIGNEE_AGENT_ID,
+      assigneeUserId: null,
+      status: "in_progress",
+    });
+    mockIssueService.getById.mockResolvedValue(existing);
+    mockIssueService.addComment.mockResolvedValue({
+      id: "comment-granted-mention",
+      issueId: existing.id,
+      companyId: existing.companyId,
+      body: "[@QA](/agents/33333333-3333-4333-8333-333333333333) please take this",
+    });
+    mockIssueService.findMentionedAgents.mockResolvedValue([MENTIONED_AGENT_ID]);
+
+    const res = await request(await createApp())
+      .post(`/api/issues/${existing.id}/comments`)
+      .send({ body: "[@QA](/agents/33333333-3333-4333-8333-333333333333) please take this" });
+
+    expect(res.status).toBe(201);
+    await vi.waitFor(() => expect(mockHeartbeatService.wakeup).toHaveBeenCalledTimes(2));
+    expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
+      MENTIONED_AGENT_ID,
+      expect.objectContaining({
+        reason: "issue_comment_mentioned",
+        contextSnapshot: expect.objectContaining({
+          wakeReason: "issue_comment_mentioned",
+          mentionThreadReadOnly: false,
+        }),
+      }),
+    );
+  });
+
+  // The same enqueue exists on the update path, and fixing only the comment
+  // route would leave every mention typed into a PATCH body unguarded.
+  it("marks an ungranted mention read-only on the issue update path too", async () => {
+    const existing = makeIssue({ assigneeAgentId: ASSIGNEE_AGENT_ID, assigneeUserId: null });
+    const updated = makeIssue({
+      assigneeAgentId: ASSIGNEE_AGENT_ID,
+      assigneeUserId: null,
+      status: "in_progress",
+    });
+    denyMentionedAgentComments();
+    mockIssueService.getById.mockResolvedValue(existing);
+    mockIssueService.update.mockResolvedValue(updated);
+    mockIssueService.addComment.mockResolvedValue({
+      id: "comment-update-mention",
+      issueId: existing.id,
+      companyId: existing.companyId,
+      body: "[@QA](/agents/33333333-3333-4333-8333-333333333333) fyi",
+    });
+    mockIssueService.findMentionedAgents.mockResolvedValue([MENTIONED_AGENT_ID]);
+
+    const res = await request(await createApp())
+      .patch(`/api/issues/${existing.id}`)
+      .send({
+        status: "in_progress",
+        comment: "[@QA](/agents/33333333-3333-4333-8333-333333333333) fyi",
+      });
+
+    expect(res.status).toBe(200);
+    await vi.waitFor(() => expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
+      MENTIONED_AGENT_ID,
+      expect.objectContaining({
+        reason: "issue_comment_mentioned",
+        contextSnapshot: expect.objectContaining({
+          wakeReason: "issue_comment_mentioned",
+          mentionThreadReadOnly: true,
+        }),
+      }),
+    ));
   });
 });

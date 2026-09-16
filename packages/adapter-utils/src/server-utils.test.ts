@@ -1534,6 +1534,33 @@ describe("renderPaperclipWakePrompt", () => {
     expect(prompt).toContain("must not start implementation work on the planning issue itself");
   });
 
+  it("tells a mention-woken agent when it cannot write to the thread", () => {
+    const base = {
+      reason: "issue_comment_mentioned",
+      issue: {
+        id: "issue-1",
+        identifier: "PAP-4501",
+        title: "Someone else's thread",
+        status: "in_progress",
+      },
+      commentWindow: { requestedCount: 0, includedCount: 0, missingCount: 0 },
+      comments: [],
+      fallbackFetchNeeded: false,
+    };
+
+    const readOnly = renderPaperclipWakePrompt({ ...base, mentionThreadReadOnly: true });
+    expect(readOnly).toContain("- issue thread writable by you: no");
+    expect(readOnly).toContain("said you may not comment on it");
+    expect(readOnly).toContain("The check is advisory");
+
+    // Absent or false, the payload says nothing — a granted mention and every
+    // other wake reason are unchanged.
+    const writable = renderPaperclipWakePrompt({ ...base, mentionThreadReadOnly: false });
+    expect(writable).not.toContain("writable by you");
+    expect(writable).not.toContain("The check is advisory");
+    expect(renderPaperclipWakePrompt(base)).not.toContain("writable by you");
+  });
+
   it("keeps accepted-plan guidance when stale comment ids have no loaded comments", () => {
     const prompt = renderPaperclipWakePrompt({
       reason: "issue_commented",

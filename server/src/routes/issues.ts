@@ -3910,6 +3910,71 @@ export function issueRoutes(
     return false as const;
   }
 
+  // An @-mention wakes the mentioned agent, but a mention only carries a
+  // comment grant when the mentioning comment's author is the issue's current
+  // agent assignee or an active company user. Waking an agent whose only
+  // possible outcome on the thread is a 403 spends a run and a credential
+  // window on nothing, so the wake payload says up front that the thread is
+  // not writable.
+  //
+  // The mention grant is one rule among several — the woken agent may be able
+  // to write because it is the assignee, because the issue has no assignee, or
+  // through any other rule the service knows about. Asking `access.decide` the
+  // same question the comment route asks means this flag can never disagree
+  // with the verdict the agent would actually get.
+  //
+  // The flag is ADVISORY IN BOTH DIRECTIONS, and the payload says so. The
+  // synthetic actor carries no responsible user, run or key scope, so the
+  // responsible-user intersection and the task-watchdog scope are skipped
+  // rather than guessed, which widens the answer; but trust is also resolved
+  // from the run's own executionPolicy, and at enqueue time the woken agent
+  // has no run at all. A low-trust resolution whose only concrete boundary
+  // scope rides on a run policy therefore denies here while the real actor,
+  // which does have a run, may be allowed. So the flag can be withheld where
+  // the agent will in fact be refused, and set where the agent would in fact
+  // be allowed. A probe error leaves the wake unflagged. It is probed from the
+  // deferred wake block, after the mentioning comment is committed, so a
+  // mention that does carry a grant reads as writable.
+  async function mentionWakeThreadIsReadOnly(
+    mentionedAgentId: string,
+    issue: Parameters<typeof decideIssueAccess>[1],
+  ): Promise<boolean> {
+    try {
+      const decision = await access.decide({
+        actor: {
+          type: "agent",
+          agentId: mentionedAgentId,
+          companyId: issue.companyId,
+        },
+        action: "issue:comment",
+        resource: {
+          type: "issue",
+          companyId: issue.companyId,
+          issueId: issue.id,
+          projectId: issue.projectId,
+          parentIssueId: issue.parentId,
+          assigneeAgentId: issue.assigneeAgentId,
+          assigneeUserId: issue.assigneeUserId,
+          status: issue.status,
+        },
+        scope: {
+          issueId: issue.id,
+          projectId: issue.projectId,
+          parentIssueId: issue.parentId,
+          assigneeAgentId: issue.assigneeAgentId,
+          assigneeUserId: issue.assigneeUserId,
+        },
+      });
+      return decision.allowed === false;
+    } catch (err) {
+      logger.warn(
+        { err, issueId: issue.id, mentionedAgentId },
+        "failed to probe mention comment grant; enqueuing the wake unflagged",
+      );
+      return false;
+    }
+  }
+
   async function assertIssueReadAllowed(req: Request, res: Response, issue: Parameters<typeof decideIssueAccess>[1]) {
     const key = `${issue.id}:${issue.companyId}:${issue.projectId ?? ""}:${issue.parentId ?? ""}:${issue.assigneeAgentId ?? ""}:${issue.assigneeUserId ?? ""}:${issue.status}`;
     const value = memoizeIssueReadDecision(req, key, () => decideIssueAccess(req, issue, "issue:read"));
@@ -10733,6 +10798,7 @@ export function issueRoutes(
 
         for (const mentionedId of mentionedIds) {
           if (actor.actorType === "agent" && actor.actorId === mentionedId) continue;
+          const mentionThreadReadOnly = await mentionWakeThreadIsReadOnly(mentionedId, issue);
           addWakeup(mentionedId, {
             source: "automation",
             triggerDetail: "system",
@@ -10747,6 +10813,7 @@ export function issueRoutes(
               wakeCommentId: comment.id,
               wakeReason: "issue_comment_mentioned",
               source: "comment.mention",
+              mentionThreadReadOnly,
             },
           });
         }
@@ -12771,6 +12838,7 @@ export function issueRoutes(
 
       for (const mentionedId of mentionedIds) {
         if (actorIsAgent && actor.actorId === mentionedId) continue;
+        const mentionThreadReadOnly = await mentionWakeThreadIsReadOnly(mentionedId, currentIssue);
         addWakeup(mentionedId, {
           source: "automation",
           triggerDetail: "system",
@@ -12785,6 +12853,7 @@ export function issueRoutes(
             wakeCommentId: comment.id,
             wakeReason: "issue_comment_mentioned",
             source: "comment.mention",
+            mentionThreadReadOnly,
           },
         });
       }

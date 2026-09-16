@@ -158,6 +158,42 @@ describe("buildPaperclipTaskMarkdown", () => {
 });
 
 describe("mergeCoalescedContextSnapshot", () => {
+  // Thread writability belongs to a wake, not to the run it coalesces into: a
+  // plain spread would keep an earlier ungranted mention's flag and go on
+  // warning the agent off a thread a later wake can write to.
+  it("clears a mention read-only flag when the incoming wake does not carry one", () => {
+    const merged = mergeCoalescedContextSnapshot(
+      {
+        issueId: "issue-1",
+        wakeReason: "issue_comment_mentioned",
+        mentionThreadReadOnly: true,
+      },
+      {
+        issueId: "issue-1",
+        commentId: "comment-2",
+        wakeCommentId: "comment-2",
+        wakeReason: "issue_commented",
+      },
+    );
+
+    expect(merged.mentionThreadReadOnly).toBeUndefined();
+  });
+
+  it("keeps a mention read-only flag carried by the incoming wake", () => {
+    const merged = mergeCoalescedContextSnapshot(
+      { issueId: "issue-1", wakeReason: "issue_commented" },
+      {
+        issueId: "issue-1",
+        commentId: "comment-2",
+        wakeCommentId: "comment-2",
+        wakeReason: "issue_comment_mentioned",
+        mentionThreadReadOnly: true,
+      },
+    );
+
+    expect(merged.mentionThreadReadOnly).toBe(true);
+  });
+
   it("clears stale accepted-plan interaction state when merging a later ordinary comment wake", () => {
     const merged = mergeCoalescedContextSnapshot(
       {
