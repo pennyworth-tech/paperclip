@@ -2469,6 +2469,41 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(checkoutReleasedIssue?.checkoutRunId).toBeNull();
   });
 
+  it("spares a fresh gateway-adapter run under the startup staleness threshold and reaps it once stale", async () => {
+    // A fresh foreign run survives startup. Once stale it is reconciled using
+    // the host's existing ownership and unknown-provider-outcome safeguards.
+    const { agentId, runId } = await seedRunFixture({
+      adapterType: "openclaw_gateway",
+      agentStatus: "idle",
+      processPid: null,
+      processGroupId: null,
+    });
+    await db
+      .update(heartbeatRuns)
+      .set({ updatedAt: new Date() })
+      .where(eq(heartbeatRuns.id, runId));
+    const heartbeat = heartbeatService(db);
+
+    const fresh = await heartbeat.reapOrphanedRuns({ staleThresholdMs: 5 * 60 * 1000 });
+    expect(fresh.reaped).toBe(0);
+    expect(
+      await db.select({ status: heartbeatRuns.status }).from(heartbeatRuns).where(eq(heartbeatRuns.id, runId)),
+    ).toEqual([{ status: "running" }]);
+
+    await db.update(heartbeatRuns).set({ updatedAt: new Date(Date.now() - 6 * 60 * 1000) })
+      .where(eq(heartbeatRuns.id, runId));
+    const stale = await heartbeat.reapOrphanedRuns({ staleThresholdMs: 5 * 60 * 1000 });
+    expect(stale.reaped).toBe(1);
+    const runs = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, agentId));
+    expect(runs.find((row) => row.id === runId)?.errorCode).toBe("process_lost");
+    expect(
+      runs.filter((row) => (row.contextSnapshot as Record<string, unknown> | null)?.wakeReason === "process_lost_retry"),
+    ).toHaveLength(0);
+  });
+
   it("requires reconciliation for a lost monitor whose provider outcomes are unknown", async () => {
     const { agentId, runId, issueId } = await seedRunFixture({
       adapterType: "openclaw_gateway",
