@@ -38,7 +38,7 @@ import { GithubIcon } from "../components/icons/github-icon";
 import { Field, adapterLabels } from "../components/agent-config-primitives";
 import { getAdapterLabel } from "../adapters/adapter-display-registry";
 import { defaultCreateValues } from "../components/agent-config-defaults";
-import { getUIAdapter, listUIAdapters } from "../adapters";
+import { getUIAdapter, listUIAdapters, onAdapterChange } from "../adapters";
 import type { CreateConfigValues } from "@paperclipai/adapter-utils";
 import {
   type FileTreeNode,
@@ -556,10 +556,34 @@ function ConflictResolutionList({
 
 // ── Adapter type options for import ───────────────────────────────────
 
-const IMPORT_ADAPTER_OPTIONS: { value: string; label: string }[] = listUIAdapters().map((adapter) => ({
-  value: adapter.type,
-  label: adapterLabels[adapter.type] ?? getAdapterLabel(adapter.type),
-}));
+/**
+ * Adapter choices for the import picker, read at render rather than at module
+ * load.
+ *
+ * The registry starts as the compiled-in list and gains the server's adapters
+ * once `/api/adapters` resolves, so a module-scope snapshot was always taken
+ * before any of them arrived — an adapter this bundle has no entry for could
+ * never be picked here. `useSyncExternalStore` over the registry's existing
+ * change notifier keeps the list current instead.
+ */
+function useImportAdapterOptions(): { value: string; label: string }[] {
+  const [adapters, setAdapters] = useState(listUIAdapters);
+  useEffect(() => {
+    // Re-read on every registry change, and once on mount: the server list may
+    // already have resolved before this component rendered.
+    const read = () => setAdapters(listUIAdapters());
+    read();
+    return onAdapterChange(read);
+  }, []);
+  return useMemo(
+    () =>
+      adapters.map((adapter) => ({
+        value: adapter.type,
+        label: adapterLabels[adapter.type] ?? getAdapterLabel(adapter.type),
+      })),
+    [adapters],
+  );
+}
 
 // ── Adapter picker for imported agents ───────────────────────────────
 
@@ -594,6 +618,7 @@ function AdapterPickerList({
   onToggleExpand: (slug: string) => void;
   onChangeConfig: (slug: string, patch: Partial<CreateConfigValues>) => void;
 }) {
+  const importAdapterOptions = useImportAdapterOptions();
   if (agents.length === 0) return null;
 
   return (
@@ -630,7 +655,7 @@ function AdapterPickerList({
                     value={selectedType}
                     onChange={(e) => onChangeAdapter(agent.slug, e.target.value)}
                   >
-                    {IMPORT_ADAPTER_OPTIONS.map((opt) => (
+                    {importAdapterOptions.map((opt) => (
                       <option key={opt.value} value={opt.value}>
                         {opt.label}
                       </option>
