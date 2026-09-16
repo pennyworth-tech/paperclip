@@ -9,6 +9,10 @@ import {
   heartbeatRuns,
   invites,
   issues as issuesTable,
+  pipelineCaseEvents,
+  pipelineCaseIssueLinks,
+  pipelineCases,
+  pipelineStages,
   pluginLogs,
   principalPermissionGrants,
   projects as projectsTable,
@@ -41,6 +45,7 @@ import { heartbeatService } from "./heartbeat.js";
 import { budgetService } from "./budgets.js";
 import { issueApprovalService } from "./issue-approvals.js";
 import { approvalService } from "./approvals.js";
+import { pipelineService } from "./pipelines.js";
 import { getStorageService } from "../storage/index.js";
 import { subscribeCompanyLiveEvents } from "./live-events.js";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
@@ -224,17 +229,19 @@ async function validateAndResolveFetchUrl(urlString: string): Promise<ValidatedF
   }
 }
 
-function buildPinnedRequestOptions(
+export function buildPinnedRequestOptions(
   target: ValidatedFetchTarget,
   init?: RequestInit,
-): { options: HttpRequestOptions & { servername?: string }; body: string | undefined } {
+): { options: HttpRequestOptions & { servername?: string }; body: string | Buffer | undefined } {
   const headers = new Headers(init?.headers);
   const method = init?.method ?? "GET";
   const body = init?.body === undefined || init?.body === null
     ? undefined
-    : typeof init.body === "string"
-      ? init.body
-      : String(init.body);
+    : (init as { bodyEncoding?: unknown }).bodyEncoding === "base64"
+      ? Buffer.from(String(init.body), "base64")
+      : typeof init.body === "string"
+        ? init.body
+        : String(init.body);
 
   headers.set("Host", target.hostHeader);
   if (body !== undefined && !headers.has("content-length") && !headers.has("transfer-encoding")) {
@@ -756,6 +763,7 @@ export function buildHostServices(
   const issueApprovals = issueApprovalService(db);
   const approvalSvc = approvalService(db);
   const interactions = issueThreadInteractionService(db);
+  const pipelineSvc = pipelineService(db);
   const scopedBus = eventBus.forPlugin(pluginKey);
 
   // Track active session event subscriptions for cleanup
@@ -1049,6 +1057,49 @@ export function buildHostServices(
     if (typeof originKind !== "string" || !originKind.startsWith("plugin:")) return;
     normalizePluginOriginKind(originKind);
   };
+
+  /**
+   * Verify a plugin-supplied agent run attribution before a pipeline mutation
+   * is attributed to it: the agent and the run must both belong to the company
+   * and the run must belong to the agent (mirrors the plugin tool route's
+   * runContext scope check). A plugin cannot borrow another agent's run.
+   */
+  const requireAgentRunInCompany = async (companyId: string, agentId: string, runId: string) => {
+    const [agent] = await db
+      .select({ companyId: agentsTable.companyId })
+      .from(agentsTable)
+      .where(eq(agentsTable.id, agentId))
+      .limit(1);
+    if (!agent || agent.companyId !== companyId) {
+      throw new Error(`actorAgentId "${agentId}" does not belong to this company`);
+    }
+    const [run] = await db
+      .select({ companyId: heartbeatRuns.companyId, agentId: heartbeatRuns.agentId })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId))
+      .limit(1);
+    if (!run || run.companyId !== companyId) {
+      throw new Error(`actorRunId "${runId}" does not belong to this company`);
+    }
+    if (run.agentId !== agentId) {
+      throw new Error(`actorRunId "${runId}" does not belong to actorAgentId "${agentId}"`);
+    }
+  };
+
+  const toPluginCaseIssueLink = (
+    link: typeof pipelineCaseIssueLinks.$inferSelect,
+    issue: { status: string; assigneeAgentId: string | null },
+  ) => ({
+    id: link.id,
+    caseId: link.caseId,
+    issueId: link.issueId,
+    role: link.role,
+    issueStatus: issue.status as Issue["status"],
+    issueAssigneeAgentId: issue.assigneeAgentId,
+    createdByRunId: link.createdByRunId,
+    retiredAt: link.retiredAt?.toISOString() ?? null,
+    createdAt: link.createdAt.toISOString(),
+  });
 
   const logPluginActivity = async (input: {
     companyId: string;
@@ -2714,6 +2765,109 @@ export function buildHostServices(
         }
 
         return { approval: redactApprovalPayload(approval) as any, applied };
+      },
+    },
+
+    pipelines: {
+      async getCase(params) {
+        const companyId = ensureCompanyId(params.companyId);
+        await ensurePluginAvailableForCompany(companyId);
+        const [row] = await db
+          .select({ case: pipelineCases, stage: pipelineStages })
+          .from(pipelineCases)
+          .innerJoin(pipelineStages, eq(pipelineCases.stageId, pipelineStages.id))
+          .where(and(eq(pipelineCases.id, params.caseId), eq(pipelineCases.companyId, companyId)))
+          .limit(1);
+        if (!row) return null;
+        const links = await db
+          .select({ link: pipelineCaseIssueLinks, issue: { status: issuesTable.status, assigneeAgentId: issuesTable.assigneeAgentId } })
+          .from(pipelineCaseIssueLinks)
+          .innerJoin(issuesTable, eq(pipelineCaseIssueLinks.issueId, issuesTable.id))
+          .where(and(
+            eq(pipelineCaseIssueLinks.companyId, companyId),
+            eq(pipelineCaseIssueLinks.caseId, params.caseId),
+            eq(issuesTable.companyId, companyId),
+          ))
+          .orderBy(pipelineCaseIssueLinks.createdAt, pipelineCaseIssueLinks.id);
+        return {
+          id: row.case.id,
+          companyId: row.case.companyId,
+          pipelineId: row.case.pipelineId,
+          caseKey: row.case.caseKey,
+          title: row.case.title,
+          summary: row.case.summary,
+          fields: row.case.fields,
+          version: row.case.version,
+          stageId: row.stage.id,
+          stageKey: row.stage.key,
+          stageKind: row.stage.kind,
+          terminalKind: row.case.terminalKind,
+          retiredAt: row.case.retiredAt?.toISOString() ?? null,
+          issueLinks: links.map(({ link, issue }) => toPluginCaseIssueLink(link, issue)),
+        };
+      },
+      async createReviewLink(params) {
+        const companyId = ensureCompanyId(params.companyId);
+        await ensurePluginAvailableForCompany(companyId);
+        const [pipelineCase] = await db
+          .select({ id: pipelineCases.id })
+          .from(pipelineCases)
+          .where(and(eq(pipelineCases.id, params.caseId), eq(pipelineCases.companyId, companyId)))
+          .limit(1);
+        if (!pipelineCase) throw new Error("Pipeline case not found");
+        const issue = requireInCompany("Issue", await issues.getById(params.issueId), companyId);
+        if (Boolean(params.actorAgentId) !== Boolean(params.actorRunId)) {
+          throw new Error("actorAgentId and actorRunId must be supplied together");
+        }
+        if (params.actorAgentId && params.actorRunId) {
+          await requireAgentRunInCompany(companyId, params.actorAgentId, params.actorRunId);
+        }
+        const actorPatch = params.actorAgentId
+          ? { actorType: "agent", actorAgentId: params.actorAgentId, runId: params.actorRunId }
+          : { actorType: "system" };
+        const link = await db.transaction(async (tx) => {
+          const [created] = await tx.insert(pipelineCaseIssueLinks).values({
+            companyId,
+            caseId: params.caseId,
+            issueId: issue.id,
+            role: "review",
+            createdByRunId: params.actorRunId ?? null,
+          }).returning();
+          await tx.insert(pipelineCaseEvents).values({
+            companyId,
+            caseId: params.caseId,
+            type: "issue_linked",
+            ...actorPatch,
+            payload: { issueId: issue.id, role: "review", pluginKey },
+          });
+          return created!;
+        });
+        return toPluginCaseIssueLink(link, { status: issue.status, assigneeAgentId: issue.assigneeAgentId ?? null });
+      },
+      async reviewCase(params) {
+        const companyId = ensureCompanyId(params.companyId);
+        await ensurePluginAvailableForCompany(companyId);
+        if (!params.actorAgentId || !params.actorRunId) {
+          throw new Error("actorAgentId and actorRunId are required to record a review decision");
+        }
+        await requireAgentRunInCompany(companyId, params.actorAgentId, params.actorRunId);
+        // The pipeline service applies the stage's approver rule (including
+        // linked_reviewer) to this agent actor exactly as the REST route does.
+        const result = await pipelineSvc.reviewCase({
+          companyId,
+          caseId: params.caseId,
+          decision: params.decision,
+          reason: params.reason ?? null,
+          expectedVersion: params.expectedVersion,
+          actor: { type: "agent", agentId: params.actorAgentId, runId: params.actorRunId },
+        });
+        return {
+          caseId: result.case.id,
+          decision: params.decision,
+          version: result.case.version,
+          stageId: result.case.stageId,
+          reviewEventId: result.reviewEvent.id,
+        };
       },
     },
 

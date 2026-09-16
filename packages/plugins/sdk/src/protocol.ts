@@ -54,6 +54,10 @@ export type { PluginLauncherRenderContextSnapshot } from "@paperclipai/shared";
 import type {
   PluginEvent,
   PluginIssueCheckoutOwnership,
+  PluginPipelineCase,
+  PluginPipelineCaseIssueLink,
+  PluginPipelineReviewDecision,
+  PluginPipelineReviewResult,
   PluginIssueOrchestrationSummary,
   PluginIssueRelationSummary,
   PluginIssueSubtree,
@@ -1600,6 +1604,11 @@ export interface WorkerToHostMethods {
 
   // HTTP
   "http.fetch": [
+    /**
+     * `init.body` is a string. When `init.bodyEncoding` is `"base64"` the body
+     * carries binary bytes (the worker serialized a Uint8Array/ArrayBuffer/Blob)
+     * and the host decodes it before sending.
+     */
     params: { url: string; init?: Record<string, unknown> },
     result: { status: number; statusText: string; headers: Record<string, string>; body: string },
   ];
@@ -2036,6 +2045,34 @@ export interface WorkerToHostMethods {
       decisionNote?: string | null;
     },
     result: { approval: Approval; applied: boolean },
+  ];
+
+  // Pipelines
+  "pipelines.cases.get": [
+    params: { caseId: string; companyId: string },
+    result: PluginPipelineCase | null,
+  ];
+  "pipelines.cases.createReviewLink": [
+    params: {
+      caseId: string;
+      companyId: string;
+      issueId: string;
+      actorAgentId?: string | null;
+      actorRunId?: string | null;
+    },
+    result: PluginPipelineCaseIssueLink,
+  ];
+  "pipelines.cases.review": [
+    params: {
+      caseId: string;
+      companyId: string;
+      decision: PluginPipelineReviewDecision;
+      reason?: string | null;
+      expectedVersion: number;
+      actorAgentId: string;
+      actorRunId: string;
+    },
+    result: PluginPipelineReviewResult,
   ];
 
   // Agents (read)

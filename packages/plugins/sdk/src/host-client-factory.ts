@@ -260,6 +260,13 @@ export interface HostServices {
     decide(params: WorkerToHostMethods["approvals.decide"][0]): Promise<WorkerToHostMethods["approvals.decide"][1]>;
   };
 
+  /** Provides `pipelines.cases.get`, `pipelines.cases.createReviewLink`, `pipelines.cases.review`. */
+  pipelines: {
+    getCase(params: WorkerToHostMethods["pipelines.cases.get"][0]): Promise<WorkerToHostMethods["pipelines.cases.get"][1]>;
+    createReviewLink(params: WorkerToHostMethods["pipelines.cases.createReviewLink"][0]): Promise<WorkerToHostMethods["pipelines.cases.createReviewLink"][1]>;
+    reviewCase(params: WorkerToHostMethods["pipelines.cases.review"][0]): Promise<WorkerToHostMethods["pipelines.cases.review"][1]>;
+  };
+
   /** Provides `issues.documents.list`, `issues.documents.get`, `issues.documents.upsert`, `issues.documents.delete`. */
   issueDocuments: {
     list(params: WorkerToHostMethods["issues.documents.list"][0]): Promise<WorkerToHostMethods["issues.documents.list"][1]>;
@@ -477,6 +484,11 @@ const METHOD_CAPABILITY_MAP: Record<WorkerToHostMethodName, PluginCapability | n
   "approvals.list": "approvals.read",
   "approvals.get": "approvals.read",
   "approvals.decide": "approvals.respond",
+
+  // Pipelines
+  "pipelines.cases.get": "pipeline.cases.read",
+  "pipelines.cases.createReviewLink": "pipeline.cases.links.write",
+  "pipelines.cases.review": "pipeline.cases.review",
 
   // Issue Documents
   "issues.documents.list": "issue.documents.read",
@@ -953,6 +965,17 @@ export function createHostClientHandlers(
     }),
     "approvals.decide": gated("approvals.decide", async (params) => {
       return services.approvals.decide(params);
+    }),
+
+    // Pipelines
+    "pipelines.cases.get": gated("pipelines.cases.get", async (params) => {
+      return services.pipelines.getCase(params);
+    }),
+    "pipelines.cases.createReviewLink": gated("pipelines.cases.createReviewLink", async (params) => {
+      return services.pipelines.createReviewLink(params);
+    }),
+    "pipelines.cases.review": gated("pipelines.cases.review", async (params) => {
+      return services.pipelines.reviewCase(params);
     }),
 
     // Issue Documents

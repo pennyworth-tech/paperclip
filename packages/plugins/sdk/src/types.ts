@@ -1639,6 +1639,87 @@ export interface PluginApprovalsClient {
   ): Promise<{ approval: Approval; applied: boolean }>;
 }
 
+export type PluginPipelineReviewDecision = "approve" | "reject" | "request_changes";
+
+export interface PluginPipelineCaseIssueLink {
+  id: string;
+  caseId: string;
+  issueId: string;
+  role: string;
+  issueStatus: Issue["status"];
+  issueAssigneeAgentId: string | null;
+  createdByRunId: string | null;
+  retiredAt: string | null;
+  createdAt: string;
+}
+
+export interface PluginPipelineCase {
+  id: string;
+  companyId: string;
+  pipelineId: string;
+  caseKey: string;
+  title: string;
+  summary: string | null;
+  fields: Record<string, unknown>;
+  version: number;
+  stageId: string;
+  stageKey: string;
+  stageKind: string;
+  terminalKind: string | null;
+  retiredAt: string | null;
+  /** Every issue link on the case, retired ones included, oldest first. */
+  issueLinks: PluginPipelineCaseIssueLink[];
+}
+
+export interface PluginPipelineReviewResult {
+  caseId: string;
+  decision: PluginPipelineReviewDecision;
+  /** Case version and stage after the decision's transition. */
+  version: number;
+  stageId: string;
+  reviewEventId: string;
+}
+
+/**
+ * `ctx.pipelines` — read pipeline cases, link review issues, and record review
+ * decisions as an authenticated agent run.
+ *
+ * Requires `pipeline.cases.read` for `getCase`, `pipeline.cases.links.write`
+ * for `createReviewLink`, and `pipeline.cases.review` for `reviewCase`.
+ */
+export interface PluginPipelinesClient {
+  /** Read a case with its stage and issue links; `null` when not in the company. */
+  getCase(caseId: string, companyId: string): Promise<PluginPipelineCase | null>;
+  /**
+   * Link an issue to a case with role `review`. When `actorAgentId` and
+   * `actorRunId` are given the host verifies the run belongs to that agent and
+   * company and attributes the link to it; otherwise the link is system-made.
+   */
+  createReviewLink(
+    caseId: string,
+    input: { issueId: string; actorAgentId?: string | null; actorRunId?: string | null },
+    companyId: string,
+  ): Promise<PluginPipelineCaseIssueLink>;
+  /**
+   * Record a review decision on a case in a review stage, attributed to the
+   * agent run (pass the `actor.agentId` / `actor.runId` the host supplied to a
+   * scoped API route). The host refuses a run that does not belong to that
+   * agent and company, then applies the stage's approver rule unchanged — a
+   * `linked_reviewer` stage accepts only the assignee of the case's review link.
+   */
+  reviewCase(
+    caseId: string,
+    input: {
+      decision: PluginPipelineReviewDecision;
+      reason?: string | null;
+      expectedVersion: number;
+      actorAgentId: string;
+      actorRunId: string;
+    },
+    companyId: string,
+  ): Promise<PluginPipelineReviewResult>;
+}
+
 /**
  * `ctx.agents` — read and manage agents.
  *
@@ -2163,6 +2244,9 @@ export interface PluginContext {
 
   /** Read and decide company approvals. Requires `approvals.read` / `approvals.respond`. */
   approvals: PluginApprovalsClient;
+
+  /** Read pipeline cases, link review issues, and record review decisions. Requires `pipeline.cases.*` capabilities. */
+  pipelines: PluginPipelinesClient;
 
   /** Read and manage agents. Requires `agents.read` for reads; `agents.pause` / `agents.resume` / `agents.invoke` for write ops. */
   agents: PluginAgentsClient;

@@ -1362,6 +1362,12 @@ export const PLUGIN_CAPABILITIES = [
   // user. Same apply-time active-human-member re-verification as above; the
   // web app's approval decision routes are board-only.
   "approvals.respond",
+  // Pipeline cases: read a case with its issue links; link a review issue to a
+  // case; record a review decision attributed to an authenticated agent run
+  // (the host re-verifies the run belongs to that agent and company).
+  "pipeline.cases.read",
+  "pipeline.cases.links.write",
+  "pipeline.cases.review",
   "issue.documents.write",
   "projects.managed",
   "routines.managed",

@@ -597,9 +597,21 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
               }
             }
             if (init.body !== undefined && init.body !== null) {
-              serializedInit.body = typeof init.body === "string"
+              const bytes = init.body instanceof Uint8Array
                 ? init.body
-                : String(init.body);
+                : init.body instanceof ArrayBuffer
+                  ? new Uint8Array(init.body)
+                  : init.body instanceof Blob
+                    ? new Uint8Array(await init.body.arrayBuffer())
+                    : null;
+              if (bytes) {
+                serializedInit.body = Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength).toString("base64");
+                serializedInit.bodyEncoding = "base64";
+              } else {
+                serializedInit.body = typeof init.body === "string"
+                  ? init.body
+                  : String(init.body);
+              }
             }
           }
 
@@ -1130,6 +1142,34 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
             action: input.action,
             actorUserId: input.actorUserId,
             decisionNote: input.decisionNote,
+          });
+        },
+      },
+
+      pipelines: {
+        async getCase(caseId, companyId) {
+          return callHost("pipelines.cases.get", { caseId, companyId });
+        },
+
+        async createReviewLink(caseId, input, companyId) {
+          return callHost("pipelines.cases.createReviewLink", {
+            caseId,
+            companyId,
+            issueId: input.issueId,
+            actorAgentId: input.actorAgentId,
+            actorRunId: input.actorRunId,
+          });
+        },
+
+        async reviewCase(caseId, input, companyId) {
+          return callHost("pipelines.cases.review", {
+            caseId,
+            companyId,
+            decision: input.decision,
+            reason: input.reason,
+            expectedVersion: input.expectedVersion,
+            actorAgentId: input.actorAgentId,
+            actorRunId: input.actorRunId,
           });
         },
       },

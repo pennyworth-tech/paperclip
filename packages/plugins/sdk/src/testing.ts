@@ -41,6 +41,7 @@ import type {
   PluginLocalFolderEntry,
   PluginLocalFolderStatus,
   PluginAccessMember,
+  PluginPipelineCase,
   PrincipalPermissionGrant,
   PermissionKey,
   PrincipalType,
@@ -114,6 +115,8 @@ export interface TestHarness {
     issueInteractions?: IssueThreadInteraction[];
     issueAttachments?: Array<IssueAttachment & { contentBase64?: string }>;
     approvals?: Approval[];
+    /** Pipeline cases (with their issue links) for `ctx.pipelines`. */
+    pipelineCases?: PluginPipelineCase[];
     agents?: Agent[];
     goals?: Goal[];
     projectWorkspaces?: PluginWorkspace[];
@@ -501,6 +504,7 @@ export function createTestHarness(options: TestHarnessOptions): TestHarness {
   const issueAttachments = new Map<string, IssueAttachment[]>();
   const attachmentContentById = new Map<string, string>();
   const approvals = new Map<string, Approval>();
+  const pipelineCases = new Map<string, PluginPipelineCase>();
   const issueDocuments = new Map<string, IssueDocument>();
   const agents = new Map<string, Agent>();
   const goals = new Map<string, Goal>();
@@ -2039,6 +2043,49 @@ export function createTestHarness(options: TestHarnessOptions): TestHarness {
         return { approval: decided, applied: true };
       },
     },
+    pipelines: {
+      async getCase(caseId, companyId) {
+        requireCapability(manifest, capabilitySet, "pipeline.cases.read");
+        const pipelineCase = pipelineCases.get(caseId);
+        return pipelineCase && pipelineCase.companyId === companyId ? pipelineCase : null;
+      },
+      async createReviewLink(caseId, input, companyId) {
+        requireCapability(manifest, capabilitySet, "pipeline.cases.links.write");
+        const pipelineCase = pipelineCases.get(caseId);
+        if (!pipelineCase || pipelineCase.companyId !== companyId) throw new Error(`Pipeline case not found: ${caseId}`);
+        const issue = issues.get(input.issueId);
+        if (!issue || issue.companyId !== companyId) throw new Error(`Issue not found: ${input.issueId}`);
+        const link = {
+          id: randomUUID(),
+          caseId,
+          issueId: issue.id,
+          role: "review",
+          issueStatus: issue.status,
+          issueAssigneeAgentId: issue.assigneeAgentId ?? null,
+          createdByRunId: input.actorRunId ?? null,
+          retiredAt: null,
+          createdAt: new Date().toISOString(),
+        };
+        pipelineCase.issueLinks.push(link);
+        return link;
+      },
+      async reviewCase(caseId, input, companyId) {
+        requireCapability(manifest, capabilitySet, "pipeline.cases.review");
+        const pipelineCase = pipelineCases.get(caseId);
+        if (!pipelineCase || pipelineCase.companyId !== companyId) throw new Error(`Pipeline case not found: ${caseId}`);
+        if (pipelineCase.stageKind !== "review") throw new Error("Pipeline case is not in a review stage");
+        if (pipelineCase.version !== input.expectedVersion) throw new Error("Pipeline case version conflict");
+        // The harness does not model stage transitions or approver rules.
+        pipelineCase.version += 1;
+        return {
+          caseId,
+          decision: input.decision,
+          version: pipelineCase.version,
+          stageId: pipelineCase.stageId,
+          reviewEventId: randomUUID(),
+        };
+      },
+    },
     agents: {
       async list(input) {
         requireCapability(manifest, capabilitySet, "agents.read");
@@ -2558,6 +2605,7 @@ export function createTestHarness(options: TestHarnessOptions): TestHarness {
         attachmentContentById.set(attachment.id, contentBase64 ?? "");
       }
       for (const row of input.approvals ?? []) approvals.set(row.id, row);
+      for (const row of input.pipelineCases ?? []) pipelineCases.set(row.id, { ...row, issueLinks: [...row.issueLinks] });
       for (const row of input.agents ?? []) agents.set(row.id, row);
       for (const row of input.goals ?? []) goals.set(row.id, row);
       for (const row of input.projectWorkspaces ?? []) {

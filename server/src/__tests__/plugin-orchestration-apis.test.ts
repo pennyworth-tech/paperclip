@@ -3,6 +3,8 @@ import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { and, eq } from "drizzle-orm";
+import { PassThrough } from "node:stream";
+import { createInterface } from "node:readline";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
   activityLog,
@@ -22,6 +24,14 @@ import {
   issueRelations,
   issueThreadInteractions,
   issues,
+  pipelineAutomationExecutions,
+  pipelineCaseBlockers,
+  pipelineCaseEvents,
+  pipelineCaseIssueLinks,
+  pipelineCases,
+  pipelineStages,
+  pipelineTransitions,
+  pipelines,
   pluginManagedResources,
   plugins,
   projects,
@@ -30,7 +40,20 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
-import { buildHostServices } from "../services/plugin-host-services.js";
+import { buildHostServices, buildPinnedRequestOptions } from "../services/plugin-host-services.js";
+import { pipelineService } from "../services/pipelines.js";
+import { createHostClientHandlers } from "../../../packages/plugins/sdk/src/host-client-factory.js";
+import { definePlugin } from "../../../packages/plugins/sdk/src/define-plugin.js";
+import { startWorkerRpcHost } from "../../../packages/plugins/sdk/src/worker-rpc-host.js";
+import {
+  createRequest,
+  createSuccessResponse,
+  isJsonRpcRequest,
+  isJsonRpcResponse,
+  parseMessage,
+  PLUGIN_RPC_ERROR_CODES,
+  serializeMessage,
+} from "../../../packages/plugins/sdk/src/protocol.js";
 import { heartbeatService } from "../services/heartbeat.js";
 import { drainHeartbeatRunsToQuiescence } from "./helpers/drain-heartbeat-runs.js";
 
@@ -104,6 +127,14 @@ describeEmbeddedPostgres("plugin orchestration APIs", () => {
     // promises in module state shared across service instances, so a fresh
     // instance here drains the runs the per-test host services dispatched.
     await drainHeartbeatRunsToQuiescence(db, heartbeatService(db));
+    await db.delete(pipelineAutomationExecutions);
+    await db.delete(pipelineCaseBlockers);
+    await db.delete(pipelineCaseIssueLinks);
+    await db.delete(pipelineCaseEvents);
+    await db.delete(pipelineCases);
+    await db.delete(pipelineTransitions);
+    await db.delete(pipelineStages);
+    await db.delete(pipelines);
     await db.delete(costEvents);
     await deleteHeartbeatRunsWithDependents();
     await db.delete(agentWakeupRequests);
@@ -1283,5 +1314,293 @@ describeEmbeddedPostgres("plugin orchestration APIs", () => {
     await expect(
       services.issues.getAttachmentContent({ attachmentId, companyId, maxBytes: 1_000_000 }),
     ).rejects.toThrow("over the");
+  });
+
+  describe("pipeline case review attributed to an agent run", () => {
+    async function seedLinkedReviewerCase() {
+      const { companyId, agentId: reviewerAId } = await seedCompanyAndAgent();
+      const reviewerBId = randomUUID();
+      await db.insert(agents).values({
+        id: reviewerBId,
+        companyId,
+        name: "Reviewer B",
+        role: "engineer",
+        status: "idle",
+        adapterType: "process",
+        adapterConfig: { command: "true" },
+        runtimeConfig: {},
+        permissions: {},
+      });
+      const svc = pipelineService(db);
+      const userActor = { type: "user" as const, userId: "board-user" };
+      const pipeline = await svc.createPipeline({
+        companyId,
+        key: `merge-${randomUUID().slice(0, 8)}`,
+        name: "Merge",
+        enforceTransitions: false,
+        actor: userActor,
+      });
+      const reviewStage = (await svc.listStages(companyId, pipeline.id)).find((stage) => stage.key === "review")!;
+      await svc.updateStage({
+        companyId,
+        pipelineId: pipeline.id,
+        stageId: reviewStage.id,
+        patch: {
+          config: {
+            ...(reviewStage.config as Record<string, unknown>),
+            requireApproval: true,
+            approver: { kind: "linked_reviewer" },
+          },
+        },
+      });
+      const created = await svc.ingestCase({
+        companyId,
+        pipelineId: pipeline.id,
+        stageKey: "review",
+        caseKey: `pr-${randomUUID().slice(0, 8)}`,
+        title: "Review PR",
+        actor: userActor,
+      });
+      const runFor = async (agentId: string) => {
+        const runId = randomUUID();
+        await db.insert(heartbeatRuns).values({
+          id: runId,
+          companyId,
+          agentId,
+          status: "running",
+          invocationSource: "assignment",
+        });
+        return runId;
+      };
+      const [reviewIssue] = await db.insert(issues).values({
+        companyId,
+        title: "Review PR",
+        status: "todo",
+        priority: "medium",
+        assigneeAgentId: reviewerAId,
+      }).returning();
+      return {
+        companyId,
+        reviewerAId,
+        reviewerBId,
+        reviewStage,
+        caseId: created.case.id,
+        version: created.case.version,
+        reviewIssueId: reviewIssue!.id,
+        runFor,
+      };
+    }
+
+    async function reviewDecidedCount(caseId: string) {
+      const rows = await db
+        .select({ id: pipelineCaseEvents.id })
+        .from(pipelineCaseEvents)
+        .where(and(eq(pipelineCaseEvents.caseId, caseId), eq(pipelineCaseEvents.type, "review_decided")));
+      return rows.length;
+    }
+
+    it("links a review issue, reads it back, and lets only the linked assignee decide", async () => {
+      const seeded = await seedLinkedReviewerCase();
+      const { companyId, caseId } = seeded;
+      const services = buildHostServices(db, "plugin-record-id", "backlit.operations", createEventBusStub());
+      const runA = await seeded.runFor(seeded.reviewerAId);
+      const runB = await seeded.runFor(seeded.reviewerBId);
+
+      const link = await services.pipelines.createReviewLink({
+        caseId,
+        companyId,
+        issueId: seeded.reviewIssueId,
+        actorAgentId: seeded.reviewerAId,
+        actorRunId: runA,
+      });
+      expect(link).toMatchObject({ caseId, issueId: seeded.reviewIssueId, role: "review", createdByRunId: runA });
+
+      const read = await services.pipelines.getCase({ caseId, companyId });
+      expect(read).toMatchObject({
+        id: caseId,
+        version: seeded.version,
+        stageKey: "review",
+        stageKind: "review",
+        issueLinks: [
+          expect.objectContaining({ issueId: seeded.reviewIssueId, role: "review", issueAssigneeAgentId: seeded.reviewerAId, retiredAt: null }),
+        ],
+      });
+      await expect(services.pipelines.getCase({ caseId, companyId: randomUUID() })).resolves.toBeNull();
+
+      await expect(services.pipelines.reviewCase({
+        caseId,
+        companyId,
+        decision: "approve",
+        expectedVersion: seeded.version,
+        actorAgentId: seeded.reviewerBId,
+        actorRunId: runB,
+      })).rejects.toMatchObject({ status: 403, details: { code: "review_required", approver: { kind: "linked_reviewer", id: seeded.reviewerAId } } });
+      expect(await reviewDecidedCount(caseId)).toBe(0);
+
+      const result = await services.pipelines.reviewCase({
+        caseId,
+        companyId,
+        decision: "approve",
+        expectedVersion: seeded.version,
+        actorAgentId: seeded.reviewerAId,
+        actorRunId: runA,
+      });
+      expect(result).toMatchObject({ caseId, decision: "approve" });
+      expect(result.version).toBeGreaterThan(seeded.version);
+      expect(result.stageId).not.toBe(seeded.reviewStage.id);
+      const [event] = await db
+        .select()
+        .from(pipelineCaseEvents)
+        .where(and(eq(pipelineCaseEvents.caseId, caseId), eq(pipelineCaseEvents.type, "review_decided")));
+      expect(event).toMatchObject({ id: result.reviewEventId, actorType: "agent", actorAgentId: seeded.reviewerAId, runId: runA });
+    });
+
+    it("refuses a forged actorAgentId whose run belongs to another agent", async () => {
+      const seeded = await seedLinkedReviewerCase();
+      const { companyId, caseId } = seeded;
+      const services = buildHostServices(db, "plugin-record-id", "backlit.operations", createEventBusStub());
+      await services.pipelines.createReviewLink({ caseId, companyId, issueId: seeded.reviewIssueId });
+      const runB = await seeded.runFor(seeded.reviewerBId);
+
+      // Reviewer A is the linked assignee, but the run is reviewer B's.
+      await expect(services.pipelines.reviewCase({
+        caseId,
+        companyId,
+        decision: "approve",
+        expectedVersion: seeded.version,
+        actorAgentId: seeded.reviewerAId,
+        actorRunId: runB,
+      })).rejects.toThrow(`does not belong to actorAgentId "${seeded.reviewerAId}"`);
+      await expect(services.pipelines.createReviewLink({
+        caseId,
+        companyId,
+        issueId: seeded.reviewIssueId,
+        actorAgentId: seeded.reviewerAId,
+        actorRunId: runB,
+      })).rejects.toThrow("does not belong to actorAgentId");
+
+      const [after] = await db.select().from(pipelineCases).where(eq(pipelineCases.id, caseId));
+      expect(after!.version).toBe(seeded.version);
+      expect(after!.stageId).toBe(seeded.reviewStage.id);
+      expect(await reviewDecidedCount(caseId)).toBe(0);
+    });
+
+    it("gates the pipeline bridge methods on their capabilities", async () => {
+      const seeded = await seedLinkedReviewerCase();
+      const services = buildHostServices(db, "plugin-record-id", "backlit.operations", createEventBusStub());
+      const runA = await seeded.runFor(seeded.reviewerAId);
+      const denied = createHostClientHandlers({ pluginId: "backlit.operations", capabilities: ["pipeline.cases.read"], services });
+      await expect(denied["pipelines.cases.review"]({
+        caseId: seeded.caseId,
+        companyId: seeded.companyId,
+        decision: "approve",
+        expectedVersion: seeded.version,
+        actorAgentId: seeded.reviewerAId,
+        actorRunId: runA,
+      })).rejects.toMatchObject({ code: PLUGIN_RPC_ERROR_CODES.CAPABILITY_DENIED });
+      await expect(denied["pipelines.cases.createReviewLink"]({
+        caseId: seeded.caseId,
+        companyId: seeded.companyId,
+        issueId: seeded.reviewIssueId,
+      })).rejects.toMatchObject({ code: PLUGIN_RPC_ERROR_CODES.CAPABILITY_DENIED });
+      await expect(denied["pipelines.cases.get"](
+        { caseId: seeded.caseId, companyId: seeded.companyId },
+        { invocationScope: { companyId: seeded.companyId } },
+      ))
+        .resolves.toMatchObject({ id: seeded.caseId });
+    });
+  });
+});
+
+describe("plugin http.fetch binary request bodies", () => {
+  // Drive a real worker ctx.http.fetch, capture the http.fetch bridge request it
+  // sends, and decode it with the host's request builder.
+  async function captureFetchInit(body: BodyInit) {
+    const hostToWorker = new PassThrough();
+    const workerToHost = new PassThrough();
+    const hostReadline = createInterface({ input: workerToHost });
+    const pending = new Map<string, (result: unknown) => void>();
+    let fetchInit: Record<string, unknown> | undefined;
+    const plugin = definePlugin({
+      async setup(ctx) {
+        ctx.actions.register("upload", async () => {
+          await ctx.http.fetch("https://example.com/upload", { method: "POST", body });
+          return { ok: true };
+        });
+      },
+    });
+    const worker = startWorkerRpcHost({ plugin, stdin: hostToWorker, stdout: workerToHost });
+    hostReadline.on("line", (line) => {
+      const message = parseMessage(line);
+      if (isJsonRpcResponse(message)) {
+        pending.get(String(message.id))?.(message);
+        return;
+      }
+      if (isJsonRpcRequest(message) && message.method === "http.fetch") {
+        fetchInit = (message.params as { init?: Record<string, unknown> }).init;
+        hostToWorker.write(serializeMessage(createSuccessResponse(message.id, {
+          status: 200, statusText: "OK", headers: {}, body: "",
+        })));
+      }
+    });
+    const callWorker = (id: string, method: string, params: unknown) => {
+      const done = new Promise((resolve) => pending.set(id, resolve));
+      hostToWorker.write(serializeMessage(createRequest(method, params, id)));
+      return done;
+    };
+    try {
+      await callWorker("1", "initialize", {
+        manifest: {
+          id: "backlit.fetch-test",
+          apiVersion: 1,
+          version: "1.0.0",
+          displayName: "Fetch test",
+          description: "Fetch test",
+          author: "Paperclip",
+          categories: ["automation"],
+          capabilities: ["http.outbound"],
+          entrypoints: {},
+        },
+        config: {},
+        databaseNamespace: null,
+      });
+      await callWorker("2", "performAction", { key: "upload", params: {} });
+      return fetchInit!;
+    } finally {
+      worker.stop();
+      hostReadline.close();
+      hostToWorker.destroy();
+      workerToHost.destroy();
+    }
+  }
+
+  const target = {
+    parsedUrl: new URL("https://example.com/upload"),
+    resolvedAddress: "93.184.216.34",
+    hostHeader: "example.com",
+    useTls: true,
+  };
+
+  it("round-trips Uint8Array, ArrayBuffer, and Blob bodies byte-exact", async () => {
+    const bytes = new Uint8Array(512);
+    for (let i = 0; i < bytes.length; i += 1) bytes[i] = i % 256;
+    // A subarray view checks the worker honours byteOffset/byteLength.
+    const view = bytes.subarray(3, 300);
+    for (const body of [view, bytes.buffer.slice(0), new Blob([bytes])] as BodyInit[]) {
+      const init = await captureFetchInit(body);
+      expect(init.bodyEncoding).toBe("base64");
+      const { body: sent, options } = buildPinnedRequestOptions(target, init as RequestInit);
+      const expected = body === view ? Buffer.from(view) : Buffer.from(bytes);
+      expect(Buffer.isBuffer(sent)).toBe(true);
+      expect((sent as Buffer).equals(expected)).toBe(true);
+      expect(options.headers).toMatchObject({ "content-length": String(expected.length) });
+    }
+  });
+
+  it("keeps string bodies unchanged", async () => {
+    const init = await captureFetchInit('{"a":"\u00e9"}');
+    expect(init.bodyEncoding).toBeUndefined();
+    expect(init.body).toBe('{"a":"\u00e9"}');
+    expect(buildPinnedRequestOptions(target, init as RequestInit).body).toBe('{"a":"\u00e9"}');
   });
 });
