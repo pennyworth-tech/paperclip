@@ -7313,6 +7313,28 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     },
   );
 
+  it("requests startup cancellation without releasing a silent adapter before its acknowledgement", async () => {
+    const { runId } = await seedRunFixture({ runtimeMode: "legacy", includeIssue: false });
+    const control = createAdapterExecutionControl();
+    adapterExecutionControls.set(runId, control);
+    const heartbeat = heartbeatService(db);
+    const reaping = heartbeat.reapOrphanedRuns();
+    try {
+      await vi.waitFor(() => expect(control.controller.signal.aborted).toBe(true));
+      expect(await heartbeat.getRun(runId)).toMatchObject({ status: "running", errorCode: "process_startup_timeout" });
+      expect(adapterExecutionControls.get(runId)).toBe(control);
+      await db.update(heartbeatRuns).set({ status: "cancelled", resultJson: {
+        executionCancellation: { state: "acknowledged" },
+      } }).where(eq(heartbeatRuns.id, runId));
+      control.finish();
+      expect(await reaping).toEqual({ reaped: 1, runIds: [runId] });
+    } finally {
+      control.finish();
+      await reaping;
+      adapterExecutionControls.delete(runId);
+    }
+  });
+
   it("signals an embedded adapter and waits for its cleanup before returning Stop", async () => {
     const { runId } = await seedRunFixture({ runtimeMode: "legacy", includeIssue: false });
     const control = createAdapterExecutionControl();

@@ -1,3 +1,4 @@
+import { legacyStartupDeadlineExpired } from "./heartbeat-startup-deadline.js";
 import { AGENT_CHAT_DIRECTIVE, conversationReplay, isConversation, isConversationExecutionWake, isWaitingConversation, prepareConversationTurn, settleConversationTurn } from "./agent-conversations.js";
 import { PROCESS_IDENTITY_RECORDED, recordNativeLocalProcessStop } from "./native-local-process-stop.js";
 import { hasAcknowledgedNativeStopIntent, isAcknowledgedNativeStop, acknowledgedNativeStopExecutionHasStopped } from "./acknowledged-native-stop.js";
@@ -18897,6 +18898,7 @@ export function heartbeatService(
       const locallyTracked =
         runningProcesses.has(run.id) ||
         activeRunExecutions.has(run.id) ||
+        adapterExecutionControls.has(run.id) ||
         coordinatorOwnedByCurrentController;
       if (
         nativeRun &&
@@ -18941,7 +18943,22 @@ export function heartbeatService(
         continue;
       }
       if (resumedRunIds.has(run.id)) continue;
-      if (locallyTracked) continue;
+      if (locallyTracked) {
+        if (legacyStartupDeadlineExpired(run, now)) {
+          // Silence triggers a stop request, not proof that a provider stopped.
+          // The normal cancellation path fences preparation and waits for the
+          // adapter's acknowledgement. Never drop its in-memory owner here.
+          try {
+            const stopped = await cancelRunInternal(run.id, "Startup exceeded 15 minutes without process metadata or output", {
+              errorCode: "process_startup_timeout",
+            });
+            if (stopped && isHeartbeatRunTerminalStatus(stopped.status)) reaped.push(run.id);
+          } catch (error) {
+            logger.warn({ err: error, runId: run.id }, "startup deadline cancellation remains unresolved");
+          }
+        }
+        continue;
+      }
       if (await hasLiveLegacyController(db, run)) continue;
 
       // Apply staleness threshold to avoid false positives
