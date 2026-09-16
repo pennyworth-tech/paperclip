@@ -777,6 +777,38 @@ function sameRunLock(checkoutRunId: string | null, actorRunId: string | null) {
 }
 
 export const TERMINAL_HEARTBEAT_RUN_STATUSES = new Set(["succeeded", "interrupted", "failed", "cancelled", "timed_out"]);
+
+// A non-terminal run can still be incapable of ever owning an issue's execution
+// lock. A run that has never started (`startedAt == null`), is not `running`,
+// and belongs to an agent that is not the issue's current assignee is stale by
+// design — it is the same population enqueueWakeup refuses to install as a
+// holder, and it is produced routinely by `@`-mention wakes for a busy third
+// agent. `queued` is not terminal and nothing moves a never-claimed queued run
+// to a terminal status, so treating it as a live holder fences the rightful
+// assignee out of its own issue forever, including out of `release`.
+//
+// `startedAt` is deliberately the staleness signal rather than a wall-clock
+// bound: it is exact and needs no tuning. `status !== "running"` and the
+// assignee mismatch keep a genuinely live holder — including the assignee's own
+// not-yet-claimed queued run under lazy locking — untouchable.
+export function isStaleByDesignExecutionHolder(
+  run: { agentId: string; status: string; startedAt: Date | string | null },
+  assigneeAgentId: string | null,
+): boolean {
+  if (!assigneeAgentId) return false;
+  if (run.agentId === assigneeAgentId) return false;
+  if (run.status === "running") return false;
+  return run.startedAt == null;
+}
+
+function executionHolderIsReleasable(
+  run: { agentId: string; status: string; startedAt: Date | string | null } | null,
+  assigneeAgentId: string | null,
+): boolean {
+  if (!run) return true;
+  if (TERMINAL_HEARTBEAT_RUN_STATUSES.has(run.status)) return true;
+  return isStaleByDesignExecutionHolder(run, assigneeAgentId);
+}
 const ISSUE_LIST_DESCRIPTION_MAX_CHARS = 1200;
 const ISSUE_LIST_DESCRIPTION_MAX_BYTES = ISSUE_LIST_DESCRIPTION_MAX_CHARS * 4;
 
@@ -5354,7 +5386,7 @@ export function issueService(db: Db) {
         sql`select ${issues.id} from ${issues} where ${issues.id} = ${issueId} for update`,
       );
       const issue = await tx
-        .select({ executionRunId: issues.executionRunId })
+        .select({ executionRunId: issues.executionRunId, assigneeAgentId: issues.assigneeAgentId })
         .from(issues)
         .where(eq(issues.id, issueId))
         .then((rows) => rows[0] ?? null);
@@ -5364,11 +5396,15 @@ export function issueService(db: Db) {
         sql`select ${heartbeatRuns.id} from ${heartbeatRuns} where ${heartbeatRuns.id} = ${issue.executionRunId} for update`,
       );
       const run = await tx
-        .select({ status: heartbeatRuns.status })
+        .select({
+          agentId: heartbeatRuns.agentId,
+          status: heartbeatRuns.status,
+          startedAt: heartbeatRuns.startedAt,
+        })
         .from(heartbeatRuns)
         .where(eq(heartbeatRuns.id, issue.executionRunId))
         .then((rows) => rows[0] ?? null);
-      if (run && !TERMINAL_HEARTBEAT_RUN_STATUSES.has(run.status)) return false;
+      if (!executionHolderIsReleasable(run, issue.assigneeAgentId)) return false;
 
       const updated = await tx
         .update(issues)
@@ -5402,32 +5438,69 @@ export function issueService(db: Db) {
         sql`select ${issues.id} from ${issues} where ${issues.id} = ${issueId} for update`,
       );
       const issue = await tx
-        .select({ checkoutRunId: issues.checkoutRunId, executionRunId: issues.executionRunId })
+        .select({
+          checkoutRunId: issues.checkoutRunId,
+          executionRunId: issues.executionRunId,
+          assigneeAgentId: issues.assigneeAgentId,
+        })
         .from(issues)
         .where(eq(issues.id, issueId))
         .then((rows) => rows[0] ?? null);
-      if (!issue?.checkoutRunId) return false;
+      if (!issue) return false;
 
-      await tx.execute(
-        sql`select ${heartbeatRuns.id} from ${heartbeatRuns} where ${heartbeatRuns.id} = ${issue.checkoutRunId} for update`,
-      );
-      const run = await tx
-        .select({ status: heartbeatRuns.status })
-        .from(heartbeatRuns)
-        .where(eq(heartbeatRuns.id, issue.checkoutRunId))
-        .then((rows) => rows[0] ?? null);
+      const loadExecutionPathRun = async (runId: string) => {
+        await tx.execute(
+          sql`select ${heartbeatRuns.id} from ${heartbeatRuns} where ${heartbeatRuns.id} = ${runId} for update`,
+        );
+        return tx
+          .select({
+            agentId: heartbeatRuns.agentId,
+            status: heartbeatRuns.status,
+            startedAt: heartbeatRuns.startedAt,
+          })
+          .from(heartbeatRuns)
+          .where(eq(heartbeatRuns.id, runId))
+          .then((rows) => rows[0] ?? null);
+      };
+
+      // A null checkoutRunId does not mean there is nothing to release. Wakes
+      // that take no checkout (mentions) leave checkoutRunId null while
+      // executionRunId still names a run, so returning early here made the
+      // executionRunId-without-checkoutRunId row unreachable — the exact shape
+      // that fences an assignee out of its own issue. Evaluate the execution
+      // holder on its own instead.
+      if (!issue.checkoutRunId) {
+        if (!issue.executionRunId) return false;
+        const executionOnlyRun = await loadExecutionPathRun(issue.executionRunId);
+        if (!executionHolderIsReleasable(executionOnlyRun, issue.assigneeAgentId)) return false;
+
+        const clearedExecutionOnly = await tx
+          .update(issues)
+          .set({
+            executionRunId: null,
+            executionAgentNameKey: null,
+            executionLockedAt: null,
+            updatedAt: new Date(),
+          })
+          .where(
+            and(
+              eq(issues.id, issueId),
+              isNull(issues.checkoutRunId),
+              eq(issues.executionRunId, issue.executionRunId),
+            ),
+          )
+          .returning({ id: issues.id })
+          .then((rows) => rows[0] ?? null);
+
+        return Boolean(clearedExecutionOnly);
+      }
+
+      const run = await loadExecutionPathRun(issue.checkoutRunId);
       if (run && !TERMINAL_HEARTBEAT_RUN_STATUSES.has(run.status)) return false;
 
       if (issue.executionRunId && issue.executionRunId !== issue.checkoutRunId) {
-        await tx.execute(
-          sql`select ${heartbeatRuns.id} from ${heartbeatRuns} where ${heartbeatRuns.id} = ${issue.executionRunId} for update`,
-        );
-        const executionRun = await tx
-          .select({ status: heartbeatRuns.status })
-          .from(heartbeatRuns)
-          .where(eq(heartbeatRuns.id, issue.executionRunId))
-          .then((rows) => rows[0] ?? null);
-        if (executionRun && !TERMINAL_HEARTBEAT_RUN_STATUSES.has(executionRun.status)) return false;
+        const executionRun = await loadExecutionPathRun(issue.executionRunId);
+        if (!executionHolderIsReleasable(executionRun, issue.assigneeAgentId)) return false;
       }
 
       const updated = await tx

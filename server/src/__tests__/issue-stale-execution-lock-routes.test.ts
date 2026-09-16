@@ -19,6 +19,7 @@ import {
 } from "./helpers/embedded-postgres.js";
 import { errorHandler } from "../middleware/index.js";
 import { issueRoutes } from "../routes/issues.js";
+import { issueService } from "../services/issues.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -347,6 +348,235 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
 
     expect(res.status, JSON.stringify(res.body)).toBe(409);
     expect(res.body?.error).toBe("Issue run ownership conflict");
+  });
+
+  // A `queued` heartbeat run that was never claimed has `startedAt: null` and is
+  // not terminal, so nothing ever releases the execution lock it holds. When the
+  // run belongs to an agent that is not the issue's assignee — the shape an
+  // `@`-mention wake produces, which also takes no checkout, leaving
+  // checkoutRunId null — the rightful assignee is fenced out of its own issue on
+  // every mutating route, `release` included, with no way to self-repair.
+  async function seedNeverStartedHolder(companyId: string, holderAgentId: string, issueId: string) {
+    const neverStartedRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: neverStartedRunId,
+      companyId,
+      agentId: holderAgentId,
+      status: "queued",
+      invocationSource: "automation",
+      // startedAt intentionally omitted — the run was never claimed.
+      contextSnapshot: { issueId, taskId: issueId, wakeReason: "issue_comment_mentioned" },
+    });
+    return neverStartedRunId;
+  }
+
+  async function seedSecondAgent(companyId: string) {
+    const otherAgentId = randomUUID();
+    await db.insert(agents).values({
+      id: otherAgentId,
+      companyId,
+      name: "MentionedAgent",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    return otherAgentId;
+  }
+
+  it("lets the assignee recover an issue held by a never-started queued run for another agent", async () => {
+    const { companyId, agentId, currentRunId } = await seedCompanyAgentAndRuns();
+    const issueId = randomUUID();
+    const mentionedAgentId = await seedSecondAgent(companyId);
+    const neverStartedRunId = await seedNeverStartedHolder(companyId, mentionedAgentId, issueId);
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Fenced by a never-started mention run",
+      status: "in_progress",
+      priority: "high",
+      assigneeAgentId: agentId,
+      // The mention wake takes no checkout, so only executionRunId is stamped.
+      checkoutRunId: null,
+      executionRunId: neverStartedRunId,
+      executionAgentNameKey: "mentionedagent",
+      executionLockedAt: new Date(),
+    });
+    // The cross-issue influence gate refuses an agent write whose run carries
+    // no source issue, so the actor run names this issue, exactly as the
+    // surrounding cases do. Same-issue writes short-circuit the cap.
+    await db.update(heartbeatRuns)
+      .set({ contextSnapshot: { issueId } })
+      .where(eq(heartbeatRuns.id, currentRunId));
+
+    const res = await request(createApp(agentActor(companyId, agentId, currentRunId)))
+      .patch(`/api/issues/${issueId}`)
+      .send({ title: "Recovered from never-started holder" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+
+    const row = await db
+      .select({
+        title: issues.title,
+        checkoutRunId: issues.checkoutRunId,
+        executionRunId: issues.executionRunId,
+      })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]);
+    expect(row).toEqual({
+      title: "Recovered from never-started holder",
+      checkoutRunId: currentRunId,
+      executionRunId: currentRunId,
+    });
+
+    // The stale holder is left alone: this releases the issue's lock, it does
+    // not cancel someone else's backlogged run.
+    const holder = await db
+      .select({ status: heartbeatRuns.status })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, neverStartedRunId))
+      .then((rows) => rows[0]);
+    expect(holder?.status).toBe("queued");
+  });
+
+  it("lets the assignee release an issue held by a never-started queued run for another agent", async () => {
+    const { companyId, agentId, currentRunId } = await seedCompanyAgentAndRuns();
+    const issueId = randomUUID();
+    const mentionedAgentId = await seedSecondAgent(companyId);
+    const neverStartedRunId = await seedNeverStartedHolder(companyId, mentionedAgentId, issueId);
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Release past a never-started holder",
+      status: "in_progress",
+      priority: "high",
+      assigneeAgentId: agentId,
+      checkoutRunId: null,
+      executionRunId: neverStartedRunId,
+      executionAgentNameKey: "mentionedagent",
+      executionLockedAt: new Date(),
+    });
+
+    const res = await request(createApp(agentActor(companyId, agentId, currentRunId)))
+      .post(`/api/issues/${issueId}/release`)
+      .send();
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+
+    const row = await db
+      .select({
+        checkoutRunId: issues.checkoutRunId,
+        executionRunId: issues.executionRunId,
+        executionLockedAt: issues.executionLockedAt,
+      })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]);
+    expect(row).toEqual({
+      checkoutRunId: null,
+      executionRunId: null,
+      executionLockedAt: null,
+    });
+  });
+
+  it("still returns 409 when the never-started holder is the assignee's own queued run", async () => {
+    // Narrowness guard: lazy locking means the assignee's own not-yet-claimed
+    // run legitimately holds the lock. Only a holder that can never run for this
+    // issue — a different agent's — is releasable.
+    const { companyId, agentId, currentRunId } = await seedCompanyAgentAndRuns();
+    const issueId = randomUUID();
+    const ownQueuedRunId = await seedNeverStartedHolder(companyId, agentId, issueId);
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Own queued holder must be preserved",
+      status: "in_progress",
+      priority: "high",
+      assigneeAgentId: agentId,
+      checkoutRunId: null,
+      executionRunId: ownQueuedRunId,
+      executionAgentNameKey: "codexcoder",
+      executionLockedAt: new Date(),
+    });
+
+    const res = await request(createApp(agentActor(companyId, agentId, currentRunId)))
+      .patch(`/api/issues/${issueId}`)
+      .send({ title: "Should fail" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(409);
+    expect(res.body?.error).toBe("Issue run ownership conflict");
+
+    const row = await db
+      .select({ executionRunId: issues.executionRunId })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]);
+    expect(row?.executionRunId).toBe(ownQueuedRunId);
+  });
+
+  it("examines executionRunId in clearCheckoutRunIfTerminal even when checkoutRunId is null", async () => {
+    // Before the fix `if (!issue?.checkoutRunId) return false` made the
+    // executionRunId-without-checkoutRunId row unreachable in this helper.
+    const { companyId, agentId, currentRunId } = await seedCompanyAgentAndRuns();
+    const svc = issueService(db);
+    const mentionedAgentId = await seedSecondAgent(companyId);
+
+    const staleIssueId = randomUUID();
+    const neverStartedRunId = await seedNeverStartedHolder(companyId, mentionedAgentId, staleIssueId);
+    await db.insert(issues).values({
+      id: staleIssueId,
+      companyId,
+      title: "Execution lock without a checkout",
+      status: "in_progress",
+      priority: "high",
+      assigneeAgentId: agentId,
+      checkoutRunId: null,
+      executionRunId: neverStartedRunId,
+      executionAgentNameKey: "mentionedagent",
+      executionLockedAt: new Date(),
+    });
+
+    await expect(svc.clearCheckoutRunIfTerminal(staleIssueId)).resolves.toBe(true);
+    const clearedRow = await db
+      .select({
+        checkoutRunId: issues.checkoutRunId,
+        executionRunId: issues.executionRunId,
+        executionLockedAt: issues.executionLockedAt,
+      })
+      .from(issues)
+      .where(eq(issues.id, staleIssueId))
+      .then((rows) => rows[0]);
+    expect(clearedRow).toEqual({
+      checkoutRunId: null,
+      executionRunId: null,
+      executionLockedAt: null,
+    });
+
+    // A live holder with no checkout is still untouchable.
+    const liveIssueId = randomUUID();
+    await db.insert(issues).values({
+      id: liveIssueId,
+      companyId,
+      title: "Live execution lock without a checkout",
+      status: "in_progress",
+      priority: "high",
+      assigneeAgentId: agentId,
+      checkoutRunId: null,
+      executionRunId: currentRunId,
+      executionAgentNameKey: "codexcoder",
+      executionLockedAt: new Date(),
+    });
+
+    await expect(svc.clearCheckoutRunIfTerminal(liveIssueId)).resolves.toBe(false);
+    const liveRow = await db
+      .select({ executionRunId: issues.executionRunId })
+      .from(issues)
+      .where(eq(issues.id, liveIssueId))
+      .then((rows) => rows[0]);
+    expect(liveRow?.executionRunId).toBe(currentRunId);
   });
 
   it("preserves live checkout ownership on checkout conflicts without retry side effects", async () => {

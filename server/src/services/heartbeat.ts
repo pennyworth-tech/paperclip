@@ -12784,24 +12784,68 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const claimedWakeReason = readNonEmptyString(claimedContext.wakeReason);
     if (claimedIssueId && claimedWakeReason !== "source_scoped_recovery_action") {
       const claimedAgent = await getAgent(claimed.agentId);
-      await db
-        .update(issues)
-        .set({
-          executionRunId: claimed.id,
-          executionAgentNameKey: normalizeAgentNameKey(claimedAgent?.name),
-          executionLockedAt: claimedAt,
-          updatedAt: claimedAt,
-        })
-        .where(
-          and(
-            eq(issues.id, claimedIssueId),
-            eq(issues.companyId, claimed.companyId),
-            // Mention/context runs can touch an issue, but only the current assignee
-            // owns the issue execution lock shown as the active run.
-            eq(issues.assigneeAgentId, claimed.agentId),
-            or(isNull(issues.executionRunId), eq(issues.executionRunId, claimed.id)),
-          ),
-        );
+      const stampExecutionLock = () =>
+        db
+          .update(issues)
+          .set({
+            executionRunId: claimed.id,
+            executionAgentNameKey: normalizeAgentNameKey(claimedAgent?.name),
+            executionLockedAt: claimedAt,
+            updatedAt: claimedAt,
+          })
+          .where(
+            and(
+              eq(issues.id, claimedIssueId),
+              eq(issues.companyId, claimed.companyId),
+              // Mention/context runs can touch an issue, but only the current assignee
+              // owns the issue execution lock shown as the active run.
+              eq(issues.assigneeAgentId, claimed.agentId),
+              or(isNull(issues.executionRunId), eq(issues.executionRunId, claimed.id)),
+            ),
+          )
+          .returning({ id: issues.id });
+
+      let stamped = await stampExecutionLock();
+      if (stamped.length === 0) {
+        // Zero rows is the designed no-op for a mention/context run on someone
+        // else's issue, but it is also how a stale incumbent stays installed:
+        // the same `executionRunId is null or = this run` clause that fences
+        // assertCheckoutOwner also silences this UPDATE, so the run goes on to
+        // execute holding a run id the issue does not recognise and every
+        // mutating route 409s. Drop a releasable holder and re-stamp; if the
+        // lock is still held against the issue's own assignee, say so rather
+        // than failing silently.
+        const releasedStaleHolder = await issuesSvc.clearExecutionRunIfTerminal(claimedIssueId);
+        if (releasedStaleHolder) stamped = await stampExecutionLock();
+
+        if (stamped.length === 0) {
+          const incumbent = await db
+            .select({
+              assigneeAgentId: issues.assigneeAgentId,
+              executionRunId: issues.executionRunId,
+            })
+            .from(issues)
+            .where(and(eq(issues.id, claimedIssueId), eq(issues.companyId, claimed.companyId)))
+            .then((rows) => rows[0] ?? null);
+
+          if (
+            incumbent &&
+            incumbent.assigneeAgentId === claimed.agentId &&
+            incumbent.executionRunId !== claimed.id
+          ) {
+            logger.warn(
+              {
+                runId: claimed.id,
+                agentId: claimed.agentId,
+                issueId: claimedIssueId,
+                incumbentExecutionRunId: incumbent.executionRunId,
+                releasedStaleHolder,
+              },
+              "claimQueuedRun: execution lock stamp matched no rows for the issue's own assignee; run will execute against a foreign executionRunId",
+            );
+          }
+        }
+      }
     }
 
     return claimed;
@@ -18424,6 +18468,35 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         }
 
         if (!activeExecutionRun) {
+          // Candidate eligibility, mirroring the "stale by design" predicate at
+          // the top of this block: a non-`running` candidate owned by an agent
+          // that is not the issue's assignee will never run for this issue, so
+          // it must not become the basis for anything here — neither the lock
+          // nor the deferral. `queued` is in
+          // EXECUTION_PATH_HEARTBEAT_RUN_STATUSES but is not terminal, and
+          // nothing ever moves a never-claimed queued run to a terminal status,
+          // so clearExecutionRunIfTerminal keeps such a holder forever and the
+          // wake it parks in `deferred_issue_execution` is never promoted. That
+          // is how an `@`-mention wake for a busy third agent — which takes no
+          // checkout, so checkoutRunId stays null — ends up owning someone
+          // else's issue permanently.
+          //
+          // A live (`running`) foreign run stays eligible here and still defers
+          // the incoming wake; what it no longer does is take the lock. See the
+          // stamp condition below.
+          //
+          // Expressed as a WHERE rather than a post-select rejection so the scan
+          // falls through to the next eligible candidate: with both a stale
+          // non-assignee queued run and the assignee's own queued run present,
+          // createdAt ordering would otherwise surface the stale one, and
+          // returning null there would enqueue a duplicate run for the assignee
+          // (the issue leg of enqueueWakeup dedupes only via activeExecutionRun).
+          const legacyRunOwnership = issue.assigneeAgentId
+            ? or(
+              eq(heartbeatRuns.status, "running"),
+              eq(heartbeatRuns.agentId, issue.assigneeAgentId),
+            )
+            : undefined;
           const legacyRun = await tx
             .select()
             .from(heartbeatRuns)
@@ -18432,6 +18505,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                 eq(heartbeatRuns.companyId, issue.companyId),
                 inArray(heartbeatRuns.status, [...EXECUTION_PATH_HEARTBEAT_RUN_STATUSES]),
                 sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issue.id}`,
+                legacyRunOwnership,
               ),
             )
             .orderBy(
@@ -18446,20 +18520,45 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               activeExecutionRun = null;
             } else {
               activeExecutionRun = legacyRun;
-              const legacyAgent = await tx
-                .select({ name: agents.name })
-                .from(agents)
-                .where(eq(agents.id, legacyRun.agentId))
-                .then((rows) => rows[0] ?? null);
-              await tx
-                .update(issues)
-                .set({
-                  executionRunId: legacyRun.id,
-                  executionAgentNameKey: normalizeAgentNameKey(legacyAgent?.name),
-                  executionLockedAt: new Date(),
-                  updatedAt: new Date(),
-                })
-                .where(eq(issues.id, issue.id));
+              // "A run is executing this issue" and "that run owns this issue's
+              // execution lock" are separate facts, and this block conflated
+              // them. `activeExecutionRun` is what makes the incoming wake defer
+              // instead of double-executing the issue on one branch, and a live
+              // foreign run must keep earning that. `executionRunId` is what
+              // assertCheckoutOwner fences on, and the claim-time stamp for the
+              // same column already restricts it to the assignee — see
+              // claimQueuedRun: "Mention/context runs can touch an issue, but
+              // only the current assignee owns the issue execution lock shown as
+              // the active run." Stamping a mention run here contradicted that,
+              // and it is how a comment re-armed the fence on an issue whose
+              // lock had just been released (observed in production: the lock
+              // came back naming a run belonging to an agent that was not the
+              // assignee, on an issue already `done`).
+              //
+              // Deferral survives the missing stamp: this scan keys off
+              // contextSnapshot->>'issueId', not off the lock, so every later
+              // wake re-derives the same holder; and the finalize path
+              // (releaseIssueExecutionAndPromote) promotes the parked wake off
+              // the finishing run's own context issue, admitting a null
+              // executionRunId explicitly.
+              const stampsExecutionLock =
+                !issue.assigneeAgentId || legacyRun.agentId === issue.assigneeAgentId;
+              if (stampsExecutionLock) {
+                const legacyAgent = await tx
+                  .select({ name: agents.name })
+                  .from(agents)
+                  .where(eq(agents.id, legacyRun.agentId))
+                  .then((rows) => rows[0] ?? null);
+                await tx
+                  .update(issues)
+                  .set({
+                    executionRunId: legacyRun.id,
+                    executionAgentNameKey: normalizeAgentNameKey(legacyAgent?.name),
+                    executionLockedAt: new Date(),
+                    updatedAt: new Date(),
+                  })
+                  .where(eq(issues.id, issue.id));
+              }
             }
           }
         }
