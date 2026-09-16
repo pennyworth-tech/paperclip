@@ -114,7 +114,8 @@ import {
 import { getPipelineStageColumnTone } from "../lib/pipeline-stage-presentation";
 
 type StageSectionKey = "instructions" | "advanced" | "secrets" | "activity" | "history";
-type ApproverKind = "any_human" | "user" | "agent";
+type ApproverKind = "any_human" | "user" | "agent" | "linked_reviewer";
+const LINKED_REVIEWER_APPROVAL_VALUE = "linked_reviewer";
 type EditableStageKind = "working" | "review" | "done" | "cancelled";
 
 type StageConfig = {
@@ -795,6 +796,9 @@ function approvalValue(config: StageConfig) {
   if (!approver || !approver.kind || approver.kind === "any_human") {
     return "any_human";
   }
+  if (approver.kind === "linked_reviewer") {
+    return LINKED_REVIEWER_APPROVAL_VALUE;
+  }
   if ((approver.kind === "user" || approver.kind === "agent") && approver.id) {
     return `${approver.kind}:${approver.id}`;
   }
@@ -804,6 +808,9 @@ function approvalValue(config: StageConfig) {
 function parseApprovalValue(value: string): { kind: ApproverKind; id: string | null } {
   if (value === "any_human") {
     return { kind: "any_human", id: null };
+  }
+  if (value === LINKED_REVIEWER_APPROVAL_VALUE) {
+    return { kind: "linked_reviewer", id: null };
   }
   const [kind, id] = value.split(":", 2);
   if ((kind === "user" || kind === "agent") && id) {
@@ -1594,6 +1601,11 @@ export function PipelineSettings() {
   );
   const approvalOptions = useMemo<InlineEntityOption[]>(
     () => [
+      {
+        id: LINKED_REVIEWER_APPROVAL_VALUE,
+        label: "Case's linked reviewer",
+        searchText: "linked reviewer review link assignee",
+      },
       ...buildCompanyUserInlineOptions(usersQuery.data?.users),
       ...sortAgentsByRecency(
         (agentsQuery.data ?? []).filter(isAgentTaskTarget),
@@ -1795,9 +1807,11 @@ export function PipelineSettings() {
           executionWorkspaceSettings: currentAutomationExecutionWorkspaceSettings,
         }),
         requireApproval: nextRequiresApproval,
-        approver: nextRequiresApproval && parsedApproval.kind !== "any_human"
-          ? { kind: parsedApproval.kind, id: parsedApproval.id }
-          : { kind: "any_human" },
+        approver: !nextRequiresApproval || parsedApproval.kind === "any_human"
+          ? { kind: "any_human" }
+          : parsedApproval.kind === "linked_reviewer"
+            ? { kind: "linked_reviewer" }
+            : { kind: parsedApproval.kind, id: parsedApproval.id },
         requireChildrenTerminal,
       };
       if (autoAdvanceOnChildrenTerminal) {

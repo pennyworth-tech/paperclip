@@ -1,0 +1,2 @@
+ALTER TABLE "pipeline_case_issue_links" DROP CONSTRAINT "pipeline_case_issue_links_role_check";--> statement-breakpoint
+ALTER TABLE "pipeline_case_issue_links" ADD CONSTRAINT "pipeline_case_issue_links_role_check" CHECK ("pipeline_case_issue_links"."role" in ('origin', 'conversation', 'work', 'automation', 'review'));

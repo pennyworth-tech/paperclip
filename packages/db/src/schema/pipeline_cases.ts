@@ -107,7 +107,7 @@ export const pipelineCaseIssueLinks = pgTable(
     issueIdx: index("pipeline_case_issue_links_issue_idx").on(table.issueId),
     companyCaseIdx: index("pipeline_case_issue_links_company_case_idx").on(table.companyId, table.caseId),
     automationAttemptIdx: index("pipeline_case_issue_links_automation_attempt_idx").on(table.automationAttemptId),
-    roleCheck: check("pipeline_case_issue_links_role_check", sql`${table.role} in ('origin', 'conversation', 'work', 'automation')`),
+    roleCheck: check("pipeline_case_issue_links_role_check", sql`${table.role} in ('origin', 'conversation', 'work', 'automation', 'review')`),
   }),
 );
 

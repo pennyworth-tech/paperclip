@@ -10,10 +10,10 @@ export const pipelineStageKindSchema = z.enum(["working", "review", "done", "can
 export const legacyPipelineStageKindSchema = z.enum(["open", "working", "review", "done", "cancelled"]);
 
 export const pipelineStageApproverSchema = z.object({
-  kind: z.enum(["any_human", "user", "agent"]).optional().default("any_human"),
+  kind: z.enum(["any_human", "user", "agent", "linked_reviewer"]).optional().default("any_human"),
   id: z.string().trim().min(1).max(200).optional(),
 }).superRefine((value, ctx) => {
-  if (value.kind !== "any_human" && (typeof value.id !== "string" || value.id.length === 0)) {
+  if ((value.kind === "user" || value.kind === "agent") && (typeof value.id !== "string" || value.id.length === 0)) {
     ctx.addIssue({
       code: z.ZodIssueCode.custom,
       path: ["id"],

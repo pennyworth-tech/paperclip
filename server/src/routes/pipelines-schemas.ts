@@ -126,7 +126,7 @@ export const reviewCaseSchema = z.object({
   leaseToken: z.string().guid().nullable().optional(),
 });
 export const blockersSchema = z.object({ blockedByCaseIds: z.array(z.string().guid()).max(100) });
-export const issueLinkRoleSchema = z.enum(["origin", "conversation", "work", "automation"]);
+export const issueLinkRoleSchema = z.enum(["origin", "conversation", "work", "automation", "review"]);
 export const createIssueLinkSchema = z.object({
   issueId: z.string().guid(),
   role: issueLinkRoleSchema,
