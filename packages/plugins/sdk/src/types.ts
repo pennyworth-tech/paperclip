@@ -1706,12 +1706,16 @@ export interface PluginPipelinesClient {
    * scoped API route). The host refuses a run that does not belong to that
    * agent and company, then applies the stage's approver rule unchanged — a
    * `linked_reviewer` stage accepts only the assignee of the case's review link.
+   * `fields`, when given, replaces the case's fields in the SAME transaction
+   * as the decision (the REST review route's `edits.fields`), so a refused
+   * decision writes nothing.
    */
   reviewCase(
     caseId: string,
     input: {
       decision: PluginPipelineReviewDecision;
       reason?: string | null;
+      fields?: Record<string, unknown>;
       expectedVersion: number;
       actorAgentId: string;
       actorRunId: string;

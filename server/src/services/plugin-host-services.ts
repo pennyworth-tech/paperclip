@@ -2864,6 +2864,8 @@ export function buildHostServices(
           caseId: params.caseId,
           decision: params.decision,
           reason: params.reason ?? null,
+          // Fields ride the decision's own transaction: a refused decision writes nothing.
+          ...(params.fields !== undefined ? { edits: { fields: params.fields } } : {}),
           expectedVersion: params.expectedVersion,
           actor: { type: "agent", agentId: params.actorAgentId, runId: params.actorRunId },
         });

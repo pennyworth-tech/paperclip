@@ -2076,6 +2076,7 @@ export function createTestHarness(options: TestHarnessOptions): TestHarness {
         if (pipelineCase.stageKind !== "review") throw new Error("Pipeline case is not in a review stage");
         if (pipelineCase.version !== input.expectedVersion) throw new Error("Pipeline case version conflict");
         // The harness does not model stage transitions or approver rules.
+        if (input.fields !== undefined) pipelineCase.fields = { ...input.fields };
         pipelineCase.version += 1;
         return {
           caseId,
