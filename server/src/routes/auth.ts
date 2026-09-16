@@ -9,6 +9,7 @@ import {
 } from "@paperclipai/shared";
 import { unauthorized } from "../errors.js";
 import { validate } from "../middleware/validate.js";
+import { resolveAuthProviderFlags } from "../auth/social-providers.js";
 
 async function loadCurrentUserProfile(db: Db, userId: string) {
   const user = await db
@@ -36,6 +37,13 @@ async function loadCurrentUserProfile(db: Db, userId: string) {
 
 export function authRoutes(db: Db) {
   const router = Router();
+
+  // Unauthenticated on purpose — the sign-in page has to know which
+  // buttons to render before any session exists. Exposes booleans only, never
+  // the client id or secret.
+  router.get("/providers", (_req, res) => {
+    res.json(resolveAuthProviderFlags());
+  });
 
   router.get("/get-session", async (req, res) => {
     if (req.actor.type !== "board" || !req.actor.userId) {

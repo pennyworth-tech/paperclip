@@ -230,6 +230,17 @@ export function InviteLandingPage() {
     queryFn: () => authApi.getSession(),
     retry: false,
   });
+  // The instance decides which sign-in methods exist. The fetch
+  // falls back to the upstream default (email/password only), so an instance
+  // without the providers route renders the invite page exactly as upstream.
+  const { data: providers } = useQuery({
+    queryKey: ["auth", "providers"],
+    queryFn: () => authApi.getProviders(),
+    staleTime: Infinity,
+    retry: false,
+  });
+  const googleEnabled = providers?.google === true;
+  const emailPasswordEnabled = providers?.emailPassword !== false;
   const inviteQuery = useQuery({
     queryKey: queryKeys.access.invite(token),
     queryFn: () => accessApi.getInvite(token),
@@ -662,15 +673,45 @@ export function InviteLandingPage() {
               <div className="space-y-5">
                 <div>
                   <h2 className="text-lg font-semibold">
-                    {authMode === "sign_up" ? "Create your account" : "Sign in to continue"}
+                    {!emailPasswordEnabled
+                      ? "Sign in to continue"
+                      : authMode === "sign_up"
+                        ? "Create your account"
+                        : "Sign in to continue"}
                   </h2>
                   <p className="mt-1 text-sm text-zinc-400">
-                    {authMode === "sign_up"
-                      ? `Start with a Paperclip account. After that, you'll come right back here to accept the invite for ${companyDisplayName}.`
-                      : "Use the Paperclip account that already matches this invite. If you do not have one yet, switch back to create account."}
+                    {!emailPasswordEnabled
+                      ? `Use your Google account to continue with the invite for ${companyDisplayName}.`
+                      : authMode === "sign_up"
+                        ? `Start with a Paperclip account. After that, you'll come right back here to accept the invite for ${companyDisplayName}.`
+                        : "Use the Paperclip account that already matches this invite. If you do not have one yet, switch back to create account."}
                   </p>
                 </div>
 
+                {googleEnabled && (
+                  <Button
+                    type="button"
+                    variant="outline"
+                    className="w-full rounded-none"
+                    onClick={() => {
+                      setAuthFeedback(null);
+                      // Land back on the invite route with the token
+                      // intact so the page's auto-accept effect completes the
+                      // join after the Google round-trip.
+                      authApi.signInSocial("google", `/invite/${token}`).catch((err) => {
+                        setAuthFeedback({
+                          tone: "error",
+                          message: err instanceof Error ? err.message : "Google sign-in failed",
+                        });
+                      });
+                    }}
+                  >
+                    Sign in with Google
+                  </Button>
+                )}
+
+                {emailPasswordEnabled && (
+                <>
                 <div className="flex gap-2">
                   <button
                     type="button"
@@ -807,6 +848,8 @@ export function InviteLandingPage() {
                     ? "Already signed up before? Use the existing-account option instead so the invite lands on the right Paperclip user."
                     : "No account yet? Switch back to create account so you can accept the invite with a new login."}
                 </p>
+                </>
+                )}
               </div>
             ) : (
               <div className="space-y-4">

@@ -22,6 +22,7 @@ import {
   resolveWorkspaceHandoffLocalKey,
   resolveWorkspaceHandoffLocalWorkspaceId,
 } from "./workspace-login-handoff.js";
+import { isEmailPasswordAuthEnabled, resolveGoogleSocialProvider } from "./social-providers.js";
 
 export type BetterAuthSessionUser = {
   id: string;
@@ -200,6 +201,10 @@ export function createBetterAuthInstance(db: Db, config: Config, trustedOrigins:
     publicUrl,
   });
 
+  // Absent env vars mean no social provider and email/password enabled —
+  // unchanged default behaviour.
+  const googleProvider = resolveGoogleSocialProvider();
+
   const authConfig = {
     baseURL: baseUrl,
     secret,
@@ -214,10 +219,11 @@ export function createBetterAuthInstance(db: Db, config: Config, trustedOrigins:
       },
     }),
     emailAndPassword: {
-      enabled: true,
+      enabled: isEmailPasswordAuthEnabled(),
       requireEmailVerification: false,
       disableSignUp: config.authDisableSignUp,
     },
+    ...(googleProvider ? { socialProviders: { google: googleProvider } } : {}),
     rateLimit: buildBetterAuthRateLimitOptions({
       deploymentMode: config.deploymentMode,
       deploymentExposure: config.deploymentExposure,

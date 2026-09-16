@@ -811,6 +811,7 @@ const PUBLIC_OPERATIONS = new Set([
   "POST /api/cli-auth/challenges",
   "GET /api/cli-auth/challenges/{id}",
   "POST /api/cli-auth/challenges/{id}/cancel",
+  "GET /api/auth/providers",
   "GET /api/invites/{token}",
   "GET /api/invites/{token}/logo",
   "GET /api/invites/{token}/onboarding",
@@ -4420,6 +4421,19 @@ registry.registerPath({
 });
 
 // ─── Auth / profile ──────────────────────────────────────────────────────────
+
+registry.registerPath({
+  method: "get",
+  path: "/api/auth/providers",
+  tags: ["auth"],
+  summary: "List the interactive sign-in methods this instance offers",
+  responses: {
+    200: r.ok(z.object({
+      google: z.boolean(),
+      emailPassword: z.boolean(),
+    })),
+  },
+});
 
 registry.registerPath({
   method: "get",

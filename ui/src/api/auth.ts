@@ -145,7 +145,34 @@ async function authPatch<T>(path: string, body: Record<string, unknown>, parse: 
   return parse(payload);
 }
 
+// Which interactive sign-in methods this instance offers.
+export type AuthProviderFlags = { google: boolean; emailPassword: boolean };
+
 export const authApi = {
+  // Falls back to the upstream default (email/password only) so a server
+  // without the providers route still renders a usable sign-in page.
+  getProviders: async (): Promise<AuthProviderFlags> => {
+    const res = await fetch("/api/auth/providers", {
+      credentials: "include",
+      headers: { Accept: "application/json" },
+    });
+    if (!res.ok) return { google: false, emailPassword: true };
+    const payload = await res.json().catch(() => null) as Partial<AuthProviderFlags> | null;
+    return {
+      google: payload?.google === true,
+      emailPassword: payload?.emailPassword !== false,
+    };
+  },
+
+  // Better Auth answers with the provider authorization URL; the browser has to
+  // perform the top-level navigation itself.
+  signInSocial: async (provider: string, callbackURL: string) => {
+    const payload = await authPost("/sign-in/social", { provider, callbackURL }) as { url?: string } | null;
+    const url = payload?.url;
+    if (!url) throw new Error("Sign-in provider did not return a redirect URL");
+    window.location.assign(url);
+  },
+
   getSession: async (): Promise<AuthSession | null> => {
     const res = await fetch("/api/auth/get-session", {
       credentials: "include",
