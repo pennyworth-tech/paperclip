@@ -17579,33 +17579,71 @@ export function heartbeatService(
       claimedWakeReason !== "source_scoped_recovery_action"
     ) {
       const claimedAgent = await getAgent(claimed.agentId);
-      await db
-        .update(issues)
-        .set({
-          executionRunId: claimed.id,
-          executionAgentNameKey: normalizeAgentNameKey(claimedAgent?.name),
-          executionLockedAt: claimedAt,
-          updatedAt: claimedAt,
-        })
-        .where(
-          and(
-            eq(issues.id, claimedIssueId),
-            eq(issues.companyId, claimed.companyId),
-            // Mention/context runs can touch an issue, but only the current assignee
-            // owns the issue execution lock shown as the active run.
-            eq(issues.assigneeAgentId, claimed.agentId),
-            claimed.scheduledRetryReason === "native_safe_replacement"
-              ? or(
-                  isNull(issues.checkoutRunId),
-                  eq(issues.checkoutRunId, claimed.id),
-                )
-              : undefined,
-            or(
-              isNull(issues.executionRunId),
-              eq(issues.executionRunId, claimed.id),
+      const stampExecutionLock = () =>
+        db
+          .update(issues)
+          .set({
+            executionRunId: claimed.id,
+            executionAgentNameKey: normalizeAgentNameKey(claimedAgent?.name),
+            executionLockedAt: claimedAt,
+            updatedAt: claimedAt,
+          })
+          .where(
+            and(
+              eq(issues.id, claimedIssueId),
+              eq(issues.companyId, claimed.companyId),
+              // Mention/context runs can touch an issue, but only the current assignee
+              // owns the issue execution lock shown as the active run.
+              eq(issues.assigneeAgentId, claimed.agentId),
+              claimed.scheduledRetryReason === "native_safe_replacement"
+                ? or(isNull(issues.checkoutRunId), eq(issues.checkoutRunId, claimed.id))
+                : undefined,
+              or(isNull(issues.executionRunId), eq(issues.executionRunId, claimed.id)),
             ),
-          ),
-        );
+          )
+          .returning({ id: issues.id });
+
+      let stamped = await stampExecutionLock();
+      if (stamped.length === 0) {
+        // Zero rows is the designed no-op for a mention/context run on someone
+        // else's issue, but it is also how a stale incumbent stays installed:
+        // the same `executionRunId is null or = this run` clause that fences
+        // assertCheckoutOwner also silences this UPDATE, so the run goes on to
+        // execute holding a run id the issue does not recognise and every
+        // mutating route 409s. Drop a releasable holder and re-stamp; if the
+        // lock is still held against the issue's own assignee, say so rather
+        // than failing silently.
+        const releasedStaleHolder = await issuesSvc.clearExecutionRunIfTerminal(claimedIssueId);
+        if (releasedStaleHolder) stamped = await stampExecutionLock();
+
+        if (stamped.length === 0) {
+          const incumbent = await db
+            .select({
+              assigneeAgentId: issues.assigneeAgentId,
+              executionRunId: issues.executionRunId,
+            })
+            .from(issues)
+            .where(and(eq(issues.id, claimedIssueId), eq(issues.companyId, claimed.companyId)))
+            .then((rows) => rows[0] ?? null);
+
+          if (
+            incumbent &&
+            incumbent.assigneeAgentId === claimed.agentId &&
+            incumbent.executionRunId !== claimed.id
+          ) {
+            logger.warn(
+              {
+                runId: claimed.id,
+                agentId: claimed.agentId,
+                issueId: claimedIssueId,
+                incumbentExecutionRunId: incumbent.executionRunId,
+                releasedStaleHolder,
+              },
+              "claimQueuedRun: execution lock stamp matched no rows for the issue's own assignee; run will execute against a foreign executionRunId",
+            );
+          }
+        }
+      }
     }
 
     return claimed;
@@ -26947,6 +26985,11 @@ export function heartbeatService(
           }
 
           if (!activeExecutionRun) {
+            // A foreign queued run cannot execute as this issue's assignee.
+            // Filter in SQL so an eligible assignee run is still discovered.
+            const legacyRunOwnership = issue.assigneeAgentId
+              ? or(eq(heartbeatRuns.status, "running"), eq(heartbeatRuns.agentId, issue.assigneeAgentId))
+              : undefined;
             const legacyRun = await tx
               .select()
               .from(heartbeatRuns)
@@ -26957,6 +27000,7 @@ export function heartbeatService(
                     ...EXECUTION_PATH_HEARTBEAT_RUN_STATUSES,
                   ]),
                   sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issue.id}`,
+                  legacyRunOwnership,
                 ),
               )
               .orderBy(
@@ -26971,6 +27015,9 @@ export function heartbeatService(
                 activeExecutionRun = null;
               } else {
                 activeExecutionRun = legacyRun;
+                // A running foreign run still defers this wake, but only the
+                // assignee may acquire the execution lock used by mutations.
+                if (!issue.assigneeAgentId || legacyRun.agentId === issue.assigneeAgentId) {
                 const legacyAgent = await tx
                   .select({ name: agents.name })
                   .from(agents)
@@ -26987,6 +27034,7 @@ export function heartbeatService(
                     updatedAt: new Date(),
                   })
                   .where(eq(issues.id, issue.id));
+                }
               }
             }
           }
