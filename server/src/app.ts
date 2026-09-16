@@ -91,9 +91,11 @@ import { logger } from "./middleware/logger.js";
 import { DEFAULT_LOCAL_PLUGIN_DIR, pluginLoader, type PluginLoader } from "./services/plugin-loader.js";
 import {
   SELF_HOSTED_AUTO_INSTALL_KEYS,
+  buildBundledPluginCatalog,
   ensureBundledPlugins,
   resolveBundledCatalogRoot,
   resolveBundledPluginInstalls,
+  type ConfiguredBundledPluginCatalogEntry,
 } from "./services/bundled-plugins.js";
 import { createPluginWorkerManager, type PluginWorkerManager } from "./services/plugin-worker-manager.js";
 import { createPluginJobScheduler } from "./services/plugin-job-scheduler.js";
@@ -316,6 +318,13 @@ export async function createApp(
      * bundled catalog fail-to-start (see services/bundled-plugins.ts).
      */
     managedPluginAutoInstall?: readonly string[] | null;
+    /**
+     * `plugins.catalog` from the managed config: additive bundled-catalog
+     * entries for bundles this image ships beyond the compiled-in seven.
+     * Composed onto `BUNDLED_PLUGIN_CATALOG` fail-to-start; a key colliding
+     * with a compiled-in one refuses startup.
+     */
+    managedPluginCatalog?: readonly ConfiguredBundledPluginCatalogEntry[] | null;
     /** Test override for the bundled plugin catalog root. */
     bundledPluginCatalogRoot?: string;
   },
@@ -373,9 +382,11 @@ export async function createApp(
   const managedAutoInstallKeys = opts.managedPluginAutoInstall ?? null;
   const bundledCatalogRoot =
     opts.bundledPluginCatalogRoot ?? resolveBundledCatalogRoot(process.env);
+  const bundledPluginCatalog = buildBundledPluginCatalog(opts.managedPluginCatalog ?? []);
   const bundledPluginInstalls = resolveBundledPluginInstalls(
     managedAutoInstallKeys ?? SELF_HOSTED_AUTO_INSTALL_KEYS,
     {
+      catalog: bundledPluginCatalog,
       catalogRoot: bundledCatalogRoot,
       env: process.env,
       enforceCatalogRoot: managedAutoInstallKeys !== null,

@@ -843,6 +843,10 @@ export async function startServer(): Promise<StartedServer> {
   // document parsed fail-closed above (`plugins.autoInstall`). Absent env means
   // self-hosted: createApp falls back to its built-in kubernetes-only default.
   const managedPluginAutoInstall = managedConfig?.plugins.autoInstall ?? null;
+  // Additive catalog entries the same document declares, for bundles this
+  // image ships beyond the compiled-in catalog. Composed fail-to-start inside
+  // createApp; absent/self-hosted leaves the compiled-in catalog untouched.
+  const managedPluginCatalog = managedConfig?.plugins.catalog ?? null;
   const app = await createApp(db as any, {
     uiMode,
     serverPort: listenPort,
@@ -879,6 +883,7 @@ export async function startServer(): Promise<StartedServer> {
     pluginWorkerManager,
     decisionServiceOptions,
     managedPluginAutoInstall,
+    managedPluginCatalog,
   });
   const server = createServer(app as unknown as Parameters<typeof createServer>[0]);
 

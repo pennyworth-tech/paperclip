@@ -52,7 +52,7 @@ describe("parseManagedConfigEnv", () => {
       mode: "cloud",
       catalogVersion: "2026.720.0",
       features: { enableApps: false, enablePipelines: true },
-      plugins: { autoInstall: ["daytona", "kubernetes"] },
+      plugins: { autoInstall: ["daytona", "kubernetes"], catalog: [] },
       environments: [],
     });
   });
@@ -66,7 +66,7 @@ describe("parseManagedConfigEnv", () => {
       mode: "cloud",
       catalogVersion: "2026.720.0",
       features: {},
-      plugins: { autoInstall: [] },
+      plugins: { autoInstall: [], catalog: [] },
       environments: [],
     });
   });
@@ -222,6 +222,109 @@ describe("parseManagedConfigEnv", () => {
         envWith(validDoc({ plugins: { autoInstall: ["daytona", "daytona"] } })),
       ),
     ).toThrow(/duplicate entry "daytona"/);
+  });
+});
+
+describe("parseManagedConfigEnv plugins.catalog section", () => {
+  const entry = (overrides: Record<string, unknown> = {}) => ({
+    key: "acme-operations",
+    pluginKey: "acme.operations",
+    relativePath: "acme/operations",
+    ...overrides,
+  });
+
+  const withCatalog = (catalog: unknown, autoInstall: unknown = ["acme-operations"]) =>
+    validDoc({ plugins: { autoInstall, catalog } });
+
+  it("defaults to an empty list when the section is absent (pre-section documents keep booting)", () => {
+    expect(parseManagedConfigEnv(envWith(validDoc()))?.plugins.catalog).toEqual([]);
+  });
+
+  it("parses a declared entry elected by autoInstall", () => {
+    const config = parseManagedConfigEnv(envWith(withCatalog([entry()])));
+    expect(config?.plugins.catalog).toEqual([
+      { key: "acme-operations", pluginKey: "acme.operations", relativePath: "acme/operations" },
+    ]);
+    expect(config?.plugins.autoInstall).toEqual(["acme-operations"]);
+  });
+
+  it("throws on a malformed section or entry", () => {
+    expect(() => parseManagedConfigEnv(envWith(withCatalog({})))).toThrow(
+      /"plugins.catalog" must be an array/,
+    );
+    expect(() => parseManagedConfigEnv(envWith(withCatalog(["acme-operations"])))).toThrow(
+      /"plugins.catalog\[0\]" must be an object/,
+    );
+    expect(() =>
+      parseManagedConfigEnv(envWith(withCatalog([entry({ extra: 1 })]))),
+    ).toThrow(/"plugins.catalog\[0\]" has unknown key "extra"/);
+    expect(() =>
+      parseManagedConfigEnv(envWith(withCatalog([{ key: "acme-operations", pluginKey: "acme.operations" }]))),
+    ).toThrow(/"plugins.catalog\[0\]" requires "relativePath"/);
+  });
+
+  it("rejects a pathOverrideEnvVar key outright (a document cannot introduce a relocating env var)", () => {
+    expect(() =>
+      parseManagedConfigEnv(
+        envWith(withCatalog([entry({ pathOverrideEnvVar: "ACME_PLUGIN_PATH" })])),
+      ),
+    ).toThrow(/"plugins.catalog\[0\]" has unknown key "pathOverrideEnvVar"/);
+  });
+
+  it("throws on a malformed key or pluginKey", () => {
+    expect(() => parseManagedConfigEnv(envWith(withCatalog([entry({ key: "Acme_Ops" })])))).toThrow(
+      /"plugins.catalog\[0\].key" must be a lowercase catalog key/,
+    );
+    expect(() =>
+      parseManagedConfigEnv(envWith(withCatalog([entry({ pluginKey: "Acme Ops" })]))),
+    ).toThrow(/"plugins.catalog\[0\].pluginKey" must be a plugin manifest id/);
+  });
+
+  // The lexical half of path containment: rejected on spelling, before any
+  // filesystem call, so no realpath or mount can influence the outcome.
+  it("rejects a relativePath that could escape the catalog root", () => {
+    const rejected = [
+      "../../etc",
+      "acme/../../etc",
+      "/etc/passwd",
+      "~/evil",
+      "acme\\operations",
+      ".hidden/operations",
+      "a/b/c/d",
+      "",
+      " acme/operations",
+    ];
+    for (const relativePath of rejected) {
+      expect(() =>
+        parseManagedConfigEnv(envWith(withCatalog([entry({ relativePath })]))),
+      ).toThrow(/"plugins.catalog\[0\].relativePath"/);
+    }
+  });
+
+  it("throws on duplicate key or pluginKey within the section", () => {
+    expect(() =>
+      parseManagedConfigEnv(
+        envWith(
+          withCatalog([entry(), entry({ pluginKey: "acme.other" })], ["acme-operations"]),
+        ),
+      ),
+    ).toThrow(/duplicate key "acme-operations"/);
+    expect(() =>
+      parseManagedConfigEnv(
+        envWith(
+          withCatalog(
+            [entry(), entry({ key: "acme-other", relativePath: "acme/other" })],
+            ["acme-operations", "acme-other"],
+          ),
+        ),
+      ),
+    ).toThrow(/duplicate pluginKey "acme.operations"/);
+  });
+
+  it("throws when a declared entry is never elected by autoInstall (dead configuration)", () => {
+    expect(() => parseManagedConfigEnv(envWith(withCatalog([entry()], ["daytona"])))).toThrow(
+      /"plugins.catalog\[0\].key" is "acme-operations", which is not in "plugins.autoInstall"/,
+    );
   });
 });
 
