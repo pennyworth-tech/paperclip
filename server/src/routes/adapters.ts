@@ -28,6 +28,7 @@ import {
   resolveExternalAdapterRegistration,
   unregisterServerAdapter,
   isOverridePaused,
+  isConfiguredBuiltinAdapter,
   setOverridePaused,
 } from "../adapters/registry.js";
 import {
@@ -127,7 +128,18 @@ interface AdapterCapabilities {
 interface AdapterInfo {
   type: string;
   label: string;
-  source: "builtin" | "external";
+  /**
+   * Where the adapter came from: compiled into this build, declared by the
+   * managed config and shipped in this image, or installed at runtime as a
+   * plugin. The user interface needs the middle case distinguished — it has no
+   * compiled-in module for a configured adapter, so it must bridge one the way
+   * it does for an external, but the adapter is not removable or reinstallable.
+   */
+  source: "builtin" | "configured" | "external";
+  /** One-line description, when the adapter carries one. */
+  description?: string;
+  /** Icon selector resolved against the interface's own icon set. */
+  iconName?: string;
   modelsCount: number;
   loaded: boolean;
   disabled: boolean;
@@ -199,8 +211,14 @@ function buildAdapterInfo(adapter: ServerAdapterModule, externalRecord: AdapterP
   const fromDisk = externalRecord ? readAdapterPackageVersionFromDisk(externalRecord) : undefined;
   return {
     type: adapter.type,
-    label: adapter.type, // ServerAdapterModule doesn't have a separate "label" field; type serves as label
-    source: externalRecord ? "external" : "builtin",
+    label: adapter.displayName ?? adapter.type,
+    source: externalRecord
+      ? "external"
+      : isConfiguredBuiltinAdapter(adapter.type)
+        ? "configured"
+        : "builtin",
+    ...(adapter.description !== undefined ? { description: adapter.description } : {}),
+    ...(adapter.iconName !== undefined ? { iconName: adapter.iconName } : {}),
     modelsCount: (adapter.models ?? []).length,
     loaded: true, // If it's in the registry, it's loaded
     disabled: disabledSet.has(adapter.type),

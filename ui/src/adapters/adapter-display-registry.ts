@@ -1,9 +1,20 @@
 /**
  * Single source of truth for adapter display metadata.
  *
- * Built-in adapters have entries in `adapterDisplayMap`. External (plugin)
- * adapters get sensible defaults derived from their type string via
- * `getAdapterDisplay()`.
+ * Three tiers, consulted in order:
+ *
+ * 1. `adapterDisplayMap`, compiled in. Always wins, so no label of a shipped
+ *    adapter can be changed from outside this bundle.
+ * 2. `runtimeDisplay`, populated from the server's adapter listing. Lets an
+ *    adapter the bundle has no entry for — one a server declares and ships —
+ *    present a real name instead of a humanized type id.
+ * 3. A default derived from the type string.
+ *
+ * An icon is a *selector*, not an image: names resolve against `ICONS` below
+ * and an unrecognized one falls back to `Cpu`. Nothing dynamic is ever derived
+ * from a name — no import, no URL, no markup. A vendor wanting its own artwork
+ * still needs a change in this file, which is the honest boundary: an icon is
+ * code, and code comes from the bundle.
  */
 import type { ComponentType } from "react";
 import {
@@ -155,6 +166,62 @@ const adapterDisplayMap: Record<string, AdapterDisplayInfo> = {
 };
 
 // ---------------------------------------------------------------------------
+// Runtime display overlay
+// ---------------------------------------------------------------------------
+
+/**
+ * The closed set of icons a server-supplied `iconName` may select. Adding a
+ * name here is a deliberate act in this bundle; a name that is not here
+ * resolves to `Cpu`.
+ */
+const ICONS: Record<string, ComponentType<{ className?: string }>> = {
+  bot: Bot,
+  code: Code,
+  cpu: Cpu,
+  gem: Gem,
+  moon: Moon,
+  pointer: MousePointer2,
+  sparkles: Sparkles,
+  terminal: Terminal,
+};
+
+export interface RuntimeAdapterDisplay {
+  type: string;
+  label?: string;
+  description?: string;
+  iconName?: string;
+}
+
+const runtimeDisplay = new Map<string, AdapterDisplayInfo>();
+
+/**
+ * Record display metadata the server reported for adapters this bundle has no
+ * compiled-in entry for. Replaces the previous overlay wholesale, so an
+ * adapter the server stops reporting stops overlaying.
+ *
+ * Entries for types already in `adapterDisplayMap` are ignored rather than
+ * stored: the compiled-in map is the authority for everything this bundle
+ * ships, and letting a server response edit those labels is a change of trust
+ * boundary for no benefit.
+ */
+export function setRuntimeAdapterDisplay(entries: readonly RuntimeAdapterDisplay[]): void {
+  runtimeDisplay.clear();
+  for (const entry of entries) {
+    if (entry.type in adapterDisplayMap) continue;
+    const suffix = getTypeSuffix(entry.type);
+    const label = entry.label && entry.label !== entry.type
+      ? entry.label
+      : withSuffix(humanizeType(entry.type), suffix);
+    runtimeDisplay.set(entry.type, {
+      label,
+      description:
+        entry.description ?? (suffix ? `External ${suffix} adapter` : "External adapter"),
+      icon: (entry.iconName ? ICONS[entry.iconName] : undefined) ?? Cpu,
+    });
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 
@@ -176,6 +243,8 @@ export function getAdapterLabel(type: string): string {
   // "OpenClaw Gateway (gateway)".
   const known = adapterDisplayMap[type];
   if (known) return known.label;
+  const runtime = runtimeDisplay.get(type);
+  if (runtime) return runtime.label;
   return withSuffix(humanizeType(type), getTypeSuffix(type));
 }
 
@@ -190,6 +259,9 @@ export function getAdapterLabels(): Record<string, string> {
 export function getAdapterDisplay(type: string): AdapterDisplayInfo {
   const known = adapterDisplayMap[type];
   if (known) return known;
+
+  const runtime = runtimeDisplay.get(type);
+  if (runtime) return runtime;
 
   const suffix = getTypeSuffix(type);
   const label = withSuffix(humanizeType(type), suffix);

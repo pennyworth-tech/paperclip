@@ -5,7 +5,7 @@ import {
   getUIAdapter,
   listUIAdapters,
   registerUIAdapter,
-  syncExternalAdapters,
+  syncServerAdapters,
   unregisterUIAdapter,
 } from "./registry";
 import { processUIAdapter } from "./process";
@@ -22,12 +22,12 @@ const externalUIAdapter: UIAdapterModule = {
 describe("ui adapter registry", () => {
   beforeEach(() => {
     unregisterUIAdapter("external_test");
-    syncExternalAdapters([]);
+    syncServerAdapters([]);
   });
 
   afterEach(() => {
     unregisterUIAdapter("external_test");
-    syncExternalAdapters([]);
+    syncServerAdapters([]);
   });
 
   it("registers adapters for lookup and listing", () => {
@@ -56,7 +56,7 @@ describe("ui adapter registry", () => {
     for (const type of ["hermes_local", "hermes_gateway"]) {
       const builtin = getUIAdapter(type);
 
-      syncExternalAdapters([{ type, label: "External Hermes" }]);
+      syncServerAdapters([{ type, label: "External Hermes" }]);
 
       const overridden = getUIAdapter(type);
       expect(overridden).not.toBe(builtin);
@@ -65,14 +65,14 @@ describe("ui adapter registry", () => {
       expect(overridden.ConfigFields).toBe(builtin.ConfigFields);
       expect(overridden.buildAdapterConfig).toBe(builtin.buildAdapterConfig);
 
-      syncExternalAdapters([{ type, label: "External Hermes", overrideDisabled: true }]);
+      syncServerAdapters([{ type, label: "External Hermes", overrideDisabled: true }]);
 
       expect(getUIAdapter(type)).toBe(builtin);
 
-      syncExternalAdapters([{ type, label: "External Hermes" }]);
+      syncServerAdapters([{ type, label: "External Hermes" }]);
       expect(getUIAdapter(type)).not.toBe(builtin);
 
-      syncExternalAdapters([]);
+      syncServerAdapters([]);
 
       expect(getUIAdapter(type)).toBe(builtin);
     }

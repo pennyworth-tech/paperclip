@@ -4,7 +4,7 @@ export {
   findUIAdapter,
   registerUIAdapter,
   unregisterUIAdapter,
-  syncExternalAdapters,
+  syncServerAdapters,
   onAdapterChange,
 } from "./registry";
 export { buildTranscript } from "./transcript";

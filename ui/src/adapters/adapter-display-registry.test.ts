@@ -1,6 +1,16 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
+import { Cpu, Terminal } from "lucide-react";
 
-import { getAdapterDisplay, getAdapterLabel, getAdapterLabels } from "./adapter-display-registry";
+import {
+  getAdapterDisplay,
+  getAdapterLabel,
+  getAdapterLabels,
+  setRuntimeAdapterDisplay,
+} from "./adapter-display-registry";
+
+afterEach(() => {
+  setRuntimeAdapterDisplay([]);
+});
 
 describe("adapter display registry", () => {
   it("uses user-facing labels without the legacy local qualifier for built-in adapters", () => {
@@ -45,5 +55,59 @@ describe("adapter display registry", () => {
       label: "Droid (gateway)",
       description: "External gateway adapter",
     });
+  });
+});
+
+describe("runtime adapter display overlay", () => {
+  it("gives an adapter this bundle does not know a real name, description and icon", () => {
+    setRuntimeAdapterDisplay([
+      {
+        type: "my_adapter",
+        label: "My Adapter",
+        description: "An adapter shipped in the server image",
+        iconName: "terminal",
+      },
+    ]);
+    expect(getAdapterLabel("my_adapter")).toBe("My Adapter");
+    expect(getAdapterDisplay("my_adapter")).toEqual({
+      label: "My Adapter",
+      description: "An adapter shipped in the server image",
+      icon: Terminal,
+    });
+  });
+
+  it("falls back to the derived display when the server sends no metadata", () => {
+    setRuntimeAdapterDisplay([{ type: "droid_local", label: "droid_local" }]);
+    expect(getAdapterDisplay("droid_local")).toMatchObject({
+      label: "Droid",
+      description: "External adapter",
+      icon: Cpu,
+    });
+  });
+
+  // An icon name selects from a closed set; it never becomes an import, a URL,
+  // or markup. An unrecognized name is simply the default icon.
+  it("resolves an unrecognized icon name to the default", () => {
+    setRuntimeAdapterDisplay([
+      { type: "my_adapter", label: "My Adapter", iconName: "../../evil.svg" },
+    ]);
+    expect(getAdapterDisplay("my_adapter").icon).toBe(Cpu);
+  });
+
+  // The compiled-in map is the authority for everything this bundle ships, so
+  // a server response cannot rename a shipped adapter.
+  it("cannot override a compiled-in adapter's display", () => {
+    setRuntimeAdapterDisplay([
+      { type: "claude_local", label: "Not Claude", description: "spoofed", iconName: "terminal" },
+    ]);
+    expect(getAdapterLabel("claude_local")).toBe("Claude Code");
+    expect(getAdapterDisplay("claude_local").description).toBe("Claude Code CLI harness");
+  });
+
+  it("drops an adapter the server stops reporting", () => {
+    setRuntimeAdapterDisplay([{ type: "droid_local", label: "Droid Deluxe" }]);
+    expect(getAdapterLabel("droid_local")).toBe("Droid Deluxe");
+    setRuntimeAdapterDisplay([]);
+    expect(getAdapterLabel("droid_local")).toBe("Droid");
   });
 });

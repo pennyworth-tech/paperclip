@@ -37,7 +37,17 @@ export interface AcpTargetDescriptor {
 export interface AdapterInfo {
   type: string;
   label: string;
-  source: "builtin" | "external";
+  /**
+   * `builtin` is compiled into the server, `configured` is declared by the
+   * managed config and shipped in the server image, `external` is a plugin
+   * installed at runtime. The last two both need a bridge adapter here,
+   * because this bundle has no compiled-in module for either.
+   */
+  source: "builtin" | "configured" | "external";
+  /** One-line description, when the adapter carries one. */
+  description?: string;
+  /** Icon selector, resolved against this bundle's own icon set. */
+  iconName?: string;
   modelsCount: number;
   loaded: boolean;
   disabled: boolean;
