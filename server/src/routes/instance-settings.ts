@@ -64,11 +64,91 @@ function assertCanManageInstanceSettings(req: Request) {
   throw forbidden("Instance admin access required");
 }
 
+// Operator drain surface. The drain flag is DB-backed so every
+// instance sharing the database honors it — a deploy sets it before staging a
+// new revision, waits for running runs to settle, interrupts the stragglers,
+// and clears it after promote. GET is board-readable (deploy tooling and
+// operators need to observe the state); every mutation is instance-admin.
+async function logInstanceDrainActivity(
+  db: Db,
+  action: string,
+  req: Request,
+  svc: ReturnType<typeof instanceSettingsService>,
+  details: Record<string, unknown>,
+) {
+  const actor = getActorInfo(req);
+  const companyIds = await svc.listCompanyIds();
+  await Promise.all(
+    companyIds.map((companyId) =>
+      logActivity(db, {
+        companyId,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        runId: actor.runId,
+        agentApiKeyId: actor.agentApiKeyId,
+        action,
+        entityType: "instance_settings",
+        entityId: "drain",
+        details,
+      }),
+    ),
+  );
+}
+
 export function instanceSettingsRoutes(db: Db) {
   const router = Router();
   const svc = instanceSettingsService(db);
   const environments = environmentService(db);
   const heartbeat = heartbeatService(db);
+
+  const drainStateView = async () => {
+    const [drain, snapshot] = await Promise.all([
+      svc.getOperatorDrain(),
+      heartbeat.getOperatorDrainSnapshot(),
+    ]);
+    return { draining: drain.active, startedAt: drain.startedAt, ...snapshot };
+  };
+
+  router.get("/instance/drain", async (req, res) => {
+    assertBoardOrgAccess(req);
+    res.json(await drainStateView());
+  });
+
+  router.post("/instance/drain", async (req, res) => {
+    assertCanManageInstanceSettings(req);
+    const drain = await svc.setOperatorDrain(true);
+    await logInstanceDrainActivity(db, "instance.drain.set", req, svc, {
+      draining: drain.active,
+      startedAt: drain.startedAt,
+    });
+    res.json(await drainStateView());
+  });
+
+  router.delete("/instance/drain", async (req, res) => {
+    assertCanManageInstanceSettings(req);
+    const drain = await svc.setOperatorDrain(false);
+    await logInstanceDrainActivity(db, "instance.drain.cleared", req, svc, {
+      draining: drain.active,
+      startedAt: drain.startedAt,
+    });
+    res.json(await drainStateView());
+  });
+
+  // Interrupts the stragglers on the instance that serves this request — the
+  // still-serving revision, the only one holding the live executions — exactly
+  // like the graceful-shutdown path, retries queued. Call it AFTER the bounded
+  // drain wait, before staging the new revision.
+  router.post("/instance/drain/interrupt", async (req, res) => {
+    assertCanManageInstanceSettings(req);
+    const drainResult = await heartbeat.drainRunningRunsForShutdown("SIGTERM");
+    await logInstanceDrainActivity(db, "instance.drain.interrupted", req, svc, {
+      interrupted: drainResult.interrupted,
+      interruptedRunIds: drainResult.interruptedRunIds,
+      retryRunIds: drainResult.retryRunIds,
+    });
+    res.json({ ...(await drainStateView()), interrupted: drainResult.interrupted, retryRunIds: drainResult.retryRunIds });
+  });
 
   router.get("/instance/settings", async (req, res) => {
     assertBoardOrgAccess(req);

@@ -62,6 +62,8 @@ describe("instance settings service", () => {
       enableProductivityReviewActiveExecutionDuration: false,
       enableProductivityReviewOwnerBurstCap: false,
       productivityReviewMaxCreationsPerOwnerPerSweep: 1,
+      operatorDrainActive: false,
+      operatorDrainStartedAt: null,
       issueGraphLivenessAutoRecoveryLookbackHours: 48,
     });
   });

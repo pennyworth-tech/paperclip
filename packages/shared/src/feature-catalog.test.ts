@@ -26,6 +26,10 @@ function schemaBooleanFlagKeys(): string[] {
       return current instanceof z.ZodBoolean;
     })
     .map(([key]) => key)
+    // Server-managed operator state, not a configurable feature —
+    // carved out of the catalog at the type level, so the expected-key
+    // derivation subtracts it too.
+    .filter((key) => key !== "operatorDrainActive")
     .sort();
 }
 

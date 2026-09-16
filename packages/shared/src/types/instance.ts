@@ -154,19 +154,37 @@ export interface InstanceExperimentalSettings {
    * `enableProductivityReviewOwnerBurstCap` is true.
    */
   productivityReviewMaxCreationsPerOwnerPerSweep: number;
+  /**
+   * Server-managed operator drain. While true, every runtime
+   * instance sharing this database holds run scheduling (dispatch, queued-run
+   * resume, the orphan reaper) so a deploy can drain running work before a new
+   * revision stages. Written only by the instance drain routes; client PATCH
+   * payloads must not control this value.
+   */
+  operatorDrainActive: boolean;
+  /**
+   * When the operator drain was last armed, so a drain left set by a failed
+   * deploy is visible and ageable. Null when not draining.
+   */
+  operatorDrainStartedAt: string | null;
   issueGraphLivenessAutoRecoveryLookbackHours: number;
 }
 
 /**
  * Boolean feature-flag keys of the experimental settings — the only keys a
  * cloud managed-config overlay may target. Server-managed bookkeeping fields
- * (activation cutoffs, lookback hours) are excluded by construction.
+ * (activation cutoffs, lookback hours) are excluded by construction, and so
+ * is `operatorDrainActive`: it is operational state owned by the instance
+ * drain routes, never a configurable feature.
  */
-export type ManagedExperimentalFeatureKey = {
-  [K in keyof InstanceExperimentalSettings]-?: InstanceExperimentalSettings[K] extends boolean
-    ? K
-    : never;
-}[keyof InstanceExperimentalSettings];
+export type ManagedExperimentalFeatureKey = Exclude<
+  {
+    [K in keyof InstanceExperimentalSettings]-?: InstanceExperimentalSettings[K] extends boolean
+      ? K
+      : never;
+  }[keyof InstanceExperimentalSettings],
+  "operatorDrainActive"
+>;
 
 export const PAPERCLIP_CLOUD_MANAGED_BY = "paperclip-cloud" as const;
 

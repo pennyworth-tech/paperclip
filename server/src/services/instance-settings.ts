@@ -81,6 +81,8 @@ function stripServerManagedExperimentalPatchFields(
   const {
     worktreeRunExecutionActivatedAt: _ignoredActivatedAt,
     worktreeRunExecutionActivationInstanceId: _ignoredActivationInstanceId,
+    operatorDrainActive: _ignoredDrainActive,
+    operatorDrainStartedAt: _ignoredDrainStartedAt,
     ...patchable
   } = patch as Record<string, unknown>;
   return patchable as PatchInstanceExperimentalSettings;
@@ -263,6 +265,8 @@ export function normalizeExperimentalSettings(raw: unknown): InstanceExperimenta
       productivityReviewMaxCreationsPerOwnerPerSweep:
         parsed.data.productivityReviewMaxCreationsPerOwnerPerSweep ??
         DEFAULT_PRODUCTIVITY_REVIEW_MAX_CREATIONS_PER_OWNER_PER_SWEEP,
+      operatorDrainActive: parsed.data.operatorDrainActive ?? false,
+      operatorDrainStartedAt: parsed.data.operatorDrainStartedAt ?? null,
       issueGraphLivenessAutoRecoveryLookbackHours:
         parsed.data.issueGraphLivenessAutoRecoveryLookbackHours ??
         DEFAULT_ISSUE_GRAPH_LIVENESS_AUTO_RECOVERY_LOOKBACK_HOURS,
@@ -306,6 +310,8 @@ export function normalizeExperimentalSettings(raw: unknown): InstanceExperimenta
     enableProductivityReviewOwnerBurstCap: false,
     productivityReviewMaxCreationsPerOwnerPerSweep:
       DEFAULT_PRODUCTIVITY_REVIEW_MAX_CREATIONS_PER_OWNER_PER_SWEEP,
+    operatorDrainActive: false,
+    operatorDrainStartedAt: null,
     issueGraphLivenessAutoRecoveryLookbackHours:
       DEFAULT_ISSUE_GRAPH_LIVENESS_AUTO_RECOVERY_LOOKBACK_HOURS,
   };
@@ -492,5 +498,41 @@ export function instanceSettingsService(db: Db, options: InstanceSettingsService
         .select({ id: companies.id })
         .from(companies)
         .then((rows) => rows.map((row) => row.id)),
+
+    // Operator drain. Stored inside the experimental jsonb but never
+    // client-patchable (stripServerManagedExperimentalPatchFields drops it); the
+    // dedicated routes below are the only writers. Read through the plain
+    // normalizer, not toExperimentalView: a cloud managed-config overlay must
+    // never mask or force an operational drain state.
+    getOperatorDrain: async (): Promise<{ active: boolean; startedAt: string | null }> => {
+      const row = await getOrCreateRow();
+      const experimental = normalizeExperimentalSettings(row.experimental);
+      return {
+        active: experimental.operatorDrainActive === true,
+        startedAt: experimental.operatorDrainStartedAt ?? null,
+      };
+    },
+
+    setOperatorDrain: async (active: boolean): Promise<{ active: boolean; startedAt: string | null }> => {
+      const current = await getOrCreateRow();
+      const nextExperimental = normalizeExperimentalSettings(current.experimental);
+      const now = (options.now ?? (() => new Date()))();
+      const drain = active
+        ? { operatorDrainActive: true, operatorDrainStartedAt: now.toISOString() }
+        : { operatorDrainActive: false, operatorDrainStartedAt: null };
+      const [updated] = await db
+        .update(instanceSettings)
+        .set({
+          experimental: { ...nextExperimental, ...drain },
+          updatedAt: now,
+        })
+        .where(eq(instanceSettings.id, current.id))
+        .returning();
+      const persisted = normalizeExperimentalSettings((updated ?? current).experimental);
+      return {
+        active: persisted.operatorDrainActive === true,
+        startedAt: persisted.operatorDrainStartedAt ?? null,
+      };
+    },
   };
 }

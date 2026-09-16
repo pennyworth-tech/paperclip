@@ -108,6 +108,8 @@ function defaultExperimentalSettings(): InstanceExperimentalSettingsPayload {
     enableProductivityReviewActiveExecutionDuration: false,
     enableProductivityReviewOwnerBurstCap: false,
     productivityReviewMaxCreationsPerOwnerPerSweep: 1,
+    operatorDrainActive: false,
+    operatorDrainStartedAt: null,
   };
 }
 

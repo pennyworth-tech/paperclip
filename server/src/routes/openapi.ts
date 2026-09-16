@@ -974,6 +974,9 @@ const BOARD_ONLY_OPERATIONS = new Set([
 
 const INSTANCE_ADMIN_OPERATIONS = new Set([
   "POST /api/companies",
+  "POST /api/instance/drain",
+  "DELETE /api/instance/drain",
+  "POST /api/instance/drain/interrupt",
   "POST /api/plugins/install",
   "POST /api/instance/database-backups",
   "POST /api/admin/users/{userId}/promote-instance-admin",
@@ -4130,6 +4133,40 @@ registry.registerPath({
   summary: "Update general instance settings",
   request: { body: jsonBody(patchInstanceGeneralSettingsSchema) },
   responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized },
+});
+
+// ─── Instance operator drain ─────────────────────────────────────────────────
+
+registry.registerPath({
+  method: "get",
+  path: "/api/instance/drain",
+  tags: ["instance"],
+  summary: "Get the operator drain state and live run counts",
+  responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/instance/drain",
+  tags: ["instance"],
+  summary: "Arm the operator drain",
+  responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden },
+});
+
+registry.registerPath({
+  method: "delete",
+  path: "/api/instance/drain",
+  tags: ["instance"],
+  summary: "Clear the operator drain",
+  responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/instance/drain/interrupt",
+  tags: ["instance"],
+  summary: "Interrupt drain stragglers on this instance",
+  responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden },
 });
 
 registry.registerPath({
