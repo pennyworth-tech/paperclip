@@ -2,6 +2,18 @@ import { describe, expect, it } from "vitest";
 import { renderPaperclipWakePrompt } from "@paperclipai/adapter-utils/server-utils";
 import { buildPaperclipWakePayload } from "../services/heartbeat.js";
 
+// An issue-scoped wake now reads the live comment count so the payload can state
+// how partial its inlined comment delta is. Callers that pass an issueId must
+// therefore supply a db; these context-only cases stub the single count query.
+const stubCommentCountDb = (total: number) =>
+  ({
+    select: () => ({
+      from: () => ({
+        where: () => Promise.resolve([{ value: total }]),
+      }),
+    }),
+  }) as never;
+
 describe("agent session wake messages", () => {
   it("includes the issue brief and requires fallback fetch when a long description is truncated", async () => {
     const description = [
@@ -10,13 +22,7 @@ describe("agent session wake messages", () => {
     ].join("\n");
 
     const wakePayload = await buildPaperclipWakePayload({
-      db: {
-        select: () => ({
-          from: () => ({
-            where: async () => [],
-          }),
-        }),
-      } as never,
+      db: stubCommentCountDb(0),
       companyId: "company-1",
       contextSnapshot: {
         wakeReason: "issue_assigned",
