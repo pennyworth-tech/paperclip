@@ -116,7 +116,7 @@ export type PipelineStageConfig = Record<string, unknown> & {
   disabled?: boolean;
   requireApproval?: boolean;
   approver?: {
-    kind?: "any_human" | "user" | "agent";
+    kind?: "any_human" | "user" | "agent" | "linked_reviewer";
     id?: string;
   };
   reviewerKind?: "human" | "any";
@@ -1045,14 +1045,14 @@ function normalizeStageApprover(
     throw unprocessable("Stage approver must be an object", { code: "validation" });
   }
   const kind = approver?.kind ?? "any_human";
-  if (kind !== "any_human" && kind !== "user" && kind !== "agent") {
-    throw unprocessable("Stage approver kind must be any_human, user, or agent", { code: "validation" });
+  if (kind !== "any_human" && kind !== "user" && kind !== "agent" && kind !== "linked_reviewer") {
+    throw unprocessable("Stage approver kind must be any_human, user, agent, or linked_reviewer", { code: "validation" });
   }
   const id = typeof approver?.id === "string" ? approver.id.trim() : approver?.id;
   if ((kind === "user" || kind === "agent") && (typeof id !== "string" || id.length === 0)) {
     throw unprocessable("Specific stage approvers require an id", { code: "validation" });
   }
-  if (kind === "any_human") {
+  if (kind === "any_human" || kind === "linked_reviewer") {
     return { kind };
   }
   if (!requireApproval) {
@@ -1072,10 +1072,38 @@ function assertStageEnabled(stage: typeof pipelineStages.$inferSelect, action: s
   });
 }
 
-function assertActorCanApproveStageExit(stage: typeof pipelineStages.$inferSelect, actor: PipelineActor) {
+async function assertActorCanApproveStageExit(
+  db: PipelineDb,
+  pipelineCase: Pick<typeof pipelineCases.$inferSelect, "companyId" | "id">,
+  stage: typeof pipelineStages.$inferSelect,
+  actor: PipelineActor,
+) {
   const config = normalizeStageConfig(stage.kind, stageConfig(stage));
   if (config.requireApproval !== true) return;
   const approver = config.approver ?? { kind: "any_human" };
+  if (approver.kind === "linked_reviewer") {
+    // Resolved at decision time: the assignee of the case's newest non-retired review-role link.
+    const reviewLink = await db
+      .select({ assigneeAgentId: issues.assigneeAgentId })
+      .from(pipelineCaseIssueLinks)
+      .innerJoin(issues, eq(pipelineCaseIssueLinks.issueId, issues.id))
+      .where(and(
+        eq(pipelineCaseIssueLinks.companyId, pipelineCase.companyId),
+        eq(pipelineCaseIssueLinks.caseId, pipelineCase.id),
+        eq(pipelineCaseIssueLinks.role, "review"),
+        isNull(pipelineCaseIssueLinks.retiredAt),
+        eq(issues.companyId, pipelineCase.companyId),
+      ))
+      .orderBy(desc(pipelineCaseIssueLinks.createdAt), desc(pipelineCaseIssueLinks.id))
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+    const reviewerAgentId = reviewLink?.assigneeAgentId ?? null;
+    if (reviewerAgentId && actor.type === "agent" && actor.agentId === reviewerAgentId) return;
+    throw new HttpError(403, "Stage approval requires the case's linked reviewer", {
+      code: "review_required",
+      approver: { kind: "linked_reviewer", id: reviewerAgentId },
+    });
+  }
   if (approver.kind === "any_human") {
     if (actor.type === "user") return;
     throw new HttpError(403, "Stage approval requires a human approver", { code: "review_required" });
@@ -3252,7 +3280,7 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
       : await getStageByKeyOrThrow(tx, current.pipelineId, input.toStageKey ?? "");
     assertStageEnabled(toStage, "transition");
     if (fromStage.id !== toStage.id) {
-      assertActorCanApproveStageExit(fromStage, input.actor);
+      await assertActorCanApproveStageExit(tx, current, fromStage, input.actor);
       await assertStageTransitionGates(tx, current, fromStage, { skipChildrenTerminalGate: input.skipChildrenTerminalGate });
       await assertLatestReviewApprovalStillCurrent(tx, current, fromStage, toStage, {
         allowWorkflowVersionDrift: input.transitionClass === "auto" && input.reason === "children_terminal",
@@ -4923,7 +4951,7 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
           throw unprocessable("Pipeline case is not in a review stage", { code: "validation" });
         }
         const config = reviewConfigForStage(detail.stage);
-        assertActorCanApproveStageExit(detail.stage, input.actor);
+        await assertActorCanApproveStageExit(tx, detail.case, detail.stage, input.actor);
         const reasonRequired =
           (input.decision === "request_changes" && config.requireRequestChangesReason !== false) ||
           (input.decision === "reject" && config.requireRejectReason !== false);

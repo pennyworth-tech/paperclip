@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { eq, sql } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
   activityLog,
@@ -143,24 +143,142 @@ describeEmbeddedPostgres("pipelineService", () => {
   async function seedLinkedIssue(input: {
     companyId: string;
     caseId: string;
-    role: "origin" | "conversation" | "work" | "automation";
+    role: "origin" | "conversation" | "work" | "automation" | "review";
     status?: "backlog" | "todo" | "in_progress" | "in_review" | "done" | "blocked" | "cancelled";
     title?: string;
+    assigneeAgentId?: string | null;
+    retiredAt?: Date | null;
   }) {
     const [issue] = await db.insert(issues).values({
       companyId: input.companyId,
       title: input.title ?? `${input.role} issue`,
       status: input.status ?? "todo",
       priority: "medium",
+      assigneeAgentId: input.assigneeAgentId ?? null,
     }).returning();
     await db.insert(pipelineCaseIssueLinks).values({
       companyId: input.companyId,
       caseId: input.caseId,
       issueId: issue!.id,
       role: input.role,
+      retiredAt: input.retiredAt ?? null,
     });
     return issue!;
   }
+
+  describe("linked_reviewer stage approver", () => {
+    async function seedLinkedReviewerCase() {
+      const { company, pipeline, byKey } = await seedPipeline();
+      const reviewStage = byKey.get("review")!;
+      await svc.updateStage({
+        companyId: company.id,
+        pipelineId: pipeline.id,
+        stageId: reviewStage.id,
+        patch: {
+          config: {
+            ...(reviewStage.config as Record<string, unknown>),
+            requireApproval: true,
+            approver: { kind: "linked_reviewer" },
+          },
+        },
+      });
+      const [reviewerA, reviewerB] = await db.insert(agents).values(["Merge Reviewer A", "Merge Reviewer B"].map((name) => ({
+        companyId: company.id,
+        name,
+        role: "engineer",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      }))).returning();
+      const created = await svc.ingestCase({
+        companyId: company.id,
+        pipelineId: pipeline.id,
+        stageKey: "review",
+        caseKey: `linked-reviewer-${randomUUID().slice(0, 8)}`,
+        title: "Review PR",
+        actor: userActor,
+      });
+      return { company, created, reviewerA: reviewerA!, reviewerB: reviewerB! };
+    }
+
+    async function reviewDecidedEvents(caseId: string) {
+      return db
+        .select()
+        .from(pipelineCaseEvents)
+        .where(and(eq(pipelineCaseEvents.caseId, caseId), eq(pipelineCaseEvents.type, "review_decided")));
+    }
+
+    it("lets the assignee of the case's review link decide and records its agent and run ids", async () => {
+      const { company, created, reviewerA } = await seedLinkedReviewerCase();
+      await seedLinkedIssue({ companyId: company.id, caseId: created.case.id, role: "review", assigneeAgentId: reviewerA.id });
+      const runId = randomUUID();
+
+      const result = await svc.reviewCase({
+        companyId: company.id,
+        caseId: created.case.id,
+        decision: "approve",
+        expectedVersion: created.case.version,
+        actor: { type: "agent", agentId: reviewerA.id, runId },
+      });
+
+      expect(result.reviewEvent).toMatchObject({ type: "review_decided", actorType: "agent", actorAgentId: reviewerA.id, runId });
+      const events = await reviewDecidedEvents(created.case.id);
+      expect(events).toHaveLength(1);
+      expect(events[0]).toMatchObject({ actorAgentId: reviewerA.id, runId });
+    });
+
+    it("refuses an agent deciding on a case whose review link is assigned to another agent", async () => {
+      const { company, created, reviewerA, reviewerB } = await seedLinkedReviewerCase();
+      await seedLinkedIssue({ companyId: company.id, caseId: created.case.id, role: "review", assigneeAgentId: reviewerB.id });
+      const before = await eventCount(created.case.id);
+
+      await expect(svc.reviewCase({
+        companyId: company.id,
+        caseId: created.case.id,
+        decision: "approve",
+        expectedVersion: created.case.version,
+        actor: { type: "agent", agentId: reviewerA.id, runId: randomUUID() },
+      })).rejects.toMatchObject({ status: 403, details: { code: "review_required", approver: { kind: "linked_reviewer", id: reviewerB.id } } });
+
+      expect(await eventCount(created.case.id)).toBe(before);
+      const [after] = await db.select().from(pipelineCases).where(eq(pipelineCases.id, created.case.id));
+      expect(after!.version).toBe(created.case.version);
+      expect(after!.stageId).toBe(created.case.stageId);
+    });
+
+    it("refuses when the case has no non-retired review link", async () => {
+      const { company, created, reviewerA } = await seedLinkedReviewerCase();
+      await seedLinkedIssue({ companyId: company.id, caseId: created.case.id, role: "automation", assigneeAgentId: reviewerA.id });
+      await seedLinkedIssue({
+        companyId: company.id,
+        caseId: created.case.id,
+        role: "review",
+        assigneeAgentId: reviewerA.id,
+        retiredAt: new Date(),
+      });
+      const before = await eventCount(created.case.id);
+
+      const decide = () => svc.reviewCase({
+        companyId: company.id,
+        caseId: created.case.id,
+        decision: "approve",
+        expectedVersion: created.case.version,
+        actor: { type: "agent", agentId: reviewerA.id, runId: randomUUID() },
+      });
+      await expect(decide()).rejects.toMatchObject({ status: 403, details: { code: "review_required", approver: { kind: "linked_reviewer", id: null } } });
+      await expect(svc.transitionCase({
+        companyId: company.id,
+        caseId: created.case.id,
+        toStageKey: "done",
+        expectedVersion: created.case.version,
+        actor: userActor,
+      })).rejects.toMatchObject({ status: 403, details: { code: "review_required" } });
+
+      expect(await eventCount(created.case.id)).toBe(before);
+      expect(await reviewDecidedEvents(created.case.id)).toHaveLength(0);
+    });
+  });
 
   it("seeds default stages and protects non-empty stage deletion", async () => {
     const { company, pipeline, byKey } = await seedPipeline();

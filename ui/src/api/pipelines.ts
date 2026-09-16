@@ -226,7 +226,7 @@ export interface PipelineCaseIssueLink {
   companyId: string;
   caseId: string;
   issueId: string;
-  role: "origin" | "conversation" | "work" | "automation";
+  role: "origin" | "conversation" | "work" | "automation" | "review";
   createdByRunId?: string | null;
   createdAt: Date | string;
   updatedAt: Date | string;
