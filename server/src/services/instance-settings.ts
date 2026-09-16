@@ -15,6 +15,7 @@ import {
   DEFAULT_FEEDBACK_DATA_SHARING_PREFERENCE,
   DEFAULT_BACKUP_RETENTION,
   DEFAULT_ISSUE_GRAPH_LIVENESS_AUTO_RECOVERY_LOOKBACK_HOURS,
+  DEFAULT_PRODUCTIVITY_REVIEW_MAX_CREATIONS_PER_OWNER_PER_SWEEP,
   PAPERCLIP_CLOUD_MANAGED_BY,
   instanceGeneralSettingsSchema,
   type InstanceGeneralSettings,
@@ -255,6 +256,13 @@ export function normalizeExperimentalSettings(raw: unknown): InstanceExperimenta
       worktreeRunExecutionActivatedAt: parsed.data.worktreeRunExecutionActivatedAt ?? null,
       worktreeRunExecutionActivationInstanceId:
         parsed.data.worktreeRunExecutionActivationInstanceId ?? null,
+      enableProductivityReviewActiveExecutionDuration:
+        parsed.data.enableProductivityReviewActiveExecutionDuration ?? false,
+      enableProductivityReviewOwnerBurstCap:
+        parsed.data.enableProductivityReviewOwnerBurstCap ?? false,
+      productivityReviewMaxCreationsPerOwnerPerSweep:
+        parsed.data.productivityReviewMaxCreationsPerOwnerPerSweep ??
+        DEFAULT_PRODUCTIVITY_REVIEW_MAX_CREATIONS_PER_OWNER_PER_SWEEP,
       issueGraphLivenessAutoRecoveryLookbackHours:
         parsed.data.issueGraphLivenessAutoRecoveryLookbackHours ??
         DEFAULT_ISSUE_GRAPH_LIVENESS_AUTO_RECOVERY_LOOKBACK_HOURS,
@@ -294,6 +302,10 @@ export function normalizeExperimentalSettings(raw: unknown): InstanceExperimenta
     enableWorktreeRunExecution: false,
     worktreeRunExecutionActivatedAt: null,
     worktreeRunExecutionActivationInstanceId: null,
+    enableProductivityReviewActiveExecutionDuration: false,
+    enableProductivityReviewOwnerBurstCap: false,
+    productivityReviewMaxCreationsPerOwnerPerSweep:
+      DEFAULT_PRODUCTIVITY_REVIEW_MAX_CREATIONS_PER_OWNER_PER_SWEEP,
     issueGraphLivenessAutoRecoveryLookbackHours:
       DEFAULT_ISSUE_GRAPH_LIVENESS_AUTO_RECOVERY_LOOKBACK_HOURS,
   };

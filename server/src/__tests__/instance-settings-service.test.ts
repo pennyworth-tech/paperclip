@@ -59,6 +59,9 @@ describe("instance settings service", () => {
       enableWorktreeRunExecution: false,
       worktreeRunExecutionActivatedAt: null,
       worktreeRunExecutionActivationInstanceId: null,
+      enableProductivityReviewActiveExecutionDuration: false,
+      enableProductivityReviewOwnerBurstCap: false,
+      productivityReviewMaxCreationsPerOwnerPerSweep: 1,
       issueGraphLivenessAutoRecoveryLookbackHours: 48,
     });
   });

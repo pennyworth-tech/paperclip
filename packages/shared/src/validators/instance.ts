@@ -8,6 +8,9 @@ import {
   DEFAULT_ISSUE_GRAPH_LIVENESS_AUTO_RECOVERY_LOOKBACK_HOURS,
   MAX_ISSUE_GRAPH_LIVENESS_AUTO_RECOVERY_LOOKBACK_HOURS,
   MIN_ISSUE_GRAPH_LIVENESS_AUTO_RECOVERY_LOOKBACK_HOURS,
+  DEFAULT_PRODUCTIVITY_REVIEW_MAX_CREATIONS_PER_OWNER_PER_SWEEP,
+  MAX_PRODUCTIVITY_REVIEW_MAX_CREATIONS_PER_OWNER_PER_SWEEP,
+  MIN_PRODUCTIVITY_REVIEW_MAX_CREATIONS_PER_OWNER_PER_SWEEP,
 } from "../types/instance.js";
 import { feedbackDataSharingPreferenceSchema } from "./feedback.js";
 import { shapeWithoutDefaults } from "./partial.js";
@@ -79,6 +82,14 @@ export const instanceExperimentalSettingsSchema = z.object({
   enableWorktreeRunExecution: z.boolean().default(false),
   worktreeRunExecutionActivatedAt: z.string().datetime().nullable().default(null),
   worktreeRunExecutionActivationInstanceId: z.string().min(1).nullable().default(null),
+  enableProductivityReviewActiveExecutionDuration: z.boolean().default(false),
+  enableProductivityReviewOwnerBurstCap: z.boolean().default(false),
+  productivityReviewMaxCreationsPerOwnerPerSweep: z
+    .number()
+    .int()
+    .min(MIN_PRODUCTIVITY_REVIEW_MAX_CREATIONS_PER_OWNER_PER_SWEEP)
+    .max(MAX_PRODUCTIVITY_REVIEW_MAX_CREATIONS_PER_OWNER_PER_SWEEP)
+    .default(DEFAULT_PRODUCTIVITY_REVIEW_MAX_CREATIONS_PER_OWNER_PER_SWEEP),
   issueGraphLivenessAutoRecoveryLookbackHours: z
     .number()
     .int()

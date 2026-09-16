@@ -6,6 +6,9 @@ export const MONTHLY_RETENTION_PRESETS = [1, 3, 6] as const;
 export const DEFAULT_ISSUE_GRAPH_LIVENESS_AUTO_RECOVERY_LOOKBACK_HOURS = 24;
 export const MIN_ISSUE_GRAPH_LIVENESS_AUTO_RECOVERY_LOOKBACK_HOURS = 1;
 export const MAX_ISSUE_GRAPH_LIVENESS_AUTO_RECOVERY_LOOKBACK_HOURS = 24 * 30;
+export const DEFAULT_PRODUCTIVITY_REVIEW_MAX_CREATIONS_PER_OWNER_PER_SWEEP = 1;
+export const MIN_PRODUCTIVITY_REVIEW_MAX_CREATIONS_PER_OWNER_PER_SWEEP = 1;
+export const MAX_PRODUCTIVITY_REVIEW_MAX_CREATIONS_PER_OWNER_PER_SWEEP = 50;
 
 export interface BackupRetentionPolicy {
   dailyDays: (typeof DAILY_RETENTION_PRESETS)[number];
@@ -129,6 +132,28 @@ export interface InstanceExperimentalSettings {
    * from another instance fail closed.
    */
   worktreeRunExecutionActivationInstanceId: string | null;
+  /**
+   * Productivity-review measurement gate. When false (default), the
+   * `long_active_duration` detector measures wall-clock elapsed since the
+   * active episode started, exactly as upstream. When true, it measures the
+   * union of the assignee's run-execution intervals clipped to the episode,
+   * so dispatch-queue wait and time spent waiting on other agents no longer
+   * read as assignee execution.
+   */
+  enableProductivityReviewActiveExecutionDuration: boolean;
+  /**
+   * Productivity-review burst cap gate. When false (default), a sweep may
+   * create any number of reviews, exactly as upstream. When true, each sweep
+   * creates at most `productivityReviewMaxCreationsPerOwnerPerSweep` reviews
+   * resolving to any one owner agent; excess candidates defer to the next
+   * sweep with nothing written.
+   */
+  enableProductivityReviewOwnerBurstCap: boolean;
+  /**
+   * Per-owner review creation ceiling applied only while
+   * `enableProductivityReviewOwnerBurstCap` is true.
+   */
+  productivityReviewMaxCreationsPerOwnerPerSweep: number;
   issueGraphLivenessAutoRecoveryLookbackHours: number;
 }
 

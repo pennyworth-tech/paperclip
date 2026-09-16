@@ -285,6 +285,22 @@ export const INSTANCE_FEATURE_CATALOG: Record<InstanceFeatureKey, FeatureCatalog
     cloudDefault: false,
     selfHostedDefault: false,
   },
+  enableProductivityReviewActiveExecutionDuration: {
+    title: "Productivity Review Active-Execution Duration",
+    description:
+      "Measure the long-active productivity trigger on the union of the assignee's run-execution intervals clipped to the current episode, netting dispatch-queue wait and third-party wait out of the measurement.",
+    tier: "managed",
+    cloudDefault: false,
+    selfHostedDefault: false,
+  },
+  enableProductivityReviewOwnerBurstCap: {
+    title: "Productivity Review Owner Burst Cap",
+    description:
+      "Cap how many productivity reviews a single reconcile sweep may create for one review owner; excess candidates defer to the next sweep.",
+    tier: "managed",
+    cloudDefault: false,
+    selfHostedDefault: false,
+  },
 };
 
 export const INSTANCE_FEATURE_KEYS = Object.keys(INSTANCE_FEATURE_CATALOG).sort() as InstanceFeatureKey[];

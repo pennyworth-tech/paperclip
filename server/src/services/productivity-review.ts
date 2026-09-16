@@ -1,6 +1,9 @@
 import { and, asc, desc, eq, gt, gte, inArray, isNull, notInArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { clampIssueRequestDepth } from "@paperclipai/shared";
+import {
+  clampIssueRequestDepth,
+  DEFAULT_PRODUCTIVITY_REVIEW_MAX_CREATIONS_PER_OWNER_PER_SWEEP,
+} from "@paperclipai/shared";
 import {
   activityLog,
   agents,
@@ -14,6 +17,7 @@ import {
 import { logger } from "../middleware/logger.js";
 import { logActivity } from "./activity-log.js";
 import { budgetService } from "./budgets.js";
+import { instanceSettingsService } from "./instance-settings.js";
 import { issueService } from "./issues.js";
 import { visibleIssueCondition } from "./issue-visibility.js";
 import {
@@ -48,7 +52,18 @@ type HeartbeatRunRow = typeof heartbeatRuns.$inferSelect;
 // result_json/context_snapshot for up to MAX_RUNS_FOR_STREAK runs per issue.
 type ProductivityRunSample = Pick<
   HeartbeatRunRow,
-  "id" | "agentId" | "status" | "livenessState" | "createdAt" | "nextAction" | "usageJson"
+  | "id"
+  | "agentId"
+  | "status"
+  | "livenessState"
+  | "createdAt"
+  | "nextAction"
+  | "usageJson"
+  // Execution-interval bounds for computeActiveExecutionMs; fixed-width
+  // timestamptz scalars, so they add no detoast cost to the sample.
+  | "startedAt"
+  | "finishedAt"
+  | "updatedAt"
 >;
 type ProductivityReviewTrigger = "no_comment_streak" | "long_active_duration" | "high_churn";
 
@@ -63,6 +78,9 @@ type ProductivityReviewThresholds = {
   creationWindowMs: number;
   maxCreationsPerWindow: number;
   maxConsecutiveNoActionReviews: number;
+  enableActiveExecutionDuration: boolean;
+  enableOwnerBurstCap: boolean;
+  maxCreationsPerOwnerPerSweep: number;
 };
 
 type ProductivityReviewEvidence = {
@@ -80,6 +98,7 @@ type ProductivityReviewEvidence = {
   commentCountLastHour: number;
   commentCountLastSixHours: number;
   elapsedMs: number | null;
+  activeExecutionMs: number | null;
   latestRuns: ProductivityRunSample[];
   latestComments: Array<typeof issueComments.$inferSelect>;
   costCents: number;
@@ -190,7 +209,57 @@ function buildThresholds(overrides?: Partial<ProductivityReviewThresholds>): Pro
       overrides?.maxConsecutiveNoActionReviews ?? DEFAULT_PRODUCTIVITY_REVIEW_MAX_CONSECUTIVE_NO_ACTION_REVIEWS,
       DEFAULT_PRODUCTIVITY_REVIEW_MAX_CONSECUTIVE_NO_ACTION_REVIEWS,
     ),
+    enableActiveExecutionDuration: overrides?.enableActiveExecutionDuration ?? false,
+    enableOwnerBurstCap: overrides?.enableOwnerBurstCap ?? false,
+    maxCreationsPerOwnerPerSweep: readPositiveInteger(
+      overrides?.maxCreationsPerOwnerPerSweep ?? DEFAULT_PRODUCTIVITY_REVIEW_MAX_CREATIONS_PER_OWNER_PER_SWEEP,
+      DEFAULT_PRODUCTIVITY_REVIEW_MAX_CREATIONS_PER_OWNER_PER_SWEEP,
+    ),
   };
+}
+
+/**
+ * Measure the union of a run set's execution intervals, clipped to the
+ * half-open window [episodeStart, now). A run with a null `startedAt` never
+ * executed and contributes nothing (dispatch-queue wait); a `running` run
+ * accrues to `now`; terminal and queue-shaped (`queued`/`scheduled_retry`)
+ * runs end at `finishedAt ?? updatedAt` — a run awaiting retry is queue time,
+ * not execution, so it must not extend to `now`. Overlapping intervals from
+ * concurrent same-agent runs are counted once.
+ */
+export function computeActiveExecutionMs(
+  runs: Array<Pick<HeartbeatRunRow, "status" | "startedAt" | "finishedAt" | "updatedAt">>,
+  episodeStart: Date,
+  now: Date,
+): number {
+  const windowStart = episodeStart.getTime();
+  const windowEnd = now.getTime();
+  const intervals: Array<[number, number]> = [];
+  for (const run of runs) {
+    if (!run.startedAt) continue;
+    const terminal = TERMINAL_RUN_STATUSES.includes(run.status as (typeof TERMINAL_RUN_STATUSES)[number]);
+    const queueShaped = run.status === "queued" || run.status === "scheduled_retry";
+    let end: number | null = null;
+    if (run.status === "running") {
+      end = windowEnd;
+    } else if (terminal || queueShaped) {
+      end = (run.finishedAt ?? run.updatedAt)?.getTime() ?? null;
+    }
+    if (end === null) continue;
+    const from = Math.max(run.startedAt.getTime(), windowStart);
+    const to = Math.min(end, windowEnd);
+    if (to <= from) continue;
+    intervals.push([from, to]);
+  }
+  intervals.sort((a, b) => a[0] - b[0]);
+  let totalMs = 0;
+  let mergedEnd = Number.NEGATIVE_INFINITY;
+  for (const [start, end] of intervals) {
+    if (end <= mergedEnd) continue;
+    totalMs += end - Math.max(start, mergedEnd);
+    mergedEnd = end;
+  }
+  return totalMs;
 }
 
 function choosePrimaryTrigger(input: {
@@ -217,6 +286,7 @@ function formatTrigger(trigger: ProductivityReviewTrigger) {
 export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: EnqueueWakeup }) {
   const issuesSvc = issueService(db);
   const budgets = budgetService(db);
+  const instanceSettings = instanceSettingsService(db);
 
   async function getCompanyIssuePrefix(companyId: string) {
     return db
@@ -461,6 +531,9 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
         createdAt: heartbeatRuns.createdAt,
         nextAction: heartbeatRuns.nextAction,
         usageJson: heartbeatRuns.usageJson,
+        startedAt: heartbeatRuns.startedAt,
+        finishedAt: heartbeatRuns.finishedAt,
+        updatedAt: heartbeatRuns.updatedAt,
       })
       .from(heartbeatRuns)
       .where(
@@ -545,9 +618,19 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
     const elapsedMs = sourceIssue.status === "in_progress" && activeStartedAt
       ? Math.max(0, now.getTime() - activeStartedAt.getTime())
       : null;
+    // Gated measurement: net the assignee's execution intervals out of the
+    // wall-clock episode. A null episodeStart means there is no episode to
+    // clip to, so longActive stays false — mirroring the ungated guard above.
+    const activeExecutionMs = thresholds.enableActiveExecutionDuration &&
+      sourceIssue.status === "in_progress" &&
+      activeStartedAt
+      ? computeActiveExecutionMs(latestRuns, activeStartedAt, now)
+      : null;
 
     const noComment = noCommentStreak >= thresholds.noCommentStreakRuns;
-    const longActive = elapsedMs !== null && elapsedMs >= thresholds.longActiveMs;
+    const longActive = thresholds.enableActiveExecutionDuration
+      ? activeExecutionMs !== null && activeExecutionMs >= thresholds.longActiveMs
+      : elapsedMs !== null && elapsedMs >= thresholds.longActiveMs;
     const highChurn =
       runCountLastHour >= thresholds.highChurnHourly ||
       assigneeRunCommentCountLastHour >= thresholds.highChurnHourly ||
@@ -580,6 +663,7 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
       commentCountLastHour: assigneeRunCommentCountLastHour,
       commentCountLastSixHours: assigneeRunCommentCountLastSixHours,
       elapsedMs,
+      activeExecutionMs,
       latestRuns: latestRuns.slice(0, 5),
       latestComments,
       costCents: costRow.costCents,
@@ -659,6 +743,9 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
       `- Active queued/running/scheduled runs: ${evidence.activeRunCount}`,
       `- No-comment completed-run streak: ${evidence.noCommentStreak}`,
       `- Current active elapsed time: ${msToHuman(evidence.elapsedMs)}`,
+      ...(evidence.activeExecutionMs !== null
+        ? [`- Active execution time (netted of queue and wait): ${msToHuman(evidence.activeExecutionMs)}`]
+        : []),
       `- Runs in rolling windows: ${evidence.runCountLastHour}/1h, ${evidence.runCountLastSixHours}/6h`,
       `- Assignee run-linked comments total/window: ${evidence.commentCount} total, ${evidence.commentCountLastHour}/1h, ${evidence.commentCountLastSixHours}/6h`,
       `- Cost events total: ${evidence.costCents} cents`,
@@ -706,7 +793,11 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
 
   async function createOrUpdateReview(
     evidence: ProductivityReviewEvidence,
-    opts: { prefix: string; thresholds: ProductivityReviewThresholds },
+    opts: {
+      prefix: string;
+      thresholds: ProductivityReviewThresholds;
+      ownerBudget?: Map<string, number>;
+    },
   ) {
     const existing = await findOpenProductivityReview(evidence.sourceIssue.companyId, evidence.sourceIssue.id);
     if (existing) {
@@ -759,6 +850,16 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
     }
 
     const ownerAgentId = await resolveReviewOwnerAgentId(evidence.sourceIssue, evidence.sourceAgent);
+    // Per-owner burst cap: after owner resolution (the owner is unknown before
+    // it) and before any write, so a deferred candidate leaves no state. A
+    // null owner bypasses the cap rather than consuming a shared "null" slot.
+    if (
+      opts.thresholds.enableOwnerBurstCap &&
+      ownerAgentId &&
+      (opts.ownerBudget?.get(ownerAgentId) ?? 0) >= opts.thresholds.maxCreationsPerOwnerPerSweep
+    ) {
+      return { kind: "owner_burst_deferred" as const, reviewIssueId: null };
+    }
     let review: Awaited<ReturnType<typeof issuesSvc.create>>;
     try {
       review = await issuesSvc.create(evidence.sourceIssue.companyId, {
@@ -835,6 +936,10 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
       });
     }
 
+    if (ownerAgentId && opts.ownerBudget) {
+      opts.ownerBudget.set(ownerAgentId, (opts.ownerBudget.get(ownerAgentId) ?? 0) + 1);
+    }
+
     return { kind: "created" as const, reviewIssueId: review.id };
   }
 
@@ -845,7 +950,17 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
     issueCreatedAtGte?: Date | null;
   }) {
     const now = opts?.now ?? new Date();
-    const thresholds = buildThresholds(opts?.thresholds);
+    // Instance settings are read once per sweep, before the candidate loop;
+    // the resolved gates fold into thresholds so the rest of the sweep needs
+    // no new parameter. Explicit threshold overrides (the test seam) win.
+    const experimental = await instanceSettings.getExperimental();
+    const thresholds = buildThresholds({
+      enableActiveExecutionDuration: experimental.enableProductivityReviewActiveExecutionDuration,
+      enableOwnerBurstCap: experimental.enableProductivityReviewOwnerBurstCap,
+      maxCreationsPerOwnerPerSweep: experimental.productivityReviewMaxCreationsPerOwnerPerSweep,
+      ...opts?.thresholds,
+    });
+    const ownerBudget = new Map<string, number>();
     const candidates = await db
       .select()
       .from(issues)
@@ -875,6 +990,10 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
       failed: 0,
       reviewIssueIds: [] as string[],
       failedIssueIds: [] as string[],
+      // Present only when the owner burst cap gate is on: both production
+      // callers spread this object into their warn log, so an unconditional
+      // key would change the default-off log line's shape.
+      ...(thresholds.enableOwnerBurstCap ? { ownerBurstDeferred: 0 } : {}),
     };
 
     const prefixCache = new Map<string, string>();
@@ -912,12 +1031,16 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
         prefixCache.set(candidate.companyId, prefix);
       }
       try {
-        const outcome = await createOrUpdateReview(evidence, { prefix, thresholds });
+        const outcome = await createOrUpdateReview(evidence, { prefix, thresholds, ownerBudget });
         if (outcome.kind === "created") result.created += 1;
         else if (outcome.kind === "updated") result.updated += 1;
         else if (outcome.kind === "creation_capped") result.creationCapped += 1;
         else if (outcome.kind === "no_action_suppressed") result.noActionSuppressed += 1;
-        else result.existing += 1;
+        else if (outcome.kind === "owner_burst_deferred") {
+          if (thresholds.enableOwnerBurstCap) {
+            result.ownerBurstDeferred = (result.ownerBurstDeferred ?? 0) + 1;
+          }
+        } else result.existing += 1;
         if (outcome.reviewIssueId) result.reviewIssueIds.push(outcome.reviewIssueId);
       } catch (err) {
         result.failed += 1;
