@@ -7266,9 +7266,6 @@ export function mergeCoalescedContextSnapshot(
     merged[WAKE_COMMENT_IDS_KEY] = mergedCommentIds;
     merged.commentId = latestCommentId;
     merged.wakeCommentId = latestCommentId;
-    // The merged context should carry canonical comment ids; the next wake will
-    // regenerate any structured payload from those ids.
-    delete merged[PAPERCLIP_WAKE_PAYLOAD_KEY];
   }
   const existingWake = parseObject(existing[PAPERCLIP_WAKE_PAYLOAD_KEY]);
   const existingCommentIds = extractWakeCommentIds(existing);
@@ -7293,6 +7290,9 @@ export function mergeCoalescedContextSnapshot(
       existingWake.checkedOutByHarness === true) ||
       (existing[PAPERCLIP_EXTERNAL_CHAT_EXECUTION_BOUND_KEY] === true &&
         existingWake.externalChatExecutionBound === true));
+  // Recompose stale payloads, preserving only the exact admitted external
+  // chat payload whose ownership and comment identity were proved above.
+  if (!preservesAdmittedWake) delete merged[PAPERCLIP_WAKE_PAYLOAD_KEY];
   if (preservesAdmittedWake) {
     merged[PAPERCLIP_WAKE_PAYLOAD_KEY] = existingWake;
     merged.wakeReason = existing.wakeReason;
@@ -7694,9 +7694,28 @@ export async function buildPaperclipWakePayload(input: {
             ),
           );
 
-  const commentsById = new Map(
-    commentRows.map((comment) => [comment.id, comment]),
-  );
+  const commentsById = new Map(commentRows.map((comment) => [comment.id, comment]));
+
+  // The inlined comment set is a delta: it is resolved from the wake comment ids
+  // this run absorbed, never from the issue thread. A comment that woke an
+  // *earlier* run is therefore structurally absent here, and nothing in the
+  // payload previously let a reader notice that. Count the live thread at
+  // composition time so the payload can state its own partiality. Scoped to the
+  // issue exactly as issuesSvc.listComments is -- soft-deleted rows included --
+  // so the number is directly comparable to GET /api/issues/{id}/comments.
+  const issueCommentTotal = issueId
+    ? await input.db
+        .select({ value: sql<number>`count(*)::int` })
+        .from(issueComments)
+        .where(
+          and(
+            eq(issueComments.companyId, input.companyId),
+            eq(issueComments.issueId, issueId),
+          ),
+        )
+        .then((rows) => Number(rows[0]?.value ?? 0))
+    : null;
+
   const issueDescription = conversationMode ? null : issueSummary?.description ?? null;
   const issueDescriptionTruncated =
     issueDescription !== null &&
@@ -8167,10 +8186,20 @@ export async function buildPaperclipWakePayload(input: {
     annotationDeltas,
     planReviewContext,
     documentReviewContext,
+    // Composition runs on the dispatch path (executeRun), so this is a real
+    // dispatch-time stamp, not an enqueue-time one.
+    composedAt: new Date().toISOString(),
     commentWindow: {
       requestedCount: commentIds.length,
       includedCount: comments.length,
       missingCount: missingCommentCount,
+      // Live thread size at composedAt, or null when the wake carries no issue.
+      // includedCount < issueCommentTotal means this payload is a partial view
+      // of the thread and the reader must GET the issue's comments. Deliberately
+      // NOT folded into fallbackFetchNeeded: once any wake has been consumed the
+      // delta is permanently smaller than the thread, so doing so would set that
+      // flag on essentially every wake and change an existing contract field.
+      issueCommentTotal,
     },
     truncated: payloadTruncated,
     fallbackFetchNeeded: payloadTruncated || missingCommentCount > 0,
