@@ -333,6 +333,44 @@ function summarizeRunFailureForIssueComment(run: LatestIssueRun) {
   return null;
 }
 
+// A `configuration_incomplete` run can be a missing secret/credential binding or
+// a configuration gap that has nothing to do with secrets (an unresolved
+// workspace base ref). When the pre-dispatch gate emitted a structured payload
+// it names its own shape, so trust `reason` over the prose regex; only fall back
+// to the regex for classifier-derived failures that carry no structured payload.
+//
+// Both sets are exhaustive over the reasons the pre-dispatch gate emits today,
+// and both must be extended when a new one is added. A reason in neither set
+// falls through to the bindings check and then the regex, which is the same
+// answer this code gave before any reason was classified — better than
+// asserting "bind a secret" about a shape nobody has classified yet.
+const SECRET_CONFIGURATION_INCOMPLETE_REASONS = new Set<string>([
+  "secret_binding_missing",
+  "push_write_credential_missing",
+  "codex_credentials_missing",
+]);
+const NON_SECRET_CONFIGURATION_INCOMPLETE_REASONS = new Set<string>([
+  "workspace_base_ref_unresolved",
+]);
+
+function configurationFailureMentionsSecret(run: LatestIssueRun): boolean {
+  if (!run) return false;
+  const resultJson = parseObject(run.resultJson);
+  const configurationIncomplete = parseObject(resultJson.configurationIncomplete);
+  const reason = readNonEmptyString(configurationIncomplete.reason);
+  if (reason && SECRET_CONFIGURATION_INCOMPLETE_REASONS.has(reason)) return true;
+  if (reason && NON_SECRET_CONFIGURATION_INCOMPLETE_REASONS.has(reason)) return false;
+  const missingBindings = Array.isArray(configurationIncomplete.missingBindings)
+    ? configurationIncomplete.missingBindings
+    : null;
+  if (missingBindings && missingBindings.length > 0) return true;
+  const error = [
+    readNonEmptyString(run.errorCode) ?? "",
+    readNonEmptyString(run.error) ?? "",
+    JSON.stringify(resultJson),
+  ].join("\n");
+  return CONFIGURATION_INCOMPLETE_SECRET_ERROR_RE.test(error);
+}
 
 function didAutomaticRecoveryFail(
   latestRun: LatestIssueRun,
@@ -387,6 +425,8 @@ const PROVIDER_QUOTA_ERROR_RE =
   /(?:you(?:'|’)ve hit your usage limit|usage limit(?: reached| exceeded)?|provider quota|quota (?:limit )?exceeded|model (?:is )?at capacity)/i;
 const CONFIGURATION_INCOMPLETE_ERROR_RE =
   /(?:model_not_found|model [^\n]{0,120} not found|missing (?:api )?(?:key|credentials?)|credentials? (?:are |is )?missing|no (?:api )?(?:key|credentials?) (?:was |were )?(?:found|configured|provided)|api key (?:is )?(?:not set|unavailable))/i;
+const CONFIGURATION_INCOMPLETE_SECRET_ERROR_RE =
+  /(?:missing (?:api )?(?:key|credentials?)|credentials? (?:are |is )?missing|no (?:api )?(?:key|credentials?) (?:was |were )?(?:found|configured|provided)|api key (?:is )?(?:not set|unavailable))/i;
 
 export type AdapterFailureRecoveryClassification =
   | { kind: "provider_quota"; retryAt: Date; parsedResetTime: boolean }
@@ -2168,7 +2208,9 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
               ? "Board operator: repair the project workspace repository URL or clone access, or configure a local checkout cwd, then explicitly retry or reassign."
               : "Board operator: repair the source task workspace link, project workspace cwd, or git checkout, then explicitly retry or reassign."
         : recoveryCause === "configuration_incomplete"
-          ? "Board operator: bind the missing secret(s) named in the run failure, then explicitly retry the original owner or reassign."
+          ? configurationFailureMentionsSecret(input.latestRun)
+            ? "Board operator: bind the missing secret(s) named in the run failure, then explicitly retry the original owner or reassign."
+            : "Board operator: inspect and repair the configuration surfaced by the run failure, then explicitly retry the original owner or reassign."
         : recoveryCause === "execution_review_participant_recovery"
           ? "Board operator: repair the failed review participant path, restore a live reviewer, explicitly reassign, or record an intentional resolution."
         : "Board operator: inspect the evidence, repair the runtime if appropriate, then explicitly retry the original owner, reassign, or intentionally resolve the task.",

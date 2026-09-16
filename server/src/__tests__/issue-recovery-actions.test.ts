@@ -560,6 +560,27 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     ).toBe(true);
   });
 
+  it("drops the secret sentence for an unresolved workspace base ref", async () => {
+    const { coderId, sourceIssue } = await seedCompany();
+    const recovery = recoveryService(db, { enqueueWakeup: vi.fn(async () => null) });
+    const makeRun = makeUnresolvedBaseRefRun(coderId, sourceIssue.id);
+
+    await recovery.escalateStrandedAssignedIssue({
+      issue: sourceIssue,
+      previousStatus: "in_progress",
+      latestRun: makeRun("fix/foo", "origin/fix/foo"),
+      recoveryCause: "configuration_incomplete",
+    });
+
+    const [action] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, sourceIssue.id));
+    // `workspace_base_ref_unresolved` is the one structured reason that names
+    // no secret; the operator is sent to the configuration, not to the vault.
+    expect(action?.nextAction ?? "").not.toContain("bind the missing secret");
+  });
+
   it.each([
     ["process_lost", undefined],
     ["adapter_failed", "successful_run_missing_state"],
@@ -1189,7 +1210,104 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       cause: "configuration_incomplete",
       recoveryIssueId: null,
     });
+    expect(action?.nextAction ?? "").not.toContain("bind the missing secret");
     expect(enqueueWakeup).not.toHaveBeenCalled();
+  });
+
+  it("keeps the secret-binding copy when a configuration_incomplete failure names a missing api key", async () => {
+    const { companyId, coderId, sourceIssueId } = await seedCompany();
+    await db.insert(heartbeatRuns).values({
+      id: randomUUID(),
+      companyId,
+      agentId: coderId,
+      invocationSource: "manual",
+      status: "failed",
+      error: "Missing OPENAI_API key in the agent runtime; no api key configured",
+      errorCode: "adapter_failed",
+      startedAt: new Date("2026-07-15T20:00:00.000Z"),
+      finishedAt: new Date("2026-07-15T20:01:00.000Z"),
+      contextSnapshot: { issueId: sourceIssueId },
+    });
+    const enqueueWakeup = vi.fn(async () => null);
+    const recovery = recoveryService(db, { enqueueWakeup });
+
+    await recovery.reconcileStrandedAssignedIssues();
+
+    const [action] = await db.select().from(issueRecoveryActions);
+    expect(action).toMatchObject({
+      sourceIssueId,
+      cause: "configuration_incomplete",
+    });
+    expect(action?.nextAction).toContain("bind the missing secret(s)");
+  });
+
+  it("keeps the secret-binding copy when the structured configurationIncomplete payload says secret_binding_missing even if the regex would not match", async () => {
+    const { companyId, coderId, sourceIssueId } = await seedCompany();
+    await db.insert(heartbeatRuns).values({
+      id: randomUUID(),
+      companyId,
+      agentId: coderId,
+      invocationSource: "manual",
+      status: "failed",
+      error: 'configuration incomplete: secret "OPENAI_API_KEY" not bound at agent env.UNBOUND_API_KEY',
+      errorCode: "configuration_incomplete",
+      startedAt: new Date("2026-07-15T20:00:00.000Z"),
+      finishedAt: new Date("2026-07-15T20:01:00.000Z"),
+      contextSnapshot: { issueId: sourceIssueId },
+      resultJson: {
+        configurationIncomplete: {
+          reason: "secret_binding_missing",
+          missingBindings: [
+            {
+              consumerType: "agent",
+              consumerId: coderId,
+              configPath: "env.UNBOUND_API_KEY",
+              envKey: "UNBOUND_API_KEY",
+              secretId: "00000000-0000-0000-0000-000000000000",
+              secretName: "OPENAI_API_KEY",
+            },
+          ],
+        },
+      },
+    });
+    const enqueueWakeup = vi.fn(async () => null);
+    const recovery = recoveryService(db, { enqueueWakeup });
+
+    await recovery.reconcileStrandedAssignedIssues();
+
+    const [action] = await db.select().from(issueRecoveryActions);
+    expect(action).toMatchObject({
+      sourceIssueId,
+      cause: "configuration_incomplete",
+    });
+    expect(action?.nextAction).toContain("bind the missing secret(s)");
+  });
+
+  it("drops the secret sentence when only errorCode flags configuration_incomplete with no secret-shaped failure text", async () => {
+    const { companyId, coderId, sourceIssueId } = await seedCompany();
+    await db.insert(heartbeatRuns).values({
+      id: randomUUID(),
+      companyId,
+      agentId: coderId,
+      invocationSource: "manual",
+      status: "failed",
+      error: "adapter process exited before the prompt was answered",
+      errorCode: "configuration_incomplete",
+      startedAt: new Date("2026-07-15T20:00:00.000Z"),
+      finishedAt: new Date("2026-07-15T20:01:00.000Z"),
+      contextSnapshot: { issueId: sourceIssueId },
+    });
+    const enqueueWakeup = vi.fn(async () => null);
+    const recovery = recoveryService(db, { enqueueWakeup });
+
+    await recovery.reconcileStrandedAssignedIssues();
+
+    const [action] = await db.select().from(issueRecoveryActions);
+    expect(action).toMatchObject({
+      sourceIssueId,
+      cause: "configuration_incomplete",
+    });
+    expect(action?.nextAction ?? "").not.toContain("bind the missing secret");
   });
 
   it("does not classify stale configuration failures from a non-assignee run", async () => {
