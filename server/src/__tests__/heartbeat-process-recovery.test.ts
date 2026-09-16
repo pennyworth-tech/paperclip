@@ -1334,6 +1334,107 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(checkoutReleasedIssue?.checkoutRunId).toBeNull();
   });
 
+  it("queues one retry for a pid-less gateway-adapter run lost without process metadata", async () => {
+    // An adapter outside SESSIONED_LOCAL_ADAPTERS never records a local pid,
+    // so the old boot-reap gate could never grant it the SIGTERM path's
+    // enqueueProcessLossRetry — every restart left an unretried process_lost.
+    const { agentId, runId, issueId } = await seedRunFixture({
+      adapterType: "openclaw_gateway",
+      agentStatus: "idle",
+      processPid: null,
+      processGroupId: null,
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reapOrphanedRuns();
+    expect(result.reaped).toBe(1);
+    expect(result.runIds).toEqual([runId]);
+
+    const runs = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, agentId));
+    const failedRun = runs.find((row) => row.id === runId);
+    const retryRuns = runs.filter((row) => row.retryOfRunId === runId);
+    expect(failedRun?.status).toBe("failed");
+    expect(failedRun?.errorCode).toBe("process_lost");
+    expect(retryRuns).toHaveLength(1);
+    expect(["queued", "running"]).toContain(retryRuns[0]?.status);
+    expect(retryRuns[0]?.retryOfRunId).toBe(runId);
+    expect(retryRuns[0]?.processLossRetryCount).toBe(1);
+
+    const issue = await waitForValue(async () =>
+      db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null)
+    );
+    expect(issue?.checkoutRunId).toBeNull();
+    expect([retryRuns[0]?.id ?? null, null]).toContain(issue?.executionRunId ?? null);
+  });
+
+  it("does not retry a lost gateway-adapter run more than once", async () => {
+    const { agentId, runId } = await seedRunFixture({
+      adapterType: "openclaw_gateway",
+      agentStatus: "idle",
+      processPid: null,
+      processGroupId: null,
+      processLossRetryCount: 1,
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reapOrphanedRuns();
+    expect(result.reaped).toBe(1);
+
+    const runs = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, agentId));
+    // An already-retried run earns no SECOND process-loss retry. retryOfRunId
+    // alone cannot assert this: the immediate issue-recovery path reuses it.
+    // The process-loss retry is identified by its wake reason.
+    const processLossRetries = runs.filter((row) => {
+      const context = row.contextSnapshot as Record<string, unknown> | null;
+      return context?.wakeReason === "process_lost_retry";
+    });
+    expect(processLossRetries).toHaveLength(0);
+    expect(
+      runs.filter((row) => (row.processLossRetryCount ?? 0) > 1),
+    ).toHaveLength(0);
+    expect(runs.find((row) => row.id === runId)?.errorCode).toBe("process_lost");
+  });
+
+  it("spares a fresh gateway-adapter run under the startup staleness threshold and reaps it once stale", async () => {
+    // A second instance boots while the first instance's runs are still live:
+    // the startup reap's staleness threshold is what keeps their fresh rows
+    // alive, and the retry gate is what recovers them once genuinely stale.
+    const { agentId, runId } = await seedRunFixture({
+      adapterType: "openclaw_gateway",
+      agentStatus: "idle",
+      processPid: null,
+      processGroupId: null,
+    });
+    await db
+      .update(heartbeatRuns)
+      .set({ updatedAt: new Date() })
+      .where(eq(heartbeatRuns.id, runId));
+    const heartbeat = heartbeatService(db);
+
+    const fresh = await heartbeat.reapOrphanedRuns({ staleThresholdMs: 5 * 60 * 1000 });
+    expect(fresh.reaped).toBe(0);
+    expect(
+      await db.select({ status: heartbeatRuns.status }).from(heartbeatRuns).where(eq(heartbeatRuns.id, runId)),
+    ).toEqual([{ status: "running" }]);
+
+    const stale = await heartbeat.reapOrphanedRuns({ staleThresholdMs: 1 });
+    expect(stale.reaped).toBe(1);
+    const runs = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, agentId));
+    expect(runs.find((row) => row.id === runId)?.errorCode).toBe("process_lost");
+    expect(
+      runs.filter((row) => (row.contextSnapshot as Record<string, unknown> | null)?.wakeReason === "process_lost_retry"),
+    ).toHaveLength(1);
+  });
+
   it("restores one lost monitor dispatch before escalating a second process loss", async () => {
     const { companyId, agentId, runId, issueId } = await seedRunFixture({
       adapterType: "openclaw_gateway",

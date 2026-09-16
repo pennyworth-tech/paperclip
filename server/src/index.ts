@@ -1331,7 +1331,14 @@ export async function startServer(): Promise<StartedServer> {
 
         for (let attempt = 1; attempt <= 2; attempt++) {
           try {
-            const result = await heartbeat.reapOrphanedRuns();
+            // Nonzero staleness threshold: a second instance boots against
+            // the shared database while the first is still serving, so its
+            // runs are live and fresh — a zero threshold reaps them as
+            // process_lost before traffic ever moves. Match the periodic
+            // reaper's 5-minute floor; genuinely dead runs (frozen updatedAt
+            // from before the restart) age past it within the same window the
+            // periodic reaper already uses.
+            const result = await heartbeat.reapOrphanedRuns({ staleThresholdMs: 5 * 60 * 1000 });
             logger.info(
               { reaped: result.reaped, runIds: result.runIds },
               "startup reap of orphaned heartbeat runs complete",

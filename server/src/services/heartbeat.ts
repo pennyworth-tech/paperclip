@@ -13875,9 +13875,24 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         readNonEmptyString(runContext.wakeReason) === "issue_monitor_due" &&
         monitorNextCheckAt !== undefined &&
         (!monitorNextCheckAt || monitorNextCheckAt.getTime() <= now.getTime());
+      // Retry parity with the graceful-shutdown path
+      // (drainRunningRunsForShutdown): an adapter outside
+      // SESSIONED_LOCAL_ADAPTERS — the gateway and remote adapters, plus
+      // `process` and `http` — has no pid or process group to gate on; when this
+      // instance no longer holds the execution, the run is exactly as lost to it as
+      // a restart-interrupted local run, so it earns the same single
+      // enqueueProcessLossRetry rather than an unretried process_lost. The one
+      // exception mirrors the monitor clause below it: a monitor dispatch whose
+      // issue already has a future monitor wake scheduled is covered by that wake,
+      // and retrying it would duplicate the dispatch.
+      const monitorWakeCoveredByFutureCheck =
+        readNonEmptyString(runContext.wakeReason) === "issue_monitor_due" &&
+        Boolean(monitorNextCheckAt && monitorNextCheckAt.getTime() > now.getTime());
+      const remoteExecutionLost = !tracksLocalChild && !monitorWakeCoveredByFutureCheck;
       const shouldRetry = (run.processLossRetryCount ?? 0) < 1 && (
         (tracksLocalChild && (!!run.processPid || !!run.processGroupId)) ||
-        monitorDispatchLostWithoutFutureWake
+        monitorDispatchLostWithoutFutureWake ||
+        remoteExecutionLost
       );
       const baseMessage = buildProcessLossMessage(run, descendantOnlyCleanup ? { descendantOnly: true } : undefined);
       const unmanagedBackgroundTaskEvidence = descendantOnlyCleanup
