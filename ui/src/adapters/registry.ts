@@ -139,19 +139,26 @@ export function getUIAdapter(type: string): UIAdapterModule {
 /**
  * Keep the UI adapter registry in sync with the server's adapter list.
  *
+ * Callers pass every server adapter this bundle has no compiled-in module for:
+ * plugins installed at runtime, and built-ins the server was configured with
+ * and ships itself. Both are "a type the server has and this bundle does not",
+ * which is the only distinction the two branches below actually turn on.
+ *
  * Two concerns:
  *
- * 1. **Builtin overrides** — when an external adapter ships a ui-parser.js for a
- *    builtin type, the external parser takes priority.  When the external is
+ * 1. **Builtin overrides** — when a server adapter ships a ui-parser.js for a
+ *    builtin type, its parser takes priority.  When it is
  *    disabled or removed the original builtin parser is restored transparently.
  *    A generation counter guards against stale loads that resolve after the
  *    override has been torn down.
  *
- * 2. **Non-builtin externals** — register a bridge adapter that lazily loads the
+ * 2. **Non-builtin types** — register a bridge adapter that lazily loads the
  *    dynamic parser on first stdout line, falling back to the generic process
- *    adapter.  Once the parser resolves the bridge is replaced.
+ *    adapter.  Once the parser resolves the bridge is replaced. Config is
+ *    schema-driven from the server's `getConfigSchema`, so an adapter needs no
+ *    compiled-in module here to be configurable.
  */
-export function syncExternalAdapters(
+export function syncServerAdapters(
   serverAdapters: {
     type: string;
     label: string;

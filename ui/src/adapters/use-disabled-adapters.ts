@@ -2,7 +2,8 @@ import { useEffect, useMemo } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { adaptersApi } from "@/api/adapters";
 import { setDisabledAdapterTypes } from "@/adapters/disabled-store";
-import { syncExternalAdapters } from "@/adapters/registry";
+import { syncServerAdapters } from "@/adapters/registry";
+import { setRuntimeAdapterDisplay } from "@/adapters/adapter-display-registry";
 import { queryKeys } from "@/lib/queryKeys";
 
 /**
@@ -25,11 +26,14 @@ export function useDisabledAdaptersSync(options: { enabled?: boolean } = {}): Se
     staleTime: 5 * 60 * 1000,
   });
 
-  // Eagerly register external adapter types in the UI registry so that
+  // Eagerly register server-side adapter types in the UI registry so that
   // consumers calling listUIAdapters() in the same render cycle see them.
   // This is idempotent — already-registered types are skipped.
+  //
+  // Keep source-based selection: external overrides can share a compiled-in
+  // type and still need to reach the override lifecycle.
   if (adapters) {
-    syncExternalAdapters(
+    syncServerAdapters(
       adapters
         .filter((a) => a.source === "external")
         .map((a) => ({
@@ -38,6 +42,16 @@ export function useDisabledAdaptersSync(options: { enabled?: boolean } = {}): Se
           disabled: a.disabled,
           overrideDisabled: a.overridePaused,
         })),
+    );
+    // Display metadata rides the response that is already being fetched, so
+    // an adapter this bundle has no entry for can still show a real name.
+    setRuntimeAdapterDisplay(
+      adapters.map((a) => ({
+        type: a.type,
+        label: a.label,
+        description: a.description,
+        iconName: a.iconName,
+      })),
     );
   }
 
