@@ -11,6 +11,22 @@ import type { PaperclipPluginManifestV1 } from "@paperclipai/shared";
  * the release image under the bundled catalog root. Nobody "installs" on a
  * managed instance: the control plane provisions, tenants use.
  *
+ * The catalog has two halves, composed by `buildBundledPluginCatalog`:
+ *
+ * - `BUNDLED_PLUGIN_CATALOG`, compiled into this file, and
+ * - `plugins.catalog`, declared by the same managed-config document, for
+ *   bundles a distributor ships in its own image.
+ *
+ * The second half widens *which names are electable*; it does not widen *what
+ * a name may reach*. A configured entry is held to strictly tighter rules
+ * than a compiled-in one: catalog-root containment is forced on regardless of
+ * the caller's flag, it can carry no `pathOverrideEnvVar`, and the bundle it
+ * names must opt in through its own `package.json` (`paperclipPlugin.bundledKey`
+ * / `.bundledPluginKey`). So a document can elect only what the image author
+ * both shipped under the catalog root and marked as electable — the same
+ * class of authority the compiled-in half grants, with membership still set
+ * by whoever builds the image.
+ *
  * Two distinct failure postures, deliberately split:
  *
  * 1. **Resolution (this file, `resolveBundledPluginInstalls`) fails to
@@ -106,6 +122,71 @@ export const BUNDLED_PLUGIN_CATALOG: readonly BundledPluginCatalogEntry[] = [
  */
 export const SELF_HOSTED_AUTO_INSTALL_KEYS: readonly string[] = ["kubernetes"];
 
+/**
+ * A catalog entry contributed by `plugins.catalog` rather than compiled in.
+ * Deliberately NOT a `BundledPluginCatalogEntry`: it has no
+ * `pathOverrideEnvVar`, so no document can introduce a new environment
+ * variable that relocates a bundle.
+ */
+export interface ConfiguredBundledPluginCatalogEntry {
+  key: string;
+  pluginKey: string;
+  relativePath: string;
+}
+
+/** A catalog entry after composition, tagged with where it came from. */
+export type ComposedBundledPluginCatalogEntry = BundledPluginCatalogEntry & {
+  /** Present only on entries a managed-config document contributed. */
+  readonly configured?: true;
+};
+
+/**
+ * `package.json` key a bundled plugin uses to declare itself. Every bundle in
+ * the compiled-in catalog already carries it; a configured entry additionally
+ * requires `bundledKey` and `bundledPluginKey` inside it to match the entry
+ * that elected it.
+ */
+const PLUGIN_DECLARATION_KEY = "paperclipPlugin";
+
+/**
+ * Compose the compiled-in catalog with control-plane-declared additions.
+ *
+ * Additions may only ADD. A `key` or `pluginKey` colliding with a compiled-in
+ * entry throws, so configuration can never redirect a name this build ships
+ * — the property that keeps the compiled-in half a fixed point no document
+ * can move. Throwing happens synchronously inside `createApp`, before the
+ * server listens, like every other resolution failure in this module.
+ */
+export function buildBundledPluginCatalog(
+  configured: readonly ConfiguredBundledPluginCatalogEntry[],
+): readonly ComposedBundledPluginCatalogEntry[] {
+  if (configured.length === 0) return BUNDLED_PLUGIN_CATALOG;
+  const composed: ComposedBundledPluginCatalogEntry[] = [...BUNDLED_PLUGIN_CATALOG];
+  const keys = new Set(BUNDLED_PLUGIN_CATALOG.map((entry) => entry.key));
+  const pluginKeys = new Set(BUNDLED_PLUGIN_CATALOG.map((entry) => entry.pluginKey));
+  for (const entry of configured) {
+    if (keys.has(entry.key)) {
+      throw new Error(
+        `configured bundled plugin key "${entry.key}" is already a compiled-in catalog key; configuration may add catalog entries but never shadow one shipped in this build; refusing to start`,
+      );
+    }
+    if (pluginKeys.has(entry.pluginKey)) {
+      throw new Error(
+        `configured bundled plugin "${entry.key}" declares pluginKey "${entry.pluginKey}", which is already a compiled-in catalog pluginKey; refusing to start`,
+      );
+    }
+    keys.add(entry.key);
+    pluginKeys.add(entry.pluginKey);
+    composed.push({
+      key: entry.key,
+      pluginKey: entry.pluginKey,
+      relativePath: entry.relativePath,
+      configured: true,
+    });
+  }
+  return composed;
+}
+
 export function resolveBundledCatalogRoot(
   env: Record<string, string | undefined>,
 ): string {
@@ -121,23 +202,94 @@ export interface ResolvedBundledPlugin {
 }
 
 /**
- * Canonicalize a path for containment comparison. Symlinks are resolved
- * when the path exists so a link inside the catalog cannot point install
- * resolution at a directory outside it; nonexistent paths fall back to a
- * lexical resolve (`..` segments still collapse).
+ * Canonicalize a path for containment comparison. Symlinks are resolved so a
+ * link inside the catalog cannot point install resolution at a directory
+ * outside it.
+ *
+ * A path that does not exist is canonicalized as far as it does: the nearest
+ * existing ancestor is resolved with `realpath` and the remaining segments are
+ * appended lexically. Resolving only whole paths was wrong in both directions.
+ * It produced a false NEGATIVE whenever the catalog root itself sat behind a
+ * symlink and an elected bundle was simply absent from the image — the root
+ * canonicalized, the missing bundle path did not, and a managed instance that
+ * should have logged "bundle not present; skipping" refused to boot instead.
+ * And it produced a false POSITIVE for a not-yet-existing path *under* a
+ * symlinked intermediate directory, which compared as inside the root while
+ * resolving outside it.
  */
 function canonicalize(p: string): string {
-  const resolved = path.resolve(p);
-  try {
-    return fs.realpathSync(resolved);
-  } catch {
-    return resolved;
+  let current = path.resolve(p);
+  const trailing: string[] = [];
+  // Bounded by construction: every iteration removes one segment, and
+  // `path.dirname` of a root is that root, which ends the walk.
+  for (;;) {
+    try {
+      return path.join(fs.realpathSync(current), ...trailing.reverse());
+    } catch {
+      const parent = path.dirname(current);
+      if (parent === current) return path.resolve(p);
+      trailing.push(path.basename(current));
+      current = parent;
+    }
   }
 }
 
 function isInsideRoot(candidate: string, root: string): boolean {
   const rel = path.relative(root, candidate);
   return rel === "" || (!rel.startsWith("..") && !path.isAbsolute(rel));
+}
+
+/**
+ * Verify that the bundle a configured catalog entry names has opted in to
+ * being loaded under that entry.
+ *
+ * ABSENCE IS BENIGN and returns without throwing, deliberately: the
+ * unassembled dev tree and an image built without a distributor's bundle both
+ * legitimately lack the directory, and `ensureBundledPlugins` already logs and
+ * skips. What throws is a bundle that is PRESENT but does not declare itself,
+ * or declares itself under a different key — that is not a missing file, it is
+ * a document pointing at code that never agreed to be loaded this way, and it
+ * is what stops any incidental directory under the catalog root (a fixture, a
+ * dev bundle, an SDK) from being electable.
+ *
+ * The read is done through `canonicalPath`, the symlink-resolved directory
+ * the containment check already accepted, so the file read and the file
+ * checked are the same file.
+ */
+function assertConfiguredBundleDeclaration(
+  entry: ComposedBundledPluginCatalogEntry,
+  canonicalPath: string,
+): void {
+  if (!fs.existsSync(canonicalPath)) return;
+  const manifestPath = path.join(canonicalPath, "package.json");
+  let pkg: unknown;
+  try {
+    pkg = JSON.parse(fs.readFileSync(manifestPath, "utf-8"));
+  } catch (err) {
+    throw new Error(
+      `bundled plugin "${entry.key}" at "${canonicalPath}" has no readable package.json (${err instanceof Error ? err.message : String(err)}); refusing to start`,
+    );
+  }
+  const declaration =
+    typeof pkg === "object" && pkg !== null
+      ? (pkg as Record<string, unknown>)[PLUGIN_DECLARATION_KEY]
+      : undefined;
+  if (typeof declaration !== "object" || declaration === null || Array.isArray(declaration)) {
+    throw new Error(
+      `bundled plugin "${entry.key}" at "${canonicalPath}" does not declare "${PLUGIN_DECLARATION_KEY}"; a package must opt in to being loaded as a bundled plugin; refusing to start`,
+    );
+  }
+  const declared = declaration as Record<string, unknown>;
+  if (declared.bundledKey !== entry.key) {
+    throw new Error(
+      `bundled plugin "${entry.key}" at "${canonicalPath}" declares ${PLUGIN_DECLARATION_KEY}.bundledKey ${JSON.stringify(declared.bundledKey ?? null)}; a package must be elected under the key it declares; refusing to start`,
+    );
+  }
+  if (declared.bundledPluginKey !== entry.pluginKey) {
+    throw new Error(
+      `bundled plugin "${entry.key}" at "${canonicalPath}" declares ${PLUGIN_DECLARATION_KEY}.bundledPluginKey ${JSON.stringify(declared.bundledPluginKey ?? null)}, but the catalog entry installs it as "${entry.pluginKey}"; refusing to start`,
+    );
+  }
 }
 
 /**
@@ -149,6 +301,13 @@ function isInsideRoot(candidate: string, root: string): boolean {
  * `enforceCatalogRoot: true` for managed (control-plane-driven) key lists
  * and `false` for the self-hosted built-in list, where the legacy
  * kubernetes path override may point anywhere (unchanged behavior).
+ *
+ * Entries the managed-config document contributed (`configured: true`) are
+ * held to tighter rules than the compiled-in ones regardless of the caller's
+ * flags: containment is always enforced, no path-override environment
+ * variable is consulted, and the bundle must declare itself. The legacy
+ * "may point anywhere" escape belongs to the compiled-in kubernetes entry
+ * alone and stays there.
  */
 export function resolveBundledPluginInstalls(
   keys: readonly string[],
@@ -156,31 +315,42 @@ export function resolveBundledPluginInstalls(
     catalogRoot: string;
     env: Record<string, string | undefined>;
     enforceCatalogRoot: boolean;
+    /**
+     * Catalog to resolve against. Defaults to the compiled-in catalog, so
+     * every caller that does not compose one behaves exactly as before.
+     */
+    catalog?: readonly ComposedBundledPluginCatalogEntry[];
   },
 ): ResolvedBundledPlugin[] {
+  const catalog: readonly ComposedBundledPluginCatalogEntry[] =
+    opts.catalog ?? BUNDLED_PLUGIN_CATALOG;
   const resolved: ResolvedBundledPlugin[] = [];
   const seen = new Set<string>();
   const canonicalRoot = canonicalize(opts.catalogRoot);
   for (const key of keys) {
     if (seen.has(key)) continue;
     seen.add(key);
-    const entry = BUNDLED_PLUGIN_CATALOG.find((candidate) => candidate.key === key);
+    const entry = catalog.find((candidate) => candidate.key === key);
     if (!entry) {
-      const known = BUNDLED_PLUGIN_CATALOG.map((candidate) => candidate.key).join(", ");
+      const known = catalog.map((candidate) => candidate.key).join(", ");
       throw new Error(
         `bundled plugin auto-install key "${key}" is not in the bundled catalog (known keys: ${known}); refusing to start`,
       );
     }
-    const override = entry.pathOverrideEnvVar
+    const override = !entry.configured && entry.pathOverrideEnvVar
       ? opts.env[entry.pathOverrideEnvVar]?.trim()
       : undefined;
     const localPath = override
       ? path.resolve(override)
       : path.resolve(opts.catalogRoot, entry.relativePath);
-    if (opts.enforceCatalogRoot && !isInsideRoot(canonicalize(localPath), canonicalRoot)) {
+    const canonicalPath = canonicalize(localPath);
+    if ((opts.enforceCatalogRoot || entry.configured) && !isInsideRoot(canonicalPath, canonicalRoot)) {
       throw new Error(
         `bundled plugin "${key}" resolves to "${localPath}", outside the bundled catalog root "${opts.catalogRoot}"; refusing to start`,
       );
+    }
+    if (entry.configured) {
+      assertConfiguredBundleDeclaration(entry, canonicalPath);
     }
     resolved.push({ key: entry.key, pluginKey: entry.pluginKey, localPath });
   }

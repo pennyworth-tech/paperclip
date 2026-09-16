@@ -6,6 +6,7 @@ import {
   BUNDLED_PLUGIN_CATALOG,
   DEFAULT_BUNDLED_CATALOG_ROOT,
   SELF_HOSTED_AUTO_INSTALL_KEYS,
+  buildBundledPluginCatalog,
   ensureBundledPlugins,
   resolveBundledCatalogRoot,
   resolveBundledPluginInstalls,
@@ -169,6 +170,39 @@ describe("resolveBundledPluginInstalls", () => {
     });
   });
 
+  // Containment compares canonical paths, so a path that does not exist must
+  // still be canonicalized as far as it does — otherwise the comparison is
+  // between a resolved root and an unresolved candidate.
+  it("does not refuse an absent bundle merely because the catalog root is symlinked", () => {
+    const real = makeTempDir("bundled-real-");
+    const link = path.join(makeTempDir("bundled-link-"), "plugins");
+    symlinkSync(real, link);
+    // Nothing is on disk under the root: `ensureBundledPlugins` is the layer
+    // that logs and skips an absent bundle, and resolution must let it.
+    expect(
+      resolveBundledPluginInstalls(["daytona"], {
+        catalogRoot: link,
+        env: {},
+        enforceCatalogRoot: true,
+      })[0]!.localPath,
+    ).toBe(path.join(link, "sandbox-providers/daytona"));
+  });
+
+  it("refuses an absent bundle under a symlinked intermediate directory that leaves the root", () => {
+    const outside = makeTempDir("bundled-outside-");
+    const root = makeTempDir("bundled-root-");
+    // `sandbox-providers` itself escapes, so `sandbox-providers/daytona`
+    // resolves outside the root even though it does not exist yet.
+    symlinkSync(outside, path.join(root, "sandbox-providers"));
+    expect(() =>
+      resolveBundledPluginInstalls(["daytona"], {
+        catalogRoot: root,
+        env: {},
+        enforceCatalogRoot: true,
+      }),
+    ).toThrow(/outside the bundled catalog root/);
+  });
+
   it("covers every catalog entry with a path inside the default root", () => {
     const keys = BUNDLED_PLUGIN_CATALOG.map((entry) => entry.key);
     const resolved = resolveBundledPluginInstalls(keys, {
@@ -177,6 +211,202 @@ describe("resolveBundledPluginInstalls", () => {
       enforceCatalogRoot: true,
     });
     expect(resolved).toHaveLength(BUNDLED_PLUGIN_CATALOG.length);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Control-plane-declared catalog entries (plugins.catalog)
+// ---------------------------------------------------------------------------
+
+const CONFIGURED_ENTRY = {
+  key: "acme-operations",
+  pluginKey: "acme.operations",
+  relativePath: "acme/operations",
+};
+
+/** Lay down a bundle directory, optionally with a `paperclipPlugin` block. */
+function writeBundle(
+  root: string,
+  relativePath: string,
+  declaration?: Record<string, unknown> | "absent" | "malformed",
+): string {
+  const dir = path.join(root, relativePath);
+  mkdirSync(dir, { recursive: true });
+  if (declaration === "malformed") {
+    writeFileSync(path.join(dir, "package.json"), "{not json");
+  } else {
+    writeFileSync(
+      path.join(dir, "package.json"),
+      JSON.stringify({
+        name: "@acme/operations",
+        ...(declaration && declaration !== "absent" ? { paperclipPlugin: declaration } : {}),
+      }),
+    );
+  }
+  return dir;
+}
+
+const VALID_DECLARATION = {
+  manifest: "./dist/manifest.js",
+  worker: "./dist/worker.js",
+  bundledKey: CONFIGURED_ENTRY.key,
+  bundledPluginKey: CONFIGURED_ENTRY.pluginKey,
+};
+
+describe("buildBundledPluginCatalog", () => {
+  it("returns the compiled-in catalog unchanged when nothing is configured", () => {
+    expect(buildBundledPluginCatalog([])).toBe(BUNDLED_PLUGIN_CATALOG);
+  });
+
+  it("appends configured entries and tags them", () => {
+    const composed = buildBundledPluginCatalog([CONFIGURED_ENTRY]);
+    expect(composed).toHaveLength(BUNDLED_PLUGIN_CATALOG.length + 1);
+    expect(composed.at(-1)).toEqual({ ...CONFIGURED_ENTRY, configured: true });
+    // Compiled-in entries are untouched and carry no `configured` tag.
+    for (const entry of composed.slice(0, BUNDLED_PLUGIN_CATALOG.length)) {
+      expect(entry.configured).toBeUndefined();
+    }
+  });
+
+  it("refuses to shadow a compiled-in key (fail to start)", () => {
+    expect(() =>
+      buildBundledPluginCatalog([{ ...CONFIGURED_ENTRY, key: "daytona" }]),
+    ).toThrow(/"daytona" is already a compiled-in catalog key.*refusing to start/);
+  });
+
+  it("refuses to reuse a compiled-in pluginKey (fail to start)", () => {
+    expect(() =>
+      buildBundledPluginCatalog([
+        { ...CONFIGURED_ENTRY, pluginKey: "paperclip.daytona-sandbox-provider" },
+      ]),
+    ).toThrow(/already a compiled-in catalog pluginKey.*refusing to start/);
+  });
+});
+
+describe("resolveBundledPluginInstalls with a configured catalog", () => {
+  function resolveConfigured(root: string, opts: { enforceCatalogRoot?: boolean } = {}) {
+    return resolveBundledPluginInstalls([CONFIGURED_ENTRY.key], {
+      catalog: buildBundledPluginCatalog([CONFIGURED_ENTRY]),
+      catalogRoot: root,
+      env: {},
+      enforceCatalogRoot: opts.enforceCatalogRoot ?? true,
+    });
+  }
+
+  it("resolves a declared bundle inside the catalog root", () => {
+    const root = makeTempDir("bundled-configured-");
+    const dir = writeBundle(root, CONFIGURED_ENTRY.relativePath, VALID_DECLARATION);
+    expect(resolveConfigured(root)).toEqual([
+      { key: CONFIGURED_ENTRY.key, pluginKey: CONFIGURED_ENTRY.pluginKey, localPath: dir },
+    ]);
+  });
+
+  it("still throws on an auto-install key absent from the composed catalog", () => {
+    const root = makeTempDir("bundled-configured-");
+    expect(() =>
+      resolveBundledPluginInstalls(["not-a-bundled-plugin"], {
+        catalog: buildBundledPluginCatalog([CONFIGURED_ENTRY]),
+        catalogRoot: root,
+        env: {},
+        enforceCatalogRoot: true,
+      }),
+      // The composed catalog is what the error names, so a configured key is
+      // reported as known.
+    ).toThrow(new RegExp(`known keys: .*${CONFIGURED_ENTRY.key}`));
+  });
+
+  it("treats an absent bundle as benign (unassembled tree / image without the bundle)", () => {
+    const root = makeTempDir("bundled-configured-");
+    expect(resolveConfigured(root)).toEqual([
+      {
+        key: CONFIGURED_ENTRY.key,
+        pluginKey: CONFIGURED_ENTRY.pluginKey,
+        localPath: path.join(root, CONFIGURED_ENTRY.relativePath),
+      },
+    ]);
+  });
+
+  it("throws when a present bundle does not declare itself (fail to start)", () => {
+    const root = makeTempDir("bundled-configured-");
+    writeBundle(root, CONFIGURED_ENTRY.relativePath, "absent");
+    expect(() => resolveConfigured(root)).toThrow(
+      /does not declare "paperclipPlugin".*must opt in.*refusing to start/,
+    );
+  });
+
+  it("throws when the declaration names a different bundledKey", () => {
+    const root = makeTempDir("bundled-configured-");
+    writeBundle(root, CONFIGURED_ENTRY.relativePath, {
+      ...VALID_DECLARATION,
+      bundledKey: "someone-elses-bundle",
+    });
+    expect(() => resolveConfigured(root)).toThrow(
+      /declares paperclipPlugin.bundledKey "someone-elses-bundle".*refusing to start/,
+    );
+  });
+
+  it("throws when the declaration names a different bundledPluginKey", () => {
+    const root = makeTempDir("bundled-configured-");
+    writeBundle(root, CONFIGURED_ENTRY.relativePath, {
+      ...VALID_DECLARATION,
+      bundledPluginKey: "acme.something-else",
+    });
+    expect(() => resolveConfigured(root)).toThrow(
+      /declares paperclipPlugin.bundledPluginKey "acme.something-else".*installs it as "acme.operations"/,
+    );
+  });
+
+  it("throws when a present bundle has no readable package.json", () => {
+    const root = makeTempDir("bundled-configured-");
+    writeBundle(root, CONFIGURED_ENTRY.relativePath, "malformed");
+    expect(() => resolveConfigured(root)).toThrow(/has no readable package.json.*refusing to start/);
+  });
+
+  it("enforces catalog-root containment for a configured entry even when the caller does not", () => {
+    // A symlink inside the root pointing out of it is the case a lexical path
+    // rule cannot catch, so it is the one containment must resolve.
+    const outside = makeTempDir("bundled-outside-");
+    writeFileSync(
+      path.join(outside, "package.json"),
+      JSON.stringify({ name: "@acme/operations", paperclipPlugin: VALID_DECLARATION }),
+    );
+    const root = makeTempDir("bundled-root-");
+    mkdirSync(path.join(root, "acme"), { recursive: true });
+    symlinkSync(outside, path.join(root, CONFIGURED_ENTRY.relativePath));
+    expect(() => resolveConfigured(root, { enforceCatalogRoot: false })).toThrow(
+      /outside the bundled catalog root/,
+    );
+  });
+
+  it("ignores a path-override env var for a configured entry", () => {
+    // `pathOverrideEnvVar` is not a field a document can set, but even when one
+    // is forced onto a composed entry the configured branch never reads it.
+    const root = makeTempDir("bundled-configured-");
+    const dir = writeBundle(root, CONFIGURED_ENTRY.relativePath, VALID_DECLARATION);
+    const composed = [
+      ...BUNDLED_PLUGIN_CATALOG,
+      { ...CONFIGURED_ENTRY, configured: true as const, pathOverrideEnvVar: "ACME_PLUGIN_PATH" },
+    ];
+    const resolved = resolveBundledPluginInstalls([CONFIGURED_ENTRY.key], {
+      catalog: composed,
+      catalogRoot: root,
+      env: { ACME_PLUGIN_PATH: "/srv/evil/plugin" },
+      enforceCatalogRoot: false,
+    });
+    expect(resolved[0]!.localPath).toBe(dir);
+  });
+
+  it("leaves the compiled-in half behaving exactly as before", () => {
+    const composed = buildBundledPluginCatalog([CONFIGURED_ENTRY]);
+    // The legacy kubernetes escape still works for the compiled-in entry.
+    expect(
+      resolveBundledPluginInstalls(["kubernetes"], {
+        catalog: composed,
+        catalogRoot: CATALOG_ROOT,
+        env: { PAPERCLIP_KUBERNETES_PLUGIN_PATH: "/somewhere/else/kubernetes" },
+        enforceCatalogRoot: false,
+      })[0]!.localPath,
+    ).toBe("/somewhere/else/kubernetes");
   });
 });
 

@@ -9,7 +9,14 @@
  *     "mode": "cloud",
  *     "catalogVersion": "2026.720.0",
  *     "features": { "<feature-key>": true | false, ... },
- *     "plugins":  { "autoInstall": ["daytona", "kubernetes"] },
+ *     "plugins":  {
+ *       "autoInstall": ["daytona", "kubernetes"],
+ *       "catalog": [
+ *         { "key": "acme-operations",
+ *           "pluginKey": "acme.operations",
+ *           "relativePath": "acme/operations" }
+ *       ]
+ *     },
  *     "environments": [
  *       { "name": "Daytona", "provider": "daytona", "config": { "target": "us" } }
  *     ]
@@ -49,9 +56,36 @@ export interface ManagedInstanceConfig {
   /** App feature-catalog version the document was validated against. */
   catalogVersion: string;
   features: Readonly<Partial<Record<ManagedExperimentalFeatureKey, boolean>>>;
-  plugins: { readonly autoInstall: readonly string[] };
+  plugins: {
+    readonly autoInstall: readonly string[];
+    /**
+     * Additive bundled-catalog entries (empty when the section is absent).
+     * Composed onto the compiled-in catalog by `buildBundledPluginCatalog`,
+     * which refuses a key that shadows one this build ships.
+     */
+    readonly catalog: readonly ManagedBundledPluginSpec[];
+  };
   /** Sandbox environments the control plane provisions at boot (empty when the section is absent). */
   environments: readonly ManagedEnvironmentSpec[];
+}
+
+/**
+ * One control-plane-declared bundled plugin. Identical in shape to a
+ * compiled-in `BundledPluginCatalogEntry` minus `pathOverrideEnvVar`: a
+ * document may name a bundle that ships in the image, never a new environment
+ * variable that relocates one (see `bundled-plugins.ts`).
+ *
+ * Declaring an entry does not install it. The entry only makes the key
+ * *electable*; `plugins.autoInstall` still elects it, and the bundle itself
+ * must opt in through its own `package.json` at resolution time.
+ */
+export interface ManagedBundledPluginSpec {
+  /** Key `plugins.autoInstall` elects, unique within the document. */
+  key: string;
+  /** Manifest id / registry `pluginKey` the bundle installs as. */
+  pluginKey: string;
+  /** Bundle location relative to the bundled catalog root. */
+  relativePath: string;
 }
 
 /**
@@ -130,6 +164,87 @@ function describeJsonValue(value: unknown): string {
   if (value === null) return "null";
   if (Array.isArray(value)) return "an array";
   return `${JSON.stringify(value)}`;
+}
+
+/** Catalog key shape: the token `plugins.autoInstall` elects. */
+const BUNDLED_PLUGIN_KEY_PATTERN = /^[a-z0-9][a-z0-9-]{0,62}$/;
+/** Manifest-id shape (`vendor.plugin-name`). */
+const PLUGIN_MANIFEST_ID_PATTERN = /^[a-z0-9][a-z0-9.-]{0,127}$/;
+
+/** A `relativePath` may name at most this many directory segments. */
+const RELATIVE_PATH_MAX_SEGMENTS = 3;
+/**
+ * Every segment must start with an alphanumeric. `.`, `..` and dotfiles are
+ * therefore rejected by construction rather than by normalization, which is
+ * the property that makes this a *lexical* rule rather than a path-arithmetic
+ * one.
+ */
+const RELATIVE_PATH_SEGMENT_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
+
+/**
+ * Validate a `relativePath` a document uses to name something inside a root
+ * the image controls (a bundled plugin today; any future rooted lookup).
+ *
+ * This is the FIRST of two independent containment barriers, and it is purely
+ * lexical: it runs before any filesystem call, so no `realpath`, mount, or
+ * race can influence it. The second barrier is the canonicalizing containment
+ * check the consumer performs at resolution time, which catches what a
+ * spelling rule cannot — a symlink planted inside the root.
+ */
+function readRelativePath(value: unknown, pointer: string): string {
+  if (typeof value !== "string" || value.length === 0 || value.trim() !== value) {
+    fail(
+      `"${pointer}" must be a non-empty string without surrounding whitespace (got ${describeJsonValue(value)})`,
+    );
+  }
+  if (value.includes("\\")) {
+    fail(`"${pointer}" must use POSIX separators; "\\" is not allowed (got ${JSON.stringify(value)})`);
+  }
+  if (value.startsWith("/")) {
+    fail(`"${pointer}" must be relative to the catalog root, not absolute (got ${JSON.stringify(value)})`);
+  }
+  if (value.startsWith("~")) {
+    fail(`"${pointer}" must not start with "~" (got ${JSON.stringify(value)})`);
+  }
+  const segments = value.split("/");
+  if (segments.length > RELATIVE_PATH_MAX_SEGMENTS) {
+    fail(
+      `"${pointer}" has ${segments.length} path segments; at most ${RELATIVE_PATH_MAX_SEGMENTS} are allowed (got ${JSON.stringify(value)})`,
+    );
+  }
+  for (const segment of segments) {
+    if (!RELATIVE_PATH_SEGMENT_PATTERN.test(segment)) {
+      fail(
+        `"${pointer}" segment ${JSON.stringify(segment)} is not allowed; every segment must start with a letter or digit and contain only letters, digits, ".", "_" and "-"`,
+      );
+    }
+  }
+  return value;
+}
+
+function readIdentifier(
+  value: unknown,
+  pointer: string,
+  pattern: RegExp,
+  shape: string,
+): string {
+  if (typeof value !== "string" || !pattern.test(value)) {
+    fail(`"${pointer}" must be ${shape} (got ${describeJsonValue(value)})`);
+  }
+  return value;
+}
+
+function assertExactKeys(entry: Record<string, unknown>, allowed: readonly string[], pointer: string): void {
+  for (const key of Object.keys(entry)) {
+    if (!allowed.includes(key)) {
+      fail(`"${pointer}" has unknown key "${key}" (allowed: ${allowed.join(", ")})`);
+    }
+  }
+  for (const key of allowed) {
+    if (entry[key] === undefined) {
+      fail(`"${pointer}" requires "${key}"`);
+    }
+  }
 }
 
 /**
@@ -223,8 +338,8 @@ export function parseManagedConfigEnv(env: ManagedConfigEnv): ManagedInstanceCon
     fail(`"plugins" must be an object (got ${describeJsonValue(doc.plugins)})`);
   }
   for (const key of Object.keys(doc.plugins)) {
-    if (key !== "autoInstall") {
-      fail(`"plugins" has unknown key "${key}" (allowed: autoInstall)`);
+    if (key !== "autoInstall" && key !== "catalog") {
+      fail(`"plugins" has unknown key "${key}" (allowed: autoInstall, catalog)`);
     }
   }
   const rawAutoInstall = doc.plugins.autoInstall;
@@ -244,6 +359,60 @@ export function parseManagedConfigEnv(env: ManagedConfigEnv): ManagedInstanceCon
       fail(`"plugins.autoInstall" has duplicate entry "${entry}"`);
     }
     autoInstall.push(entry);
+  }
+
+  // `plugins.catalog` is OPTIONAL for the same reason `environments` is (see
+  // below): absence declares "no image-declared plugins beyond the ones this
+  // build compiles in", which drops no control.
+  //
+  // The section may only ADD electable keys. It cannot shadow a compiled-in
+  // catalog key, cannot carry a `pathOverrideEnvVar`, and cannot cause a
+  // bundle to load on its own — `buildBundledPluginCatalog` enforces the
+  // first, this parser the second (unknown keys are rejected outright), and
+  // the bundle's own `package.json` declaration the third. What is validated
+  // here is only what one document can be self-inconsistent about.
+  const catalog: ManagedBundledPluginSpec[] = [];
+  if (doc.plugins.catalog !== undefined) {
+    if (!Array.isArray(doc.plugins.catalog)) {
+      fail(
+        `"plugins.catalog" must be an array of bundled plugin entries (got ${describeJsonValue(doc.plugins.catalog)})`,
+      );
+    }
+    for (const [index, entry] of doc.plugins.catalog.entries()) {
+      const pointer = `plugins.catalog[${index}]`;
+      if (!isPlainObject(entry)) {
+        fail(`"${pointer}" must be an object (got ${describeJsonValue(entry)})`);
+      }
+      assertExactKeys(entry, ["key", "pluginKey", "relativePath"], pointer);
+      const key = readIdentifier(
+        entry.key,
+        `${pointer}.key`,
+        BUNDLED_PLUGIN_KEY_PATTERN,
+        "a lowercase catalog key of letters, digits and \"-\" starting with a letter or digit",
+      );
+      const pluginKey = readIdentifier(
+        entry.pluginKey,
+        `${pointer}.pluginKey`,
+        PLUGIN_MANIFEST_ID_PATTERN,
+        "a plugin manifest id of lowercase letters, digits, \".\" and \"-\" starting with a letter or digit",
+      );
+      const relativePath = readRelativePath(entry.relativePath, `${pointer}.relativePath`);
+      if (catalog.some((existing) => existing.key === key)) {
+        fail(`"plugins.catalog" has duplicate key "${key}"`);
+      }
+      if (catalog.some((existing) => existing.pluginKey === pluginKey)) {
+        fail(`"plugins.catalog" has duplicate pluginKey "${pluginKey}"`);
+      }
+      // A declared-but-unelected entry is dead configuration and almost always
+      // skew: the document is delivered atomically, so there is no
+      // staged-rollout case where declaring without electing is meaningful.
+      if (!autoInstall.includes(key)) {
+        fail(
+          `"${pointer}.key" is "${key}", which is not in "plugins.autoInstall"; a declared catalog entry must also be elected for install`,
+        );
+      }
+      catalog.push(Object.freeze({ key, pluginKey, relativePath }) as ManagedBundledPluginSpec);
+    }
   }
 
   // `environments` is OPTIONAL, unlike `features` and `plugins`: documents
@@ -331,7 +500,10 @@ export function parseManagedConfigEnv(env: ManagedConfigEnv): ManagedInstanceCon
     mode: "cloud",
     catalogVersion: doc.catalogVersion,
     features: Object.freeze(features),
-    plugins: Object.freeze({ autoInstall: Object.freeze(autoInstall) }),
+    plugins: Object.freeze({
+      autoInstall: Object.freeze(autoInstall),
+      catalog: Object.freeze(catalog),
+    }),
     environments: Object.freeze(environmentSpecs),
   }) as ManagedInstanceConfig;
 }

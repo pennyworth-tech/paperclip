@@ -142,6 +142,7 @@ export {
   managedFeatureKeySet,
   parseManagedConfigEnv,
   MANAGED_CONFIG_ENV_KEY,
+  type ManagedBundledPluginSpec,
   type ManagedEnvironmentSpec,
   type ManagedInstanceConfig,
 } from "./managed-config.js";
