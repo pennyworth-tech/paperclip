@@ -278,7 +278,12 @@ function resolveStrandedRecoveryCause(
 ): StrandedRecoveryCause {
   if (explicitCause) return explicitCause;
   if (isProviderQuotaRecovery(latestRun)) return "provider_quota";
-  if (latestRun?.errorCode === "process_lost") return "process_lost";
+  // `process_never_started` is the zero-output variant of a lost process and
+  // shares its playbook; aliasing it here keeps the recovery cause stable
+  // rather than dropping such runs into the generic stranded path.
+  if (latestRun?.errorCode === "process_lost" || latestRun?.errorCode === "process_never_started") {
+    return "process_lost";
+  }
   if (latestRun?.errorCode === "codex_output_inactivity_monitor") {
     return "codex_output_inactivity_monitor";
   }

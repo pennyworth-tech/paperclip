@@ -489,6 +489,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     processPid?: number | null;
     processGroupId?: number | null;
     processLossRetryCount?: number;
+    lastOutputAt?: Date | null;
     includeIssue?: boolean;
     runErrorCode?: string | null;
     runError?: string | null;
@@ -549,6 +550,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       processPid: input?.processPid ?? null,
       processGroupId: input?.processGroupId ?? null,
       processLossRetryCount: input?.processLossRetryCount ?? 0,
+      lastOutputAt: input?.lastOutputAt ?? null,
       errorCode: input?.runErrorCode ?? null,
       error: input?.runError ?? null,
       startedAt: now,
@@ -1338,11 +1340,15 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     // An adapter outside SESSIONED_LOCAL_ADAPTERS never records a local pid,
     // so the old boot-reap gate could never grant it the SIGTERM path's
     // enqueueProcessLossRetry — every restart left an unretried process_lost.
+    // The run streamed output before it was lost (lastOutputAt): a mid-flight
+    // loss is process_lost, while a zero-output run is the never-started
+    // shape (process_never_started) covered below.
     const { agentId, runId, issueId } = await seedRunFixture({
       adapterType: "openclaw_gateway",
       agentStatus: "idle",
       processPid: null,
       processGroupId: null,
+      lastOutputAt: new Date("2026-03-19T00:00:30.000Z"),
     });
     const heartbeat = heartbeatService(db);
 
@@ -1376,6 +1382,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       agentStatus: "idle",
       processPid: null,
       processGroupId: null,
+      lastOutputAt: new Date("2026-03-19T00:00:30.000Z"),
       processLossRetryCount: 1,
     });
     const heartbeat = heartbeatService(db);
@@ -1405,11 +1412,13 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     // A second instance boots while the first instance's runs are still live:
     // the startup reap's staleness threshold is what keeps their fresh rows
     // alive, and the retry gate is what recovers them once genuinely stale.
+    // lastOutputAt marks the run as mid-flight (lost, not never-started).
     const { agentId, runId } = await seedRunFixture({
       adapterType: "openclaw_gateway",
       agentStatus: "idle",
       processPid: null,
       processGroupId: null,
+      lastOutputAt: new Date("2026-03-19T00:00:30.000Z"),
     });
     await db
       .update(heartbeatRuns)
@@ -1435,12 +1444,157 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     ).toHaveLength(1);
   });
 
+  it("terminalizes a never-started run even while an in-memory execution wrapper holds it", async () => {
+    // The adapter execution wrapper keeps its in-memory entry forever while
+    // no process ever started and no output ever flowed — the remote
+    // execution it was dispatched to is already gone. The startup deadline is
+    // what earns the reap past the in-memory skip; without it the run
+    // escalates forever without terminalizing.
+    const { agentId, runId, issueId } = await seedRunFixture({
+      adapterType: "openclaw_gateway",
+      agentStatus: "idle",
+      processPid: null,
+      processGroupId: null,
+    });
+    runningProcesses.set(runId, {
+      child: { pid: 12345 } as ChildProcess,
+      graceSec: 1,
+      processGroupId: null,
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reapOrphanedRuns();
+    expect(result).toEqual({ reaped: 1, runIds: [runId] });
+    expect(runningProcesses.has(runId)).toBe(false);
+
+    const runs = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, agentId));
+    const failedRun = runs.find((row) => row.id === runId);
+    expect(failedRun?.status).toBe("failed");
+    expect(failedRun?.errorCode).toBe("process_never_started");
+    expect(failedRun?.error).toContain("never started");
+    expect(failedRun?.resultJson).toMatchObject({ stopReason: "process_lost" });
+
+    // The retry arrives via the arm for adapters with no local child: the
+    // never-started verdict must not orphan that retry.
+    const retryRuns = runs.filter((row) => row.retryOfRunId === runId);
+    expect(retryRuns).toHaveLength(1);
+    expect(retryRuns[0]?.processLossRetryCount).toBe(1);
+
+    const issue = await waitForValue(async () =>
+      db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => {
+        const row = rows[0] ?? null;
+        return row?.checkoutRunId === null ? row : null;
+      })
+    );
+    expect([retryRuns[0]?.id ?? null, null]).toContain(issue?.executionRunId ?? null);
+  });
+
+  it("keeps the in-memory skip for a never-started run inside the startup deadline", async () => {
+    const { runId } = await seedRunFixture({
+      adapterType: "openclaw_gateway",
+      agentStatus: "idle",
+      processPid: null,
+      processGroupId: null,
+    });
+    const fresh = new Date();
+    await db
+      .update(heartbeatRuns)
+      .set({ startedAt: fresh, updatedAt: fresh })
+      .where(eq(heartbeatRuns.id, runId));
+    runningProcesses.set(runId, {
+      child: { pid: 12345 } as ChildProcess,
+      graceSec: 1,
+      processGroupId: null,
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reapOrphanedRuns();
+    expect(result).toEqual({ reaped: 0, runIds: [] });
+    expect(
+      await db.select({ status: heartbeatRuns.status }).from(heartbeatRuns).where(eq(heartbeatRuns.id, runId)),
+    ).toEqual([{ status: "running" }]);
+  });
+
+  it("does not terminalize an in-memory zero-metadata run that has produced output", async () => {
+    // processStartedAt is null for EVERY non-local-child adapter run, live
+    // ones included — output is the only thing distinguishing a healthy
+    // in-flight run from a never-started one, so it must keep the in-memory
+    // skip.
+    const { runId } = await seedRunFixture({
+      adapterType: "openclaw_gateway",
+      agentStatus: "idle",
+      processPid: null,
+      processGroupId: null,
+      lastOutputAt: new Date("2026-03-19T00:00:30.000Z"),
+    });
+    runningProcesses.set(runId, {
+      child: { pid: 12345 } as ChildProcess,
+      graceSec: 1,
+      processGroupId: null,
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reapOrphanedRuns();
+    expect(result).toEqual({ reaped: 0, runIds: [] });
+    expect(
+      await db.select({ status: heartbeatRuns.status }).from(heartbeatRuns).where(eq(heartbeatRuns.id, runId)),
+    ).toEqual([{ status: "running" }]);
+  });
+
+  it("terminalizes a never-started local-adapter run without a process-loss retry and releases the issue", async () => {
+    // A local-child run that never recorded a pid earns no process-loss retry
+    // (nothing proved a process to lose), but the reservation — the issue
+    // execution lock — must still be released.
+    const { agentId, runId, issueId } = await seedRunFixture({
+      adapterType: "codex_local",
+      agentStatus: "idle",
+      processPid: null,
+      processGroupId: null,
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reapOrphanedRuns();
+    expect(result).toEqual({ reaped: 1, runIds: [runId] });
+
+    const runs = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, agentId));
+    expect(runs.find((row) => row.id === runId)).toMatchObject({
+      status: "failed",
+      errorCode: "process_never_started",
+    });
+    // No PROCESS-LOSS retry (nothing proved a process to lose). The immediate
+    // issue-recovery path may enqueue its own continuation reusing
+    // retryOfRunId — that is the designed resume, not a process-loss retry,
+    // and it is told apart by its wake reason.
+    expect(
+      runs.filter((row) => (row.contextSnapshot as Record<string, unknown> | null)?.wakeReason === "process_lost_retry"),
+    ).toHaveLength(0);
+
+    // The damage this guards against is the fenced issue: assert the dead run no longer
+    // owns either reservation column. A promoted recovery run may legitimately
+    // re-claim the issue right away, so "null" is not the invariant — "not
+    // this run" is.
+    const issue = await waitForValue(async () =>
+      db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => {
+        const row = rows[0] ?? null;
+        return row && row.checkoutRunId !== runId && row.executionRunId !== runId ? row : null;
+      })
+    );
+    expect(issue).not.toBeNull();
+  });
+
   it("restores one lost monitor dispatch before escalating a second process loss", async () => {
     const { companyId, agentId, runId, issueId } = await seedRunFixture({
       adapterType: "openclaw_gateway",
       agentStatus: "idle",
       processPid: null,
       processGroupId: null,
+      lastOutputAt: new Date("2026-03-19T00:00:30.000Z"),
       contextSnapshot: {
         wakeReason: "issue_monitor_due",
         nextCheckAt: "2026-03-19T00:00:00.000Z",
@@ -1468,6 +1622,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       agentStatus: "idle",
       processPid: null,
       processGroupId: null,
+      lastOutputAt: new Date("2026-03-19T00:00:30.000Z"),
       processLossRetryCount: 1,
       contextSnapshot: {
         wakeReason: "process_lost_retry",
@@ -3400,10 +3555,11 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     });
   });
 
-  // Scenario 4: `process_lost` before the agent started is retried like
+  // Scenario 4: a continuation lost before the agent started is retried like
   // other infrastructure failures. Distinct from the pid-based process-loss retry
   // ("queues exactly one retry when the recorded local pid is dead"): here no pid was ever
-  // recorded (the process died before producing output), so the reaper falls through to the
+  // recorded and no output ever flowed, so the run classifies as the never-started
+  // loss (errorCode process_never_started) and the reaper falls through to the
   // accepted-interaction infra-retry path. Pre-P1 `process_lost` was not retry-eligible there.
   it("retries a plan-approval continuation lost as process_lost before agent start as an infrastructure failure", async () => {
     const { companyId, agentId, runId, wakeupRequestId, issueId } = await seedQueuedIssueRunFixture();
@@ -3479,7 +3635,11 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
 
     const failedRun = runs.find((row) => row.id === runId);
     const retryRun = runs.find((row) => row.id !== runId);
-    expect(failedRun).toMatchObject({ status: "failed", errorCode: "process_lost" });
+    // No pid, no output, no process start: the reaper classifies the loss
+    // as process_never_started, and the interaction-continuation classifier
+    // accepts it exactly like process_lost, so the dedicated infra retry
+    // (3 attempts, interaction context) still fires.
+    expect(failedRun).toMatchObject({ status: "failed", errorCode: "process_never_started" });
     expect(retryRun).toMatchObject({
       status: "scheduled_retry",
       retryOfRunId: runId,
@@ -3506,7 +3666,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(comments).toHaveLength(1);
     expect(comments[0]).toMatchObject({
       authorType: "system",
-      body: "Agent failed to resume after approval: `process_lost` — retrying (attempt 1/3)",
+      body: "Agent failed to resume after approval: `process_never_started` — retrying (attempt 1/3)",
     });
 
     const interaction = await db
@@ -3519,7 +3679,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       outcome: "accepted",
       resumeFailure: {
         status: "retrying",
-        errorCode: "process_lost",
+        errorCode: "process_never_started",
         attempt: 1,
         maxAttempts: 3,
         runId,

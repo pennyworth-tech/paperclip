@@ -3264,7 +3264,9 @@ function RunDetail({ run: initialRun, agentRouteId, adapterType, adapterConfig }
       queryClient.invalidateQueries({ queryKey: queryKeys.heartbeats(run.companyId, run.agentId) });
     },
   });
-  const canResumeLostRun = run.errorCode === "process_lost" && run.status === "failed";
+  const canResumeLostRun =
+    (run.errorCode === "process_lost" || run.errorCode === "process_never_started") &&
+    run.status === "failed";
   const resumePayload = useMemo(() => {
     const payload: Record<string, unknown> = {
       resumeFromRunId: run.id,

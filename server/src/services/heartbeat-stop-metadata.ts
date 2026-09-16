@@ -90,7 +90,13 @@ export function inferHeartbeatRunStopReason(input: {
   if (maxTurnStopReason) return maxTurnStopReason;
   if (input.outcome === "timed_out") return "timeout";
   if (input.outcome === "failed" && input.errorCode === "unmanaged_background_task_stopped") return "unmanaged_background_task_stopped";
-  if (input.outcome === "failed" && input.errorCode === "process_lost") return "process_lost";
+  // The coarse stop reason stays "process_lost": the UI and agent-facing
+  // reports label that category, and the precise cause lives in errorCode
+  // (process_never_started).
+  if (
+    input.outcome === "failed" &&
+    (input.errorCode === "process_lost" || input.errorCode === "process_never_started")
+  ) return "process_lost";
   if (input.outcome === "cancelled") {
     const message = (input.errorMessage ?? "").toLowerCase();
     if (message.includes("budget")) return "budget_paused";

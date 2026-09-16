@@ -470,6 +470,17 @@ export {
 } from "./recovery/service.js";
 export const ACTIVE_RUN_OUTPUT_PROGRESS_FLUSH_INTERVAL_MS = 60 * 1000;
 export const ACTIVE_RUN_LOG_RUNTIME_STATUS_REFRESH_INTERVAL_MS = 5 * 1000;
+// A claimed run that never recorded a process start and never produced output
+// has no legitimate liveness signal left, but every adapter that does not track
+// a local child process leaves processStartedAt null for its whole lifetime, so
+// the null column alone is not evidence. The arm fires only when
+// processStartedAt, processPid, processGroupId and lastOutputAt are ALL null
+// and the run has been claimed longer than any healthy dispatch-to-first-output
+// window: 15 minutes is 3x the periodic reap's 5-minute staleness floor and a
+// quarter of ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS, the silent-run
+// watchdog's suspicion bar, so a never-started run terminalizes before the
+// watchdog's first escalation instead of escalating forever.
+export const NEVER_STARTED_RUN_STARTUP_DEADLINE_MS = 15 * 60 * 1000;
 export const BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS = [
   2 * 60 * 1000,
   10 * 60 * 1000,
@@ -799,7 +810,14 @@ function isSandboxProviderWorkerUnavailableFailureMessage(value: unknown) {
 function isRetryableInteractionContinuationInfrastructureFailure(
   run: Pick<typeof heartbeatRuns.$inferSelect, "error" | "errorCode" | "resultJson">,
 ) {
-  if (run.errorCode === WORKSPACE_VALIDATION_FAILURE_CODE || run.errorCode === "process_lost") {
+  // process_never_started is the zero-output variant of a
+  // lost process: an accepted-interaction continuation whose run never started
+  // is exactly as infra-retryable as one whose process was lost mid-flight.
+  if (
+    run.errorCode === WORKSPACE_VALIDATION_FAILURE_CODE ||
+    run.errorCode === "process_lost" ||
+    run.errorCode === "process_never_started"
+  ) {
     return true;
   }
 
@@ -13845,7 +13863,26 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const reaped: string[] = [];
 
     for (const { run, adapterType, adapterConfig } of activeRuns) {
-      if (runningProcesses.has(run.id) || activeRunExecutions.has(run.id)) continue;
+      // A run past its startup deadline that never started a process and
+      // never produced output is terminalized even when the in-memory maps
+      // still hold it. A hung adapter execution wrapper keeps its
+      // activeRunExecutions entry forever while the remote execution it was
+      // dispatched to is already gone — the
+      // in-memory skip is exactly what let that run emit liveness and
+      // escalate indefinitely. Everything else keeps the skip: an execution
+      // this instance still holds is presumed live unless it has been
+      // claim-silent for the whole startup deadline.
+      const neverStartedPastStartupDeadline =
+        run.processStartedAt == null &&
+        run.processPid == null &&
+        run.processGroupId == null &&
+        run.lastOutputAt == null &&
+        run.startedAt != null &&
+        now.getTime() - new Date(run.startedAt).getTime() >= NEVER_STARTED_RUN_STARTUP_DEADLINE_MS;
+      if (
+        (runningProcesses.has(run.id) || activeRunExecutions.has(run.id)) &&
+        !neverStartedPastStartupDeadline
+      ) continue;
 
       // Apply staleness threshold to avoid false positives
       if (staleThresholdMs > 0) {
@@ -13916,12 +13953,23 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         readNonEmptyString(runContext.wakeReason) === "issue_monitor_due" &&
         Boolean(monitorNextCheckAt && monitorNextCheckAt.getTime() > now.getTime());
       const remoteExecutionLost = !tracksLocalChild && !monitorWakeCoveredByFutureCheck;
+      // No never-started arm here, deliberately. A pid-less run on an adapter
+      // with no local child already earns the retry via remoteExecutionLost
+      // above, and a local-child run whose accepted-interaction continuation
+      // never started is retried by the dedicated interaction-continuation
+      // infra path below (3 attempts, interaction context preserved) — a
+      // generic process-loss retry here would pre-empt it with a worse-shaped
+      // one. The never-started verdict itself is carried by lostErrorCode.
       const shouldRetry = (run.processLossRetryCount ?? 0) < 1 && (
         (tracksLocalChild && (!!run.processPid || !!run.processGroupId)) ||
         monitorDispatchLostWithoutFutureWake ||
         remoteExecutionLost
       );
-      const baseMessage = buildProcessLossMessage(run, descendantOnlyCleanup ? { descendantOnly: true } : undefined);
+      const neverStartedMessage = `Run never started -- no process metadata and no output within ${NEVER_STARTED_RUN_STARTUP_DEADLINE_MS / 60_000} minutes of claim`;
+      const baseMessage = neverStartedPastStartupDeadline
+        ? neverStartedMessage
+        : buildProcessLossMessage(run, descendantOnlyCleanup ? { descendantOnly: true } : undefined);
+      const lostErrorCode = neverStartedPastStartupDeadline ? "process_never_started" : "process_lost";
       const unmanagedBackgroundTaskEvidence = descendantOnlyCleanup
         ? {
           kind: "orphaned_process_group_cleanup",
@@ -13935,7 +13983,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
       let finalizedRun = await setRunStatus(run.id, "failed", {
         error: shouldRetry ? `${baseMessage}; retrying once` : baseMessage,
-        errorCode: "process_lost",
+        errorCode: lostErrorCode,
         finishedAt: now,
         resultJson: (() => {
           const result = mergeRunStopMetadataForAgent(
@@ -13943,7 +13991,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             "failed",
             {
               resultJson: parseObject(run.resultJson),
-              errorCode: "process_lost",
+              errorCode: lostErrorCode,
               errorMessage: shouldRetry ? `${baseMessage}; retrying once` : baseMessage,
             },
           );
@@ -14006,6 +14054,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       });
       await startNextQueuedRunForAgent(run.agentId);
       runningProcesses.delete(run.id);
+      // A never-started run is reaped precisely because a wrapper still holds
+      // it, so drop that entry too. Leaving it behind keeps liveRunExecutions
+      // reporting the run as live and makes waitForRunExecutionDrain time out
+      // on it forever.
+      activeRunExecutions.delete(run.id);
       reaped.push(run.id);
     }
 
