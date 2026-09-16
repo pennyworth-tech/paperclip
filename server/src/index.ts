@@ -101,6 +101,7 @@ import { getBoardClaimWarningUrl, initializeBoardClaimChallenge } from "./board-
 import { maybePersistWorktreeRuntimePorts } from "./worktree-config.js";
 import { initTelemetry, getTelemetryClient } from "./telemetry.js";
 import { conflict } from "./errors.js";
+import { invalidateDatabaseBackupHealthCache } from "./services/database-backup-health.js";
 import { ensureDecisionSigningSecret } from "./services/decision-signing.js";
 import { createDecisionRetentionNotifyOriginAgent, createDecisionWakeOriginAgent } from "./services/decision-wakeup.js";
 import {
@@ -793,6 +794,10 @@ export async function startServer(): Promise<StartedServer> {
       throw err;
     } finally {
       databaseBackupInFlight = false;
+      // This run changed what the health check would observe — a new backup
+      // file, pruned older ones, or a failure marker — so drop the cached
+      // observation instead of reporting the pre-run state until it expires.
+      invalidateDatabaseBackupHealthCache();
     }
   };
   // The process-owned aggregate byte ledger for the sandbox duplex channel. One
