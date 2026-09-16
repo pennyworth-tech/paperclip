@@ -32,6 +32,15 @@ export function AuthPage() {
     queryFn: () => authApi.getSession(),
     retry: false,
   });
+  // The instance decides which sign-in methods exist.
+  const { data: providers } = useQuery({
+    queryKey: ["auth", "providers"],
+    queryFn: () => authApi.getProviders(),
+    staleTime: Infinity,
+    retry: false,
+  });
+  const googleEnabled = providers?.google === true;
+  const emailPasswordEnabled = providers?.emailPassword !== false;
 
   useEffect(() => {
     if (session) {
@@ -96,11 +105,31 @@ export function AuthPage() {
             {mode === "sign_in" ? "Sign in to Paperclip" : "Create your Paperclip account"}
           </h1>
           <p className="mt-1 text-sm text-muted-foreground">
-            {mode === "sign_in"
-              ? "Use your email and password to access this instance."
-              : "Create an account for this instance. Email confirmation is not required in v1."}
+            {!emailPasswordEnabled
+              ? "Use your Google account to access this instance."
+              : mode === "sign_in"
+                ? "Use your email and password to access this instance."
+                : "Create an account for this instance. Email confirmation is not required in v1."}
           </p>
 
+          {googleEnabled && (
+            <Button
+              type="button"
+              variant="outline"
+              className="mt-6 w-full"
+              onClick={() => {
+                setError(null);
+                authApi.signInSocial("google", nextPath).catch((err) => {
+                  setError(err instanceof Error ? err.message : "Google sign-in failed");
+                });
+              }}
+            >
+              Sign in with Google
+            </Button>
+          )}
+
+          {emailPasswordEnabled && (
+          <>
           <form
             className="mt-6 space-y-4"
             method="post"
@@ -198,6 +227,8 @@ export function AuthPage() {
               {mode === "sign_in" ? "Create one" : "Sign in"}
             </button>
           </div>
+          </>
+          )}
         </div>
       </div>
 
