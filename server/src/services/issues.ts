@@ -1366,6 +1366,57 @@ export async function heartbeatRunIsTerminalOrMissing(
 }
 
 /**
+ * The status-carrying form of {@link heartbeatRunIsTerminalOrMissing}: reports
+ * *why* a run can hold no claim, not merely that it cannot, so a refusal can
+ * name the reason. `status` is null when the run row no longer exists.
+ */
+export async function readHeartbeatRunLiveness(
+  dbOrTx: Pick<Db, "select">,
+  runId: string,
+): Promise<{ live: boolean; status: string | null }> {
+  const run = await dbOrTx
+    .select({ status: heartbeatRuns.status })
+    .from(heartbeatRuns)
+    .where(eq(heartbeatRuns.id, runId))
+    .then((rows: Array<{ status: string }>) => rows[0] ?? null);
+  if (!run) return { live: false, status: null };
+  return { live: !TERMINAL_HEARTBEAT_RUN_STATUSES.has(run.status), status: run.status };
+}
+
+/**
+ * The same predicate as a SQL condition, for use inside a write's own WHERE
+ * clause. The read side — `clearCheckoutRunIfTerminal` and
+ * `adoptUnownedCheckoutRun` — treats a terminal-or-missing run as holding no
+ * claim, so a write path that does not carry this condition can commit a claim
+ * that the very next request is guaranteed to erase.
+ */
+function actorRunIsLiveCondition(runId: string): SQL {
+  return sql`exists (select 1 from ${heartbeatRuns} where ${heartbeatRuns.id} = ${runId} and ${notInArray(
+    heartbeatRuns.status,
+    Array.from(TERMINAL_HEARTBEAT_RUN_STATUSES),
+  )})`;
+}
+
+/**
+ * The structured half of a checkout/ownership refusal caused by the *caller's
+ * own* run being terminal or missing — the case whose bare null-ownership body
+ * is indistinguishable from a lost transaction. `code` is promoted to a
+ * top-level `code` by the error handler. The top-level message deliberately
+ * stays unchanged: `isCheckoutConflictError` in the heartbeat service matches
+ * it by string equality, and the harness auto-checkout rethrows anything that
+ * does not match, which would fail run start instead of degrading cleanly.
+ */
+function terminalActorRunRefusal(actorRunId: string, actorRunStatus: string | null) {
+  return {
+    code: "actor_run_terminal",
+    reason: actorRunStatus
+      ? `The acting heartbeat run ${actorRunId} is ${actorRunStatus}, which is terminal. A terminal run cannot hold an issue checkout or execution claim.`
+      : `The acting heartbeat run ${actorRunId} no longer exists. A missing run cannot hold an issue checkout or execution claim.`,
+    actorRunStatus: actorRunStatus ?? "missing",
+  };
+}
+
+/**
  * Returns whether a specific run's sync-back on a specific execution workspace
  * has settled — i.e. the accept/review gates that guard against a still-in-flight
  * worktree sync no longer need to block on this run.
@@ -8426,6 +8477,39 @@ export function issueService(db: Db) {
       await clearExecutionRunIfTerminal(id);
       await clearCheckoutRunIfTerminal(id);
 
+      // A claim naming a terminal or missing run is erased by the two sweeps
+      // directly above on the very next request, so persisting one hands the
+      // caller a 200 it can never observe and a follow-up 409 whose body shows
+      // nobody owning the issue. Refuse here — before any of the write paths
+      // below — and name the reason. Board checkouts pass a null run id and are
+      // unaffected; `queued` and `running` are not terminal, so the harness
+      // auto-checkout at run start is unaffected too.
+      const actorRunLiveness = checkoutRunId ? await readHeartbeatRunLiveness(db, checkoutRunId) : null;
+      if (checkoutRunId && actorRunLiveness && !actorRunLiveness.live) {
+        const refusedIssue = await db
+          .select({
+            id: issues.id,
+            status: issues.status,
+            assigneeAgentId: issues.assigneeAgentId,
+            checkoutRunId: issues.checkoutRunId,
+            executionRunId: issues.executionRunId,
+          })
+          .from(issues)
+          .where(eq(issues.id, id))
+          .then((rows) => rows[0] ?? null);
+        if (!refusedIssue) throw notFound("Issue not found");
+        throw conflict("Issue checkout conflict", {
+          issueId: refusedIssue.id,
+          status: refusedIssue.status,
+          assigneeAgentId: refusedIssue.assigneeAgentId,
+          checkoutRunId: refusedIssue.checkoutRunId,
+          executionRunId: refusedIssue.executionRunId,
+          actorAgentId: agentId,
+          actorRunId: checkoutRunId,
+          ...terminalActorRunRefusal(checkoutRunId, actorRunLiveness.status),
+        });
+      }
+
       const dependencyReadiness = await listIssueDependencyReadinessMap(db, issueCompany.companyId, [id]);
       const readiness = dependencyReadiness.get(id);
       const unresolvedBlockerIssueIds = readiness?.unresolvedBlockerIssueIds ?? [];
@@ -8468,6 +8552,9 @@ export function issueService(db: Db) {
             inArray(issues.status, expectedStatuses),
             or(isNull(issues.assigneeAgentId), sameRunAssigneeCondition),
             executionLockCondition,
+            // Carries the liveness gate in the write itself, so the invariant
+            // holds structurally rather than only because of the check above.
+            ...(checkoutRunId ? [actorRunIsLiveCondition(checkoutRunId)] : []),
           ),
         )
         .returning()
@@ -8499,25 +8586,23 @@ export function issueService(db: Db) {
         (current.executionRunId == null || current.executionRunId === checkoutRunId) &&
         checkoutRunId
       ) {
-        const adopted = await db
-          .update(issues)
-          .set({
-            checkoutRunId,
-            executionRunId: checkoutRunId,
-            updatedAt: new Date(),
-          })
-          .where(
-            and(
-              eq(issues.id, id),
-              eq(issues.status, "in_progress"),
-              eq(issues.assigneeAgentId, agentId),
-              isNull(issues.checkoutRunId),
-              or(isNull(issues.executionRunId), eq(issues.executionRunId, checkoutRunId)),
-            ),
-          )
-          .returning()
-          .then((rows) => rows[0] ?? null);
-        if (adopted) return adopted;
+        // Delegates rather than carrying a second copy of this adoption: the
+        // inline copy that used to live here differed from the helper only by
+        // omitting its actor-liveness gate and its `for update` row lock, which
+        // is exactly how a terminal run was handed a 200 on this branch. It
+        // also returned the raw row while every other branch returns a
+        // label-enriched one; re-reading here makes the shapes agree.
+        const adopted = await adoptUnownedCheckoutRun({
+          issueId: id,
+          actorAgentId: agentId,
+          actorRunId: checkoutRunId,
+        });
+        if (adopted) {
+          const row = await db.select().from(issues).where(eq(issues.id, id)).then((rows) => rows[0] ?? null);
+          if (!row) throw notFound("Issue not found");
+          const [enriched] = await withIssueLabels(db, [row]);
+          return enriched;
+        }
       }
 
       if (
@@ -8574,6 +8659,10 @@ export function issueService(db: Db) {
                 inArray(issues.status, expectedStatuses),
                 eq(issues.executionRunId, current.executionRunId),
                 or(isNull(issues.assigneeAgentId), eq(issues.assigneeAgentId, agentId)),
+                // Gates the incumbent (`stale`, above) *and* the actor: this
+                // branch stamps checkoutRunId/executionRunId with the caller's
+                // own run, so it is a claim-persisting write like the others.
+                actorRunIsLiveCondition(checkoutRunId),
               ),
             )
             .returning()
@@ -8597,12 +8686,20 @@ export function issueService(db: Db) {
         return enriched;
       }
 
+      // Re-read liveness rather than reusing the value from the top of the
+      // request: the actor's run can reach a terminal status between the two,
+      // in which case the write paths above declined it and the caller is owed
+      // that reason instead of a bare ownership snapshot.
+      const actorRunAtConflict = checkoutRunId ? await readHeartbeatRunLiveness(db, checkoutRunId) : null;
       throw conflict("Issue checkout conflict", {
         issueId: current.id,
         status: current.status,
         assigneeAgentId: current.assigneeAgentId,
         checkoutRunId: current.checkoutRunId,
         executionRunId: current.executionRunId,
+        ...(checkoutRunId && actorRunAtConflict && !actorRunAtConflict.live
+          ? terminalActorRunRefusal(checkoutRunId, actorRunAtConflict.status)
+          : {}),
       });
     },
 
@@ -8727,6 +8824,18 @@ export function issueService(db: Db) {
       if (!latest) throw notFound("Issue not found");
       const resolvedLatest = await resolveOwnership(latest);
       if (resolvedLatest.ownership) return resolvedLatest.ownership;
+
+      // Both refusals below can be reached with every ownership column null —
+      // the sweeps at the head of this function having just erased a claim held
+      // by a terminal run, and `adoptUnownedCheckoutRun` then declining to hand
+      // it to an equally terminal caller. That body reads like a lost
+      // transaction, so when the caller's own run is what disqualifies it, say
+      // so instead of only reporting who does not own the issue.
+      const actorRunLiveness = actorRunId ? await readHeartbeatRunLiveness(db, actorRunId) : null;
+      const terminalActorDetails = actorRunId && actorRunLiveness && !actorRunLiveness.live
+        ? terminalActorRunRefusal(actorRunId, actorRunLiveness.status)
+        : {};
+
       if (resolvedLatest.latest) {
         throw conflict("Issue run ownership conflict", {
           issueId: resolvedLatest.latest.id,
@@ -8736,6 +8845,7 @@ export function issueService(db: Db) {
           executionRunId: resolvedLatest.latest.executionRunId,
           actorAgentId,
           actorRunId,
+          ...terminalActorDetails,
         });
       }
 
@@ -8747,6 +8857,7 @@ export function issueService(db: Db) {
         executionRunId: latest.executionRunId,
         actorAgentId,
         actorRunId,
+        ...terminalActorDetails,
       });
     },
 
