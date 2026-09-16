@@ -17,6 +17,7 @@ import {
   DEFAULT_SANDBOX_REMOTE_CWD,
   resolveEnvironmentExecutionTarget,
 } from "../services/environment-execution-target.js";
+import { registerServerAdapter, unregisterServerAdapter } from "../adapters/registry.js";
 
 const A = SANDBOX_STARTUP_SPAN_ATTRS;
 
@@ -1406,5 +1407,120 @@ describe("resolveEnvironmentExecutionTarget", () => {
     // copies the stale flag.
     expect(execSpan!.parent).toBe(stepSpan);
     expect(execSpan!.attributes[A.execCriticalPath]).toBe(false);
+  });
+});
+
+describe("execution-target adapter capability gate", () => {
+  beforeEach(() => {
+    mockResolveEnvironmentDriverConfigForRuntime.mockReset();
+    for (const type of ["stub_declares_none", "stub_declares_ssh", "stub_declares_nothing"]) {
+      try {
+        unregisterServerAdapter(type);
+      } catch {
+        /* not registered */
+      }
+    }
+  });
+
+  const stubModule = (
+    type: string,
+    supportsRemoteExecutionTransports: ReadonlyArray<"ssh" | "sandbox"> | undefined,
+  ) => ({
+    type,
+    execute: async () => ({ exitCode: 0, signal: null, timedOut: false }),
+    testEnvironment: async () => ({ adapterType: type, status: "pass" as const, checks: [], testedAt: "" }),
+    ...(supportsRemoteExecutionTransports ? { supportsRemoteExecutionTransports } : {}),
+  });
+
+  const resolve = (adapterType: string, driver: string) =>
+    resolveEnvironmentExecutionTarget({
+      db: {} as never,
+      companyId: "company-1",
+      adapterType,
+      environment: { id: "env-1", driver, config: {} },
+      leaseMetadata: null,
+    });
+
+  it("fails a sandbox environment for an adapter that declares no remote transport", async () => {
+    registerServerAdapter(stubModule("stub_declares_none", []) as never);
+    // This used to resolve to null, which is indistinguishable from
+    // "no environment configured" — the adapter then ran on its own default
+    // host and the operator's isolation choice vanished silently.
+    await expect(resolve("stub_declares_none", "sandbox")).rejects.toThrow(/cannot run on a 'sandbox' environment/);
+  });
+
+  it("fails an ssh environment for an adapter that declares no remote transport", async () => {
+    registerServerAdapter(stubModule("stub_declares_none", []) as never);
+    await expect(resolve("stub_declares_none", "ssh")).rejects.toThrow(/cannot run on a 'ssh' environment/);
+  });
+
+  it("honours a declared transport and refuses the undeclared one", async () => {
+    registerServerAdapter(stubModule("stub_declares_ssh", ["ssh"]) as never);
+    mockResolveEnvironmentDriverConfigForRuntime.mockResolvedValue({
+      driver: "ssh",
+      config: {
+        host: "worker.example.com",
+        port: 22,
+        username: "runner",
+        remoteWorkspacePath: "/home/runner/ws",
+        privateKey: null,
+        knownHosts: null,
+        strictHostKeyChecking: true,
+      },
+    });
+    const target = await resolve("stub_declares_ssh", "ssh");
+    expect(target).toMatchObject({ kind: "remote", transport: "ssh" });
+
+    await expect(resolve("stub_declares_ssh", "sandbox")).rejects.toThrow(/cannot run on a 'sandbox' environment/);
+  });
+
+  it("keeps the historic null for an out-of-tree adapter that declares nothing", async () => {
+    registerServerAdapter(stubModule("stub_declares_nothing", undefined) as never);
+    // Absence of a declaration is UNKNOWN, not a refusal. The shared
+    // remote-managed set is a closed list of built-ins with no registration
+    // hook, so every out-of-tree adapter is outside it by construction, as are
+    // the gateway adapters that reach their own execution host and have no host
+    // workspace to place. Failing these runs would take them offline on any
+    // instance whose policy forces every agent onto a managed environment.
+    // The orchestrator records the unapplied placement instead.
+    for (const driver of ["sandbox", "ssh"]) {
+      await expect(resolve("stub_declares_nothing", driver), driver).resolves.toBeNull();
+    }
+    expect(mockResolveEnvironmentDriverConfigForRuntime).not.toHaveBeenCalled();
+  });
+
+  it("falls back to the shared remote-managed set for a built-in that declares nothing", async () => {
+    mockResolveEnvironmentDriverConfigForRuntime.mockResolvedValue({
+      driver: "ssh",
+      config: {
+        host: "h",
+        port: 22,
+        username: "u",
+        remoteWorkspacePath: "/w",
+        privateKey: null,
+        knownHosts: null,
+        strictHostKeyChecking: true,
+      },
+    });
+    for (const adapterType of ["codex_local", "grok_local", "kimi_local"]) {
+      await expect(resolve(adapterType, "ssh"), adapterType).resolves.toMatchObject({ transport: "ssh" });
+    }
+  });
+
+  it("still returns a local target for the local driver, for every adapter", async () => {
+    registerServerAdapter(stubModule("stub_declares_none", []) as never);
+    // The local driver is the default for every agent; gating it would brick
+    // every run rather than protect anything.
+    await expect(resolve("stub_declares_none", "local")).resolves.toMatchObject({ kind: "local" });
+  });
+
+  it("returns null (not a throw) for a driver that is not an execution target at all", async () => {
+    registerServerAdapter(stubModule("stub_declares_none", []) as never);
+    // `plugin` is a real driver this resolver does not build a target for, so
+    // the driver check has to run before the capability check; `kubernetes` is
+    // not a driver at all. Both must stay null rather than throwing.
+    for (const driver of ["plugin", "kubernetes"]) {
+      await expect(resolve("stub_declares_none", driver), driver).resolves.toBeNull();
+    }
   });
 });

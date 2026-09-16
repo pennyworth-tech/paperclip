@@ -377,6 +377,11 @@ const HEARTBEAT_MAX_CONCURRENT_RUNS_MAX = 50;
 const LIVENESS_BOOKKEEPING_ACTIVITY_ACTIONS = [
   "environment.lease_acquired",
   "environment.lease_released",
+  // Written by the orchestrator during run setup, on the same path and with the
+  // same runId as the lease rows above, and like them it records what the
+  // platform did rather than anything the agent produced. Counting it as
+  // evidence would let a run that produced nothing at all look productive.
+  "environment.placement_not_applied",
 ];
 const DEFERRED_WAKE_CONTEXT_KEY = "_paperclipWakeContext";
 const WAKE_COMMENT_IDS_KEY = "wakeCommentIds";

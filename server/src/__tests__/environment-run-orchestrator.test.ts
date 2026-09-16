@@ -11,10 +11,14 @@ const mockUpdateLeaseMetadata = vi.hoisted(() => vi.fn());
 const mockUpdateExecutionWorkspace = vi.hoisted(() => vi.fn());
 const mockLogActivity = vi.hoisted(() => vi.fn());
 const mockLoggerInfo = vi.hoisted(() => vi.fn());
+const mockLoggerWarn = vi.hoisted(() => vi.fn());
+const mockResolveEnvironmentExecutionTransport = vi.hoisted(() => vi.fn());
+const mockEnsureLocalEnvironment = vi.hoisted(() => vi.fn());
+const mockGetEnvironmentById = vi.hoisted(() => vi.fn());
 
 vi.mock("../services/environment-execution-target.js", () => ({
   resolveEnvironmentExecutionTarget: mockResolveEnvironmentExecutionTarget,
-  resolveEnvironmentExecutionTransport: vi.fn().mockResolvedValue(null),
+  resolveEnvironmentExecutionTransport: mockResolveEnvironmentExecutionTransport,
 }));
 
 vi.mock("@paperclipai/adapter-utils/execution-target", () => ({
@@ -27,8 +31,8 @@ vi.mock("../services/workspace-realization.js", () => ({
 
 vi.mock("../services/environments.js", () => ({
   environmentService: vi.fn(() => ({
-    ensureLocalEnvironment: vi.fn(),
-    getById: vi.fn(),
+    ensureLocalEnvironment: mockEnsureLocalEnvironment,
+    getById: mockGetEnvironmentById,
     acquireLease: vi.fn(),
     releaseLease: vi.fn(),
     updateLeaseMetadata: mockUpdateLeaseMetadata,
@@ -48,7 +52,7 @@ vi.mock("../services/activity-log.js", () => ({
 vi.mock("../middleware/logger.js", () => ({
   logger: {
     info: mockLoggerInfo,
-    warn: vi.fn(),
+    warn: mockLoggerWarn,
     error: vi.fn(),
     debug: vi.fn(),
   },
@@ -727,5 +731,139 @@ describe("environmentRunOrchestrator — realizeForRun", () => {
     );
 
     expect(mockResolveEnvironmentExecutionTarget).not.toHaveBeenCalled();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// acquireForRun
+//
+// `resolveEnvironmentExecutionTransport` returns `null` both when no
+// environment is configured and when the adapter has no remote transport to
+// honor the configured one. The second case leaves the run executing wherever
+// the adapter runs by default, so the operator's isolation choice is not
+// applied — and on the run path nothing used to say so. These cases pin that it
+// is recorded, and that it is recorded only for the drivers where a null is
+// actually a discarded placement.
+// ---------------------------------------------------------------------------
+
+describe("environmentRunOrchestrator — acquireForRun unhonored placement", () => {
+  const mockDb = {} as any;
+
+  function makeAcquireInput(overrides: { adapterType?: string; issueId?: string | null } = {}) {
+    return {
+      companyId: "company-1",
+      selectedEnvironmentId: "env-1",
+      localEnvironmentId: "env-local",
+      adapterType: overrides.adapterType ?? "gateway_stub",
+      issueId: overrides.issueId !== undefined ? overrides.issueId : "issue-1",
+      heartbeatRunId: "run-1",
+      agentId: "agent-1",
+      persistedExecutionWorkspace: null,
+      executionWorkspaceSettings: null,
+    };
+  }
+
+  function placementActivityCalls() {
+    return mockLogActivity.mock.calls.filter(
+      ([, input]) => (input as { action?: string })?.action === "environment.placement_not_applied",
+    );
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockLogActivity.mockResolvedValue(undefined);
+    mockResolveEnvironmentExecutionTransport.mockResolvedValue(null);
+  });
+
+  for (const driver of ["sandbox", "ssh"] as const) {
+    it(`records the unapplied placement when an adapter resolves no target for a ${driver} environment`, async () => {
+      const environment = makeEnvironment(driver);
+      mockGetEnvironmentById.mockResolvedValue(environment);
+      const lease = makeLease();
+      const runtime = makeMockRuntime({
+        acquireRunLease: vi.fn().mockResolvedValue({
+          environment,
+          lease,
+          leaseContext: { executionWorkspaceId: null },
+        }),
+      });
+
+      const result = await environmentRunOrchestrator(mockDb, {
+        environmentRuntime: runtime,
+      }).acquireForRun(makeAcquireInput());
+
+      // The run still proceeds: a null target is not a failure, it is an
+      // unapplied placement.
+      expect(result.executionTransport).toBeNull();
+      expect(result.environment).toBe(environment);
+      expect(result.lease).toBe(lease);
+
+      const calls = placementActivityCalls();
+      expect(calls).toHaveLength(1);
+      expect(calls[0]?.[1]).toMatchObject({
+        companyId: "company-1",
+        actorType: "agent",
+        actorId: "agent-1",
+        agentId: "agent-1",
+        runId: "run-1",
+        issueId: "issue-1",
+        entityType: "environment",
+        entityId: "env-1",
+        details: {
+          environmentId: "env-1",
+          driver,
+          adapterType: "gateway_stub",
+          reason: "adapter_declares_no_remote_transports",
+        },
+      });
+      expect(mockLoggerWarn).toHaveBeenCalledTimes(1);
+    });
+  }
+
+  it("stays silent when the adapter did resolve a transport for the environment", async () => {
+    const environment = makeEnvironment("sandbox");
+    mockGetEnvironmentById.mockResolvedValue(environment);
+    mockResolveEnvironmentExecutionTransport.mockResolvedValue({
+      kind: "sandbox",
+      environmentId: "env-1",
+    });
+    const runtime = makeMockRuntime({
+      acquireRunLease: vi.fn().mockResolvedValue({
+        environment,
+        lease: makeLease(),
+        leaseContext: { executionWorkspaceId: null },
+      }),
+    });
+
+    const result = await environmentRunOrchestrator(mockDb, {
+      environmentRuntime: runtime,
+    }).acquireForRun(makeAcquireInput({ adapterType: "codex_local" }));
+
+    expect(result.executionTransport).toEqual({ kind: "sandbox", environmentId: "env-1" });
+    expect(placementActivityCalls()).toHaveLength(0);
+    expect(mockLoggerWarn).not.toHaveBeenCalled();
+  });
+
+  it("stays silent for a local environment, where a null transport is the normal answer", async () => {
+    // `local` is every agent's default and this resolver builds no remote
+    // target for it, so a null here is not a discarded isolation choice and
+    // warning on it would fire on nearly every run.
+    const environment = makeEnvironment("local");
+    mockGetEnvironmentById.mockResolvedValue(environment);
+    const runtime = makeMockRuntime({
+      acquireRunLease: vi.fn().mockResolvedValue({
+        environment,
+        lease: makeLease(),
+        leaseContext: { executionWorkspaceId: null },
+      }),
+    });
+
+    const result = await environmentRunOrchestrator(mockDb, {
+      environmentRuntime: runtime,
+    }).acquireForRun(makeAcquireInput());
+
+    expect(result.executionTransport).toBeNull();
+    expect(placementActivityCalls()).toHaveLength(0);
+    expect(mockLoggerWarn).not.toHaveBeenCalled();
   });
 });

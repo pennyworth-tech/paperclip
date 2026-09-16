@@ -15,6 +15,7 @@ import {
   SANDBOX_STARTUP_SPAN_ATTRS,
 } from "@paperclipai/adapter-utils/acpx-engine/startup-timing";
 import { parseObject } from "../adapters/utils.js";
+import { getServerAdapter } from "../adapters/registry.js";
 import { getStartupTracer } from "../instrumentation.js";
 import { resolveEnvironmentDriverConfigForRuntime } from "./environment-config.js";
 import type { EnvironmentRuntimeService } from "./environment-runtime.js";
@@ -186,6 +187,79 @@ function setSandboxExecSpanFailure(
   span.setStatus({ code: SPAN_STATUS_CODE_ERROR });
 }
 
+/**
+ * Capability-driven execution targets.
+ *
+ * `adapterSupportsRemoteManagedEnvironments()` answers whether an adapter is
+ * *offered* a remote-managed environment. It is a closed set of built-in
+ * adapter types with no registration hook, so an out-of-tree adapter can never
+ * join it and an adapter outside it resolves to `null` for a `sandbox` or `ssh`
+ * environment.
+ *
+ * Sitting outside that set is NOT a statement that the adapter cannot honor a
+ * remote transport. Adapters are outside it for opposite reasons: `process`
+ * executes on the host, while `http`, `cursor_cloud`, `hermes_gateway` and
+ * `openclaw_gateway` reach their own execution host and have no host workspace
+ * to place at all — and every out-of-tree adapter is outside it by
+ * construction. Reading absence as refusal would fail runs for adapters that
+ * never wanted an execution target, which is why an undeclared adapter keeps
+ * the historic `null` here.
+ *
+ * An adapter module may now DECLARE the remote transports it can honor. A
+ * declaration is a hard gate: an environment whose driver it does not list
+ * fails the run instead of quietly resolving to nothing. Declaring nothing
+ * means "unknown", and the caller reports the unhonored placement rather than
+ * failing a run it cannot prove is misplaced.
+ */
+export class UnsupportedExecutionTargetError extends Error {
+  constructor(
+    readonly adapterType: string,
+    readonly driver: string,
+  ) {
+    super(
+      `Adapter '${adapterType}' cannot run on a '${driver}' environment. ` +
+        `Move this agent to an environment whose driver it supports, or declare ` +
+        `'${driver}' in the adapter's supportsRemoteExecutionTransports.`,
+    );
+    this.name = "UnsupportedExecutionTargetError";
+  }
+}
+
+/**
+ * The remote transports this adapter is known to honor, or `null` when nothing
+ * is known about it. `null` is the third value that keeps "undeclared" from
+ * collapsing into "refused"; see the note on `UnsupportedExecutionTargetError`.
+ */
+function knownRemoteTransports(adapterType: string): ReadonlySet<"ssh" | "sandbox"> | null {
+  // getServerAdapter falls back to the generic process adapter for unknown
+  // types, so only trust a declaration that came from the type we asked for.
+  const module = getServerAdapter(adapterType);
+  const declared = module.type === adapterType ? module.supportsRemoteExecutionTransports : undefined;
+  // An explicit `[]` is a declaration too: it refuses every remote transport.
+  if (declared) return new Set(declared);
+  // No declaration: the shared capability metadata answers for the adapters it
+  // covers, and says nothing about the ones it does not.
+  return adapterSupportsRemoteManagedEnvironments(adapterType)
+    ? new Set<"ssh" | "sandbox">(["ssh", "sandbox"])
+    : null;
+}
+
+/**
+ * Whether the resolver may build `transport` for this adapter.
+ *
+ * Throws when the adapter has declared its transports and this one is not among
+ * them — the operator configured a placement the adapter has stated it cannot
+ * honor, and running anyway would discard the isolation choice silently.
+ * Returns `false` when nothing is declared, which keeps the historic `null`
+ * target: the caller records the unhonored placement instead.
+ */
+function canBuildRemoteTransport(adapterType: string, transport: "ssh" | "sandbox"): boolean {
+  const known = knownRemoteTransports(adapterType);
+  if (!known) return false;
+  if (known.has(transport)) return true;
+  throw new UnsupportedExecutionTargetError(adapterType, transport);
+}
+
 export async function resolveEnvironmentExecutionTarget(input: {
   db: Db;
   companyId: string;
@@ -225,7 +299,7 @@ export async function resolveEnvironmentExecutionTarget(input: {
     // Keep this gate in lockstep with the shared capability metadata that the
     // environment selector and capabilities API expose; a drift here lets the
     // UI offer environments the runtime then refuses.
-    if (!adapterSupportsRemoteManagedEnvironments(input.adapterType)) {
+    if (!canBuildRemoteTransport(input.adapterType, "sandbox")) {
       return null;
     }
 
@@ -573,10 +647,12 @@ export async function resolveEnvironmentExecutionTarget(input: {
     };
   }
 
-  if (
-    !adapterSupportsRemoteManagedEnvironments(input.adapterType) ||
-    input.environment.driver !== "ssh"
-  ) {
+  // Any other driver is not an execution target at all (`local` and `sandbox`
+  // returned above; `plugin` has no target today), so it keeps the historic null.
+  if (input.environment.driver !== "ssh") {
+    return null;
+  }
+  if (!canBuildRemoteTransport(input.adapterType, "ssh")) {
     return null;
   }
 

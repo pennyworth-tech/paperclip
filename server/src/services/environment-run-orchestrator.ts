@@ -328,6 +328,48 @@ export function environmentRunOrchestrator(
       leaseMetadata: leaseRecord.lease.metadata,
     });
 
+    // Step 5: Record a placement the adapter did not take.
+    //
+    // A `null` transport for `ssh`/`sandbox` means the adapter declared no
+    // remote transports and is outside the shared remote-managed set, so the
+    // run proceeds wherever that adapter runs by default. That is the historic
+    // behaviour and it stays — an adapter that reaches its own execution host
+    // has no host workspace to place, and instance policy can force every agent
+    // onto a managed environment without consulting the adapter. What was
+    // missing is any trace of it: `null` is also what "no environment
+    // configured" resolves to, so an operator's isolation choice was discarded
+    // with nothing written anywhere on the run path. Say so, on the run.
+    if (!executionTransport && (environment.driver === "ssh" || environment.driver === "sandbox")) {
+      logger.warn(
+        {
+          runId: input.heartbeatRunId,
+          agentId: input.agentId,
+          companyId: input.companyId,
+          adapterType: input.adapterType,
+          environmentId: environment.id,
+          driver: environment.driver,
+        },
+        "Adapter resolved no execution target for a remote environment; the run proceeds on the adapter's own execution host and this environment's isolation is not applied",
+      );
+      await logActivity(db, {
+        companyId: input.companyId,
+        actorType: "agent",
+        actorId: input.agentId,
+        agentId: input.agentId,
+        runId: input.heartbeatRunId,
+        action: "environment.placement_not_applied",
+        entityType: "environment",
+        entityId: environment.id,
+        issueId: input.issueId,
+        details: {
+          environmentId: environment.id,
+          driver: environment.driver,
+          adapterType: input.adapterType,
+          reason: "adapter_declares_no_remote_transports",
+        },
+      });
+    }
+
     return {
       environment,
       lease: leaseRecord.lease,

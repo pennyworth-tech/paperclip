@@ -509,6 +509,28 @@ export interface ServerAdapterModule {
    * API-key-only vendor) omits it. The capability data holds no secret.
    */
   loginCapability?: import("./login-capability.js").AdapterLoginCapability;
+
+  /**
+   * Optional: declare the remote execution transports this adapter can honor.
+   *
+   * Declaring the field opts the adapter into a hard gate: an environment whose
+   * driver is not listed FAILS the run instead of silently resolving to no
+   * execution target — a null target is indistinguishable from "no environment
+   * configured", so the operator's isolation choice would be discarded without
+   * a word. `[]` therefore means "no Paperclip environment may place this
+   * adapter, and configuring one is worth failing the run over".
+   *
+   * OMIT the field unless you mean that. Omitting keeps the historic
+   * behaviour: the shared remote-managed capability metadata
+   * (`adapterSupportsRemoteManagedEnvironments`) still answers for the built-in
+   * adapters it covers, and an adapter outside it resolves no execution target
+   * and runs where it always ran, with the unapplied placement recorded on the
+   * run. Omitting is the right choice for an adapter that reaches its own
+   * execution host anyway (a gateway or hosted-agent adapter): it has no host
+   * workspace to isolate, and an instance whose policy forces every agent onto
+   * a managed environment would otherwise take it offline for nothing.
+   */
+  supportsRemoteExecutionTransports?: ReadonlyArray<"ssh" | "sandbox">;
 }
 
 // ---------------------------------------------------------------------------
