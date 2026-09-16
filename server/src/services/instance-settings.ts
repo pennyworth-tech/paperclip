@@ -32,7 +32,7 @@ import {
   applyOperatorGeneralDefaults,
   stripOperatorGeneralEchoes,
 } from "@paperclipai/shared";
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import { getManagedInstanceConfig, type ManagedInstanceConfig } from "./managed-config.js";
 import { getOperatorSettingDefaults } from "./setting-defaults.js";
 
@@ -83,6 +83,8 @@ function stripServerManagedExperimentalPatchFields(
   const {
     worktreeRunExecutionActivatedAt: _ignoredActivatedAt,
     worktreeRunExecutionActivationInstanceId: _ignoredActivationInstanceId,
+    operatorDrainActive: _ignoredDrainActive,
+    operatorDrainStartedAt: _ignoredDrainStartedAt,
     ...patchable
   } = patch as Record<string, unknown>;
   return patchable as PatchInstanceExperimentalSettings;
@@ -263,6 +265,8 @@ export function normalizeExperimentalSettings(raw: unknown): InstanceExperimenta
       worktreeRunExecutionActivatedAt: parsed.data.worktreeRunExecutionActivatedAt ?? null,
       worktreeRunExecutionActivationInstanceId:
         parsed.data.worktreeRunExecutionActivationInstanceId ?? null,
+      operatorDrainActive: parsed.data.operatorDrainActive ?? false,
+      operatorDrainStartedAt: parsed.data.operatorDrainStartedAt ?? null,
     };
   }
   return {
@@ -303,6 +307,8 @@ export function normalizeExperimentalSettings(raw: unknown): InstanceExperimenta
     enableWorktreeRunExecution: false,
     worktreeRunExecutionActivatedAt: null,
     worktreeRunExecutionActivationInstanceId: null,
+    operatorDrainActive: false,
+    operatorDrainStartedAt: null,
   };
 }
 
@@ -549,25 +555,29 @@ export function instanceSettingsService(db: Db, options: InstanceSettingsService
     },
 
     updateExperimental: async (patch: PatchInstanceExperimentalSettings): Promise<InstanceSettings> => {
-      const current = await getOrCreateRow();
-      // Guarded Cloud flags stay absent from the row unless chosen, so the
-      // read-time catalog default keeps applying (see stripCloudCatalogDefaultEchoes).
-      const nextExperimental = stripCloudCatalogDefaultEchoes(
-        current.experimental,
-        patch,
-        applyExperimentalSettingsPatch(current.experimental, patch, options),
-        managedConfig,
-      );
-      const now = new Date();
-      const [updated] = await db
-        .update(instanceSettings)
-        .set({
-          experimental: { ...nextExperimental },
-          updatedAt: now,
-        })
-        .where(eq(instanceSettings.id, current.id))
-        .returning();
-      return toInstanceSettings(updated ?? current);
+      return db.transaction(async (tx) => {
+        const row = await getOrCreateRow(tx);
+        const [current] = await tx.select().from(instanceSettings)
+          .where(eq(instanceSettings.id, row.id)).for("update");
+        // Guarded Cloud flags stay absent from the row unless chosen, so the
+        // read-time catalog default keeps applying (see stripCloudCatalogDefaultEchoes).
+        const nextExperimental = stripCloudCatalogDefaultEchoes(
+          current.experimental,
+          patch,
+          applyExperimentalSettingsPatch(current.experimental, patch, options),
+          managedConfig,
+        );
+        const now = new Date();
+        const [updated] = await tx
+          .update(instanceSettings)
+          .set({
+            experimental: { ...nextExperimental },
+            updatedAt: now,
+          })
+          .where(eq(instanceSettings.id, current.id))
+          .returning();
+        return toInstanceSettings(updated ?? current);
+      });
     },
 
     listCompanyIds: async (): Promise<string[]> =>
@@ -575,5 +585,42 @@ export function instanceSettingsService(db: Db, options: InstanceSettingsService
         .select({ id: companies.id })
         .from(companies)
         .then((rows) => rows.map((row) => row.id)),
+
+    // Operator drain. Stored inside the experimental jsonb but never
+    // client-patchable (stripServerManagedExperimentalPatchFields drops it); the
+    // dedicated routes below are the only writers. Read through the plain
+    // normalizer, not toExperimentalView: a cloud managed-config overlay must
+    // never mask or force an operational drain state.
+    getOperatorDrain: async (): Promise<{ active: boolean; startedAt: string | null }> => {
+      const row = await getOrCreateRow();
+      const experimental = normalizeExperimentalSettings(row.experimental);
+      return {
+        active: experimental.operatorDrainActive === true,
+        startedAt: experimental.operatorDrainStartedAt ?? null,
+      };
+    },
+
+    setOperatorDrain: async (active: boolean): Promise<{ active: boolean; startedAt: string | null }> => {
+      const current = await getOrCreateRow();
+      const now = (options.now ?? (() => new Date()))();
+      const drain = active
+        ? { operatorDrainActive: true, operatorDrainStartedAt: now.toISOString() }
+        : { operatorDrainActive: false, operatorDrainStartedAt: null };
+      const [updated] = await db
+        .update(instanceSettings)
+        .set({
+          // Merge only operational keys in SQL under the update's row lock.
+          // Do not materialize defaults or overwrite concurrent feature edits.
+          experimental: sql`coalesce(${instanceSettings.experimental}, '{}'::jsonb) || ${JSON.stringify(drain)}::jsonb`,
+          updatedAt: now,
+        })
+        .where(eq(instanceSettings.id, current.id))
+        .returning();
+      const persisted = normalizeExperimentalSettings((updated ?? current).experimental);
+      return {
+        active: persisted.operatorDrainActive === true,
+        startedAt: persisted.operatorDrainStartedAt ?? null,
+      };
+    },
   };
 }

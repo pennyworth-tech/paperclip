@@ -85,6 +85,8 @@ export const instanceExperimentalSettingsSchema = z.object({
   enableWorktreeRunExecution: z.boolean().default(false),
   worktreeRunExecutionActivatedAt: z.string().datetime().nullable().default(null),
   worktreeRunExecutionActivationInstanceId: z.string().min(1).nullable().default(null),
+  operatorDrainActive: z.boolean().default(false),
+  operatorDrainStartedAt: z.string().datetime().nullable().default(null),
 }).strict();
 
 export const patchInstanceExperimentalSettingsSchema = z
@@ -94,6 +96,8 @@ export const patchInstanceExperimentalSettingsSchema = z
         .omit({
           worktreeRunExecutionActivatedAt: true,
           worktreeRunExecutionActivationInstanceId: true,
+          operatorDrainActive: true,
+          operatorDrainStartedAt: true,
         })
         .shape,
     ),
@@ -134,7 +138,11 @@ export type InstanceExperimentalSettings = z.infer<typeof instanceExperimentalSe
 export type PatchInstanceExperimentalSettings = Partial<
   Omit<
     InstanceExperimentalSettings,
-    "worktreeRunExecutionActivatedAt" | "worktreeRunExecutionActivationInstanceId"
+    | "worktreeRunExecutionActivatedAt"
+    | "worktreeRunExecutionActivationInstanceId"
+    // Server-managed operator drain state; the drain routes are the only writers.
+    | "operatorDrainActive"
+    | "operatorDrainStartedAt"
   >
 >;
 export type PatchInstanceSettings = z.infer<typeof patchInstanceSettingsSchema>;

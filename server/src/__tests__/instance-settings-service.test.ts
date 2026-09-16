@@ -70,6 +70,8 @@ describe("instance settings service", () => {
       enableWorktreeRunExecution: false,
       worktreeRunExecutionActivatedAt: null,
       worktreeRunExecutionActivationInstanceId: null,
+      operatorDrainActive: false,
+      operatorDrainStartedAt: null,
     });
   });
 

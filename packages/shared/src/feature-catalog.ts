@@ -27,9 +27,16 @@ type ExperimentalSettings = z.infer<typeof instanceExperimentalSettingsSchema>;
  * The boolean flag keys of the experimental settings schema. Non-flag keys
  * (activation timestamps, numeric tuning values) are excluded.
  */
-export type InstanceFeatureKey = {
-  [K in keyof ExperimentalSettings]: ExperimentalSettings[K] extends boolean ? K : never;
-}[keyof ExperimentalSettings];
+export type InstanceFeatureKey = Exclude<
+  {
+    [K in keyof ExperimentalSettings]: ExperimentalSettings[K] extends boolean ? K : never;
+  }[keyof ExperimentalSettings],
+  // Server-managed operator state, not a configurable feature: the
+  // drain flag is written only by the instance drain routes, so it is carved
+  // out of the feature catalog exactly as it is carved out of the
+  // cloud-managed overlay keys.
+  "operatorDrainActive"
+>;
 
 export interface FeatureCatalogEntry {
   title: string;

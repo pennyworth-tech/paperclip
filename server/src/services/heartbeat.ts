@@ -9357,7 +9357,7 @@ export function resolveHeartbeatSchedulingSuppression(
 ): {
   suppressed: boolean;
   reason:
-    "worktree_instance" | "database_restore_in_progress" | "task_drain" | null;
+    "worktree_instance" | "database_restore_in_progress" | "task_drain" | "operator_drain" | null;
 } {
   if (
     isTruthyRuntimeEnvValue(env.PAPERCLIP_IN_WORKTREE) &&
@@ -9434,11 +9434,34 @@ export function heartbeatService(
     }
     return cachedWorktreeRunExecutionOverride;
   };
+  // Database drain coordinates all controllers. Before a successful read,
+  // suppress scheduling rather than assume a booting controller may run work.
+  // Later read failures retain the last observed value; successful reads use
+  // a short cache so every controller observes changes within three seconds.
+  const OPERATOR_DRAIN_CACHE_TTL_MS = 3_000;
+  let cachedOperatorDrain: { active: boolean; at: number } = { active: true, at: 0 };
+  const resolveOperatorDrainActive = async () => {
+    const now = Date.now();
+    if (now - cachedOperatorDrain.at < OPERATOR_DRAIN_CACHE_TTL_MS) {
+      return cachedOperatorDrain.active;
+    }
+    try {
+      const drain = await instanceSettings.getOperatorDrain();
+      cachedOperatorDrain = { active: drain.active, at: now };
+    } catch {
+      // Keep the prior value; see the comment above.
+    }
+    return cachedOperatorDrain.active;
+  };
   const getSchedulingSuppression = async () => {
-    const override = await resolveWorktreeRunExecutionOverride();
-    return resolveHeartbeatSchedulingSuppression(runtimeEnv, {
-      allowWorktreeRunExecution: override.allowed,
+    const envSuppression = resolveHeartbeatSchedulingSuppression(runtimeEnv, {
+      allowWorktreeRunExecution: (await resolveWorktreeRunExecutionOverride()).allowed,
     });
+    if (envSuppression.suppressed) return envSuppression;
+    if (await resolveOperatorDrainActive()) {
+      return { suppressed: true, reason: "operator_drain" as const };
+    }
+    return envSuppression;
   };
   const getWorktreeExecutionCutoff = async () => {
     const override = await resolveWorktreeRunExecutionOverride();
@@ -18598,6 +18621,7 @@ export function heartbeatService(
   }
 
   async function reapOrphanedRuns(opts?: { staleThresholdMs?: number }) {
+    if (await resolveOperatorDrainActive()) return { reaped: 0, runIds: [] };
     const staleThresholdMs = opts?.staleThresholdMs ?? 0;
     const now = new Date();
 
@@ -29166,6 +29190,20 @@ export function heartbeatService(
     getTaskDrainStatus,
     computeTaskDrain,
     applyTaskDrain,
+
+    // Instance-wide live-run counts for the operator drain surface.
+    getOperatorDrainSnapshot: async () => {
+      const counts = await db
+        .select({ status: heartbeatRuns.status, count: sql<number>`count(*)` })
+        .from(heartbeatRuns)
+        .where(inArray(heartbeatRuns.status, ["running", "queued"]))
+        .groupBy(heartbeatRuns.status);
+      const byStatus = new Map(counts.map((row) => [row.status, Number(row.count)]));
+      return {
+        runningCount: byStatus.get("running") ?? 0,
+        queuedCount: byStatus.get("queued") ?? 0,
+      };
+    },
 
     promoteDueScheduledRetries,
     retryScheduledRetryNow,
