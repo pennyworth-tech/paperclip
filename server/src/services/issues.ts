@@ -809,6 +809,191 @@ function executionHolderIsReleasable(
   if (TERMINAL_HEARTBEAT_RUN_STATUSES.has(run.status)) return true;
   return isStaleByDesignExecutionHolder(run, assigneeAgentId);
 }
+
+// The shape isStaleByDesignExecutionHolder cannot reach: a run that *did*
+// start. A `running` heartbeat run can die without ever writing a terminal
+// status — a worker restart, or a hung adapter call. Nothing clears the
+// `executionRunId` it leaves behind, so it fences the issue's own assignee out
+// of every write behind assertCheckoutOwner, with no self-service escape.
+//
+// This gate deliberately applies to `running` ONLY. Elapsed age is not a death
+// signal in either direction and no wall-clock rule keyed on `createdAt` is
+// admissible here:
+//
+//   - A `queued` run is pending, not dead, however old it is. Upstream says so
+//     itself in reapOrphanedRuns: "queued runs are legitimately waiting;
+//     resumeQueuedRuns handles them". Dispatch selects on
+//     `heartbeatRuns.status = 'queued'` alone, in both resumeQueuedRuns and
+//     startNextQueuedRunForAgent, so
+//     a queued run remains selectable at any age; measured in the field, one
+//     sat 59m37s and started normally. Where a queued run holds a lock
+//     indefinitely the cause is *selection* — every cancellation path lives
+//     inside claimQueuedRun, i.e. post-selection — which is a scheduler defect
+//     to fix at the comparator, not a corpse to sweep. Sweeping this shape
+//     deletes assigned work and reports success. The queued run that is
+//     genuinely incapable of owning the lock is the never-started foreign
+//     holder, and isStaleByDesignExecutionHolder above releases it on an exact
+//     signal rather than on the clock.
+//   - A `scheduled_retry` run is live dispatch intent by construction.
+//
+// So the status check below is structural, not an optimisation: for any status
+// other than `running` we return before reaching the time comparison at all.
+//
+// For a `running` run the window is measured off worker-progress signals only
+// — never `createdAt`. claimQueuedRun writes `startedAt: run.startedAt ??
+// claimedAt`, so a running run always carries at least one; if it somehow
+// carries none we spare it rather than guess.
+//
+// Why this is still needed given reapOrphanedRuns: that sweeper skips any run
+// still present in the in-memory `runningProcesses` / `activeRunExecutions`
+// maps, and falls back to pid liveness only for adapters where
+// `isTrackedLocalChildProcessAdapter` holds. A remote-adapter run
+// whose call hangs keeps its map entry, has no local pid, and is therefore
+// never reaped — holding the lock indefinitely. This gate is demand-driven:
+// it fires on one run, under the caller's FOR UPDATE, only when that run's
+// lock is actually blocking a write.
+//
+// Window: 2x ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS (60m), the point at
+// which the neighbouring scanSilentActiveRuns watchdog calls a silent run
+// merely *suspicious* and files an evaluation issue. This verdict is
+// destructive, so it acts at double that threshold, and well past the ~60m
+// lifetime of the run credential a live run would need to write anything.
+export const STALE_RUN_LOCK_AGE_OUT_MS = 2 * 60 * 60 * 1000;
+export const STALE_RUN_LOCK_AGE_OUT_ERROR_CODE = "stale_execution_lock_aged_out";
+
+type DbTransaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
+
+type RunLivenessRow = {
+  id: string;
+  agentId: string;
+  status: string;
+  startedAt: Date | null;
+  processStartedAt: Date | null;
+  lastOutputAt: Date | null;
+  lastUsefulActionAt: Date | null;
+};
+
+const RUN_LIVENESS_COLUMNS = {
+  id: heartbeatRuns.id,
+  agentId: heartbeatRuns.agentId,
+  status: heartbeatRuns.status,
+  startedAt: heartbeatRuns.startedAt,
+  processStartedAt: heartbeatRuns.processStartedAt,
+  lastOutputAt: heartbeatRuns.lastOutputAt,
+  lastUsefulActionAt: heartbeatRuns.lastUsefulActionAt,
+} as const;
+
+/**
+ * The most recent evidence the *worker* made progress, or null if the run
+ * carries none. `createdAt` is deliberately absent: it records when the run was
+ * enqueued, not anything the worker did, and keying on it is the wall-clock
+ * rule this gate exists to avoid.
+ */
+function latestRunProgressAt(run: RunLivenessRow): Date | null {
+  let latest: Date | null = null;
+  for (const signal of [run.lastOutputAt, run.lastUsefulActionAt, run.processStartedAt, run.startedAt]) {
+    if (signal && (!latest || signal > latest)) latest = signal;
+  }
+  return latest;
+}
+
+/**
+ * Decides whether a run holding an issue lock may be treated as finished, and
+ * gives a demonstrably dead non-terminal run a terminal verdict so that every
+ * status-only consumer of TERMINAL_HEARTBEAT_RUN_STATUSES self-heals at once.
+ *
+ * What makes the verdict safe is the *bypass*, not the status it writes. The
+ * run row is updated directly here via tx.update(heartbeatRuns), so this never
+ * enters heartbeat.ts's run finalizer: issueNeedsImmediateRecovery is evaluated
+ * only inside releaseIssueExecutionAndPromote, and nothing on this path calls
+ * it. No terminal status written from here reaches that predicate at all.
+ *
+ * Routing this verdict through heartbeat.ts's setRunStatus would NOT be safe,
+ * and picking `cancelled` would not rescue it: issueNeedsImmediateRecovery
+ * groups `cancelled` WITH `failed` and `timed_out`, so a caller that finalised
+ * the run the ordinary way would enqueue a recovery run, which re-stamps
+ * executionRunId in its insert transaction and re-fences the issue — the fix
+ * undoing itself. Treat that as a constraint on future refactors, not an
+ * invitation to reuse the shared helper.
+ *
+ * `cancelled` is chosen because it is the status heartbeat.ts already writes
+ * when it retires a run it will not continue (cancelQueuedRunForStaleIssue),
+ * not because the status carries any protection of its own.
+ *
+ * The recovery sweep's own pre-pass, terminalizeOrphanedRunningRun, covers two
+ * adjacent shapes but not this one: a run whose issue already reached a
+ * terminal status, and a run whose recorded process is gone. The first
+ * authority is explicitly suppressed while a non-terminal issue still
+ * references the run (runReferencedByActiveIssue), which is exactly the case
+ * here; the second requires `processPid` / `processGroupId`, which
+ * persistRunProcessMetadata writes only for local child-process adapters. A
+ * remote or gateway adapter run that hangs on a live issue records no pid and
+ * is therefore still never terminalized.
+ *
+ * MUST be called with the run row already locked FOR UPDATE by the caller's
+ * transaction; the final UPDATE is guarded on the observed status anyway, so a
+ * run that moves underneath us aborts the verdict rather than racing it.
+ */
+async function resolveRunLockFinished(tx: DbTransaction, run: RunLivenessRow, now: Date): Promise<boolean> {
+  if (TERMINAL_HEARTBEAT_RUN_STATUSES.has(run.status)) return true;
+
+  // Structural: only a `running` run can be dead-but-non-terminal. `queued` and
+  // `scheduled_retry` are pending dispatch at any age and must never reach the
+  // time comparison below. See the note on STALE_RUN_LOCK_AGE_OUT_MS.
+  if (run.status !== "running") return false;
+
+  // No worker-progress evidence at all — cannot prove death, so leave it alone.
+  // Deliberate fail-safe, and unreachable through every writer that exists
+  // today: no insert(heartbeatRuns) creates a `running` row, and both writes
+  // that set status = 'running' either persist a startedAt or act on a row that
+  // is already running — either way latestRunProgressAt sees a signal. Keep it
+  // for a future writer that does neither; it fails toward sparing the run, so
+  // it is cheap. Do not retire it as dead code.
+  const progressAt = latestRunProgressAt(run);
+  if (!progressAt) return false;
+
+  // Time since the worker last made progress; never time since enqueue.
+  if (progressAt > new Date(now.getTime() - STALE_RUN_LOCK_AGE_OUT_MS)) return false;
+
+  const verdict = await tx
+    .update(heartbeatRuns)
+    .set({
+      status: "cancelled",
+      finishedAt: now,
+      error: "Cancelled: run held an issue execution lock while running and showed no worker progress inside the stale-lock window",
+      errorCode: STALE_RUN_LOCK_AGE_OUT_ERROR_CODE,
+      // livenessState is deliberately left null. Its domain is
+      // RUN_LIVENESS_STATES — a classification of what a run's OUTPUT achieved
+      // ("completed", "advanced", "plan_only", …) — and "dead" is not a member
+      // of it, so writing that here puts an out-of-domain value in the column.
+      // This path also has no output to classify, and stamping any value would
+      // pre-empt the `isNull(livenessState)` backfill in activity.ts that is
+      // what classifies a run later. errorCode already carries the reason.
+      updatedAt: now,
+    })
+    .where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.status, run.status)))
+    .returning({ id: heartbeatRuns.id })
+    .then((rows) => rows[0] ?? null);
+
+  return Boolean(verdict);
+}
+
+/**
+ * The execution-lock holder gate, in one place: the sync verdict first — a
+ * missing run, a terminal run, or a never-started foreign holder — and only
+ * then the age-out, which is the one branch that can write. Ordering matters:
+ * a holder releasable on an exact signal must never take the destructive path.
+ */
+async function resolveExecutionHolderFinished(
+  tx: DbTransaction,
+  run: RunLivenessRow | null,
+  assigneeAgentId: string | null,
+  now: Date,
+): Promise<boolean> {
+  if (executionHolderIsReleasable(run, assigneeAgentId)) return true;
+  return run ? resolveRunLockFinished(tx, run, now) : true;
+}
+
 const ISSUE_LIST_DESCRIPTION_MAX_CHARS = 1200;
 const ISSUE_LIST_DESCRIPTION_MAX_BYTES = ISSUE_LIST_DESCRIPTION_MAX_CHARS * 4;
 
@@ -5396,15 +5581,12 @@ export function issueService(db: Db) {
         sql`select ${heartbeatRuns.id} from ${heartbeatRuns} where ${heartbeatRuns.id} = ${issue.executionRunId} for update`,
       );
       const run = await tx
-        .select({
-          agentId: heartbeatRuns.agentId,
-          status: heartbeatRuns.status,
-          startedAt: heartbeatRuns.startedAt,
-        })
+        .select(RUN_LIVENESS_COLUMNS)
         .from(heartbeatRuns)
         .where(eq(heartbeatRuns.id, issue.executionRunId))
         .then((rows) => rows[0] ?? null);
-      if (!executionHolderIsReleasable(run, issue.assigneeAgentId)) return false;
+      const now = new Date();
+      if (!(await resolveExecutionHolderFinished(tx, run, issue.assigneeAgentId, now))) return false;
 
       const updated = await tx
         .update(issues)
@@ -5412,7 +5594,7 @@ export function issueService(db: Db) {
           executionRunId: null,
           executionAgentNameKey: null,
           executionLockedAt: null,
-          updatedAt: new Date(),
+          updatedAt: now,
         })
         .where(
           and(
@@ -5453,15 +5635,13 @@ export function issueService(db: Db) {
           sql`select ${heartbeatRuns.id} from ${heartbeatRuns} where ${heartbeatRuns.id} = ${runId} for update`,
         );
         return tx
-          .select({
-            agentId: heartbeatRuns.agentId,
-            status: heartbeatRuns.status,
-            startedAt: heartbeatRuns.startedAt,
-          })
+          .select(RUN_LIVENESS_COLUMNS)
           .from(heartbeatRuns)
           .where(eq(heartbeatRuns.id, runId))
           .then((rows) => rows[0] ?? null);
       };
+
+      const now = new Date();
 
       // A null checkoutRunId does not mean there is nothing to release. Wakes
       // that take no checkout (mentions) leave checkoutRunId null while
@@ -5472,7 +5652,7 @@ export function issueService(db: Db) {
       if (!issue.checkoutRunId) {
         if (!issue.executionRunId) return false;
         const executionOnlyRun = await loadExecutionPathRun(issue.executionRunId);
-        if (!executionHolderIsReleasable(executionOnlyRun, issue.assigneeAgentId)) return false;
+        if (!(await resolveExecutionHolderFinished(tx, executionOnlyRun, issue.assigneeAgentId, now))) return false;
 
         const clearedExecutionOnly = await tx
           .update(issues)
@@ -5480,7 +5660,7 @@ export function issueService(db: Db) {
             executionRunId: null,
             executionAgentNameKey: null,
             executionLockedAt: null,
-            updatedAt: new Date(),
+            updatedAt: now,
           })
           .where(
             and(
@@ -5495,12 +5675,20 @@ export function issueService(db: Db) {
         return Boolean(clearedExecutionOnly);
       }
 
+      // A `return false` from here on still COMMITS. issues.ts never calls
+      // tx.rollback(), so any verdict these resolvers have already written
+      // persists even when we subsequently bail: below, a `cancelled` verdict
+      // on the checkout holder survives the early return taken because the
+      // execution holder is still live. "Nothing was released" is therefore not
+      // "nothing was written". That is benign and it converges — the run it
+      // retired was demonstrably dead, and the next call short-circuits on the
+      // now-terminal status — but do not read the false return as a rollback.
       const run = await loadExecutionPathRun(issue.checkoutRunId);
-      if (run && !TERMINAL_HEARTBEAT_RUN_STATUSES.has(run.status)) return false;
+      if (run && !(await resolveRunLockFinished(tx, run, now))) return false;
 
       if (issue.executionRunId && issue.executionRunId !== issue.checkoutRunId) {
         const executionRun = await loadExecutionPathRun(issue.executionRunId);
-        if (!executionHolderIsReleasable(executionRun, issue.assigneeAgentId)) return false;
+        if (!(await resolveExecutionHolderFinished(tx, executionRun, issue.assigneeAgentId, now))) return false;
       }
 
       const updated = await tx
@@ -5510,7 +5698,7 @@ export function issueService(db: Db) {
           executionRunId: null,
           executionAgentNameKey: null,
           executionLockedAt: null,
-          updatedAt: new Date(),
+          updatedAt: now,
         })
         .where(
           and(

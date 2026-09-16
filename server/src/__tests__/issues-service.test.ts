@@ -36,6 +36,8 @@ import {
   deriveIssueCommentRunLogAttribution,
   ISSUE_LIST_MAX_LIMIT,
   issueService,
+  STALE_RUN_LOCK_AGE_OUT_ERROR_CODE,
+  STALE_RUN_LOCK_AGE_OUT_MS,
 } from "../services/issues.ts";
 import {
   WORKSPACE_WORKTREE_REQUIRES_PROJECT_CODE,
@@ -5560,7 +5562,16 @@ describeEmbeddedPostgres("issueService.clearExecutionRunIfTerminal", () => {
         agentId,
         status: "running",
         invocationSource: "manual",
-        startedAt: new Date("2026-06-10T10:06:00.000Z"),
+        // Recency, not a frozen literal. This run is the issue's live
+        // execution-lock holder, and liveness for a `running` run is measured
+        // off its last observed activity — the canonical form is
+        // `silenceStartedAtForRun` in recovery/service.ts:
+        // `lastOutputAt ?? processStartedAt ?? startedAt ?? createdAt`.
+        // `startedAt` is the only one of those columns this row carries, so a
+        // fixed 2026-06-10 literal describes a holder that has been silent for
+        // months — past even ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS — rather
+        // than the live one this case is about.
+        startedAt: new Date(Date.now() - 60 * 1000),
       },
     ]);
     await db.insert(issues).values({
@@ -5592,6 +5603,112 @@ describeEmbeddedPostgres("issueService.clearExecutionRunIfTerminal", () => {
     expect(row?.executionRunId).toBe(runningRunId);
     expect(row?.executionAgentNameKey).toBe("codexcoder");
     expect(row?.executionLockedAt).toBeInstanceOf(Date);
+  });
+
+  // The other half of the case above: same shape, same assertions inverted,
+  // and the only difference in the fixture is how long the execution-lock
+  // holder has been silent. Together the pair pins where the boundary is.
+  it("clears checkout locks when a different execution run is demonstrably dead", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const issueId = randomUUID();
+    const failedRunId = randomUUID();
+    const silentRunId = randomUUID();
+    // Comfortably outside the age-out window.
+    const agedOutAt = new Date(Date.now() - STALE_RUN_LOCK_AGE_OUT_MS - 60 * 60 * 1000);
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "CodexCoder",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(heartbeatRuns).values([
+      {
+        id: failedRunId,
+        companyId,
+        agentId,
+        status: "failed",
+        invocationSource: "manual",
+        finishedAt: new Date(Date.now() - 60 * 1000),
+      },
+      {
+        id: silentRunId,
+        companyId,
+        agentId,
+        status: "running",
+        invocationSource: "manual",
+        // Silent past the age-out window: still `running`, but it has shown no
+        // activity on any of the columns liveness is measured off. Without the
+        // age-out this run fences the issue's own assignee out of every write
+        // behind assertCheckoutOwner, permanently and with no self-service
+        // escape, because nothing else can terminalize it.
+        //
+        // createdAt is set alongside startedAt rather than left to defaultNow():
+        // a run cannot be claimed before it is enqueued, and the age-out reads
+        // wall-clock recency, so the row has to be coherent in time to describe
+        // the shape it claims to.
+        createdAt: agedOutAt,
+        startedAt: agedOutAt,
+      },
+    ]);
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Mixed execution lock",
+      status: "in_progress",
+      priority: "high",
+      assigneeAgentId: agentId,
+      checkoutRunId: failedRunId,
+      executionRunId: silentRunId,
+      executionAgentNameKey: "codexcoder",
+      executionLockedAt: agedOutAt,
+    });
+
+    await expect(svc.clearCheckoutRunIfTerminal(issueId)).resolves.toBe(true);
+
+    const row = await db
+      .select({
+        checkoutRunId: issues.checkoutRunId,
+        executionRunId: issues.executionRunId,
+        executionAgentNameKey: issues.executionAgentNameKey,
+        executionLockedAt: issues.executionLockedAt,
+      })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]);
+    expect(row).toEqual({
+      checkoutRunId: null,
+      executionRunId: null,
+      executionAgentNameKey: null,
+      executionLockedAt: null,
+    });
+
+    // The lock cleared because the run was given a terminal verdict, not
+    // because the clear skipped it: every status-only consumer now agrees.
+    const agedOut = await db
+      .select({
+        status: heartbeatRuns.status,
+        errorCode: heartbeatRuns.errorCode,
+        finishedAt: heartbeatRuns.finishedAt,
+      })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, silentRunId))
+      .then((rows) => rows[0]);
+    expect(agedOut?.status).toBe("cancelled");
+    expect(agedOut?.errorCode).toBe(STALE_RUN_LOCK_AGE_OUT_ERROR_CODE);
+    expect(agedOut?.finishedAt).toBeInstanceOf(Date);
   });
 
   it("does not let stale release clobber a successor checkout lock", async () => {
