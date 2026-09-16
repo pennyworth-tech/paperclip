@@ -4808,6 +4808,87 @@ async function countBlockedInboxIssues(dbOrTx: any, companyId: string, filters?:
   }, 0);
 }
 
+// ── Automation-origin label stamping ──────────────────────────────────────
+//
+// The label taxonomy is a per-company fact: names are the contract, ids are
+// rows. Every stamper resolves names against the company's labels and skips
+// what is absent — a company without the taxonomy gets zero stamps and no
+// error, and no stamping path ever creates a label implicitly or fails an
+// issue create over one.
+
+/** The only label names the automation stamper may attach — never a caller-supplied free string. */
+export const AUTOMATION_ORIGIN_LABEL_NAMES = {
+  pipelineSource: "source:pipeline",
+  routineSource: "source:routine",
+  recoverySource: "source:recovery",
+  humanGate: "needs:human",
+} as const;
+
+/**
+ * The label names derived from the issue's own create data: every
+ * recovery-classifier origin stamps `source:recovery`, plus `needs:human`
+ * when no agent owns the outcome — the human-gate case (unassigned or
+ * user-assigned recovery issues wait on a human by construction).
+ * Routine-execution origins are stamped at the dispatch site, which is the
+ * only place that knows whether the firing routine is a pipeline stage
+ * automation; every other origin (manual, plugin) derives nothing.
+ */
+export function automationOriginLabelNames(input: {
+  originKind: string | null | undefined;
+  hasAgentAssignee: boolean;
+}): string[] {
+  const isRecoveryOrigin = input.originKind
+    && (Object.values(RECOVERY_ORIGIN_KINDS) as string[]).includes(input.originKind);
+  if (!isRecoveryOrigin) return [];
+  return input.hasAgentAssignee
+    ? [AUTOMATION_ORIGIN_LABEL_NAMES.recoverySource]
+    : [AUTOMATION_ORIGIN_LABEL_NAMES.recoverySource, AUTOMATION_ORIGIN_LABEL_NAMES.humanGate];
+}
+
+/**
+ * Resolves label ids by exact name within one company, returning only the ids
+ * that exist. Absent names are skipped — never created, never an error — so
+ * stamping is inert in companies that have not adopted the taxonomy.
+ */
+export async function resolveCompanyLabelIdsByNames(
+  dbOrTx: Db | any,
+  companyId: string,
+  names: readonly string[],
+): Promise<string[]> {
+  const wanted = [...new Set(names.filter((name): name is string => typeof name === "string" && name.length > 0))];
+  if (wanted.length === 0) return [];
+  const rows: Array<{ id: string; name: string }> = await dbOrTx
+    .select({ id: labels.id, name: labels.name })
+    .from(labels)
+    .where(and(eq(labels.companyId, companyId), inArray(labels.name, wanted)));
+  const idByName = new Map(rows.map((row) => [row.name, row.id]));
+  return wanted.flatMap((name) => {
+    const id = idByName.get(name);
+    return id ? [id] : [];
+  });
+}
+
+/**
+ * Filters caller-carried label ids down to the company's existing labels. A
+ * stale id on the carrying surface (a stage automation config outliving a
+ * deleted label) must drop the stamp, not fail the issue create — the
+ * platform's own `assertValidLabelIds` would reject the whole write.
+ */
+export async function filterCompanyLabelIds(
+  dbOrTx: Db | any,
+  companyId: string,
+  labelIds: readonly string[],
+): Promise<string[]> {
+  const wanted = [...new Set(labelIds.filter((id): id is string => typeof id === "string" && id.length > 0))];
+  if (wanted.length === 0) return [];
+  const rows: Array<{ id: string }> = await dbOrTx
+    .select({ id: labels.id })
+    .from(labels)
+    .where(and(eq(labels.companyId, companyId), inArray(labels.id, wanted)));
+  const present = new Set(rows.map((row) => row.id));
+  return wanted.filter((id) => present.has(id));
+}
+
 export function issueService(db: Db) {
   const instanceSettings = instanceSettingsService(db);
   const treeControlSvc = issueTreeControlService(db);
@@ -7751,8 +7832,24 @@ export function issueService(db: Db) {
             },
           });
         }
-        if (inputLabelIds) {
-          await syncIssueLabels(issue.id, companyId, inputLabelIds, tx);
+        // Automation-origin stamping: recovery-classifier creates
+        // carry `source:recovery`, plus `needs:human` when no agent owns the
+        // outcome. Derived here — the one choke point every recovery create
+        // already crosses — so every classifier surface stamps without its
+        // call site knowing the taxonomy. Merged with caller-carried labelIds
+        // (the routine-dispatch source stamps) and inert where the taxonomy
+        // labels do not exist.
+        const automationLabelIds = await resolveCompanyLabelIdsByNames(
+          tx,
+          companyId,
+          automationOriginLabelNames({
+            originKind: issueData.originKind,
+            hasAgentAssignee: Boolean(values.assigneeAgentId),
+          }),
+        );
+        const createLabelIds = [...new Set([...(inputLabelIds ?? []), ...automationLabelIds])];
+        if (createLabelIds.length > 0) {
+          await syncIssueLabels(issue.id, companyId, createLabelIds, tx);
         }
         if (blockedByIssueIds !== undefined) {
           await syncBlockedByIssueIds(

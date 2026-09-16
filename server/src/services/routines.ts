@@ -61,7 +61,12 @@ import { conflict, forbidden, notFound, unauthorized, unprocessable } from "../e
 import { logger } from "../middleware/logger.js";
 import { getTelemetryClient } from "../telemetry.js";
 import { getConfiguredSecretProvider } from "../secrets/configured-provider.js";
-import { issueService } from "./issues.js";
+import {
+  AUTOMATION_ORIGIN_LABEL_NAMES,
+  filterCompanyLabelIds,
+  issueService,
+  resolveCompanyLabelIdsByNames,
+} from "./issues.js";
 import { assertAssignableAgent } from "./agent-assignability.js";
 import { visibleIssueCondition } from "./issue-visibility.js";
 import { secretService } from "./secrets.js";
@@ -1707,6 +1712,14 @@ export function routineService(
     descriptionAppendix?: string | null;
     nextRunAtOverride?: Date | null;
     actor?: Actor;
+    /**
+     * Label ids carried by a server-controlled dispatch surface (the pipeline
+     * stage automation config). Deliberately NOT a member of the public
+     * `RunRoutine` schema: agents do not choose labels, so the
+     * manual/api run path cannot set them — only `runPipelineStageEntryRoutine`
+     * forwards this member through.
+     */
+    issueLabelIds?: string[] | null;
   }) {
     const projectId = input.projectId ?? input.routine.projectId ?? null;
     const projectWorkspaceId = input.projectWorkspaceId ?? null;
@@ -1874,6 +1887,21 @@ export function routineService(
           return updated ?? createdRun;
         }
 
+        // Automation-origin stamping: the fired issue
+        // carries its taxonomy source label at creation — `source:pipeline`
+        // when the firing routine is a pipeline stage automation,
+        // `source:routine` otherwise — plus the stage-config-carried
+        // `issueLabelIds`, filtered to labels that exist so a stale id drops
+        // its stamp instead of failing the dispatch. Absent taxonomy names
+        // stamp nothing; the dispatch never fails over a label.
+        const automationLabelIds = [
+          ...await resolveCompanyLabelIdsByNames(txDb, input.routine.companyId, [
+            input.routine.originKind === "pipeline_automation"
+              ? AUTOMATION_ORIGIN_LABEL_NAMES.pipelineSource
+              : AUTOMATION_ORIGIN_LABEL_NAMES.routineSource,
+          ]),
+          ...await filterCompanyLabelIds(txDb, input.routine.companyId, input.issueLabelIds ?? []),
+        ];
         try {
           createdIssue = await issueSvc.create(input.routine.companyId, {
             projectId,
@@ -1897,6 +1925,7 @@ export function routineService(
             executionWorkspaceId: input.executionWorkspaceId ?? null,
             executionWorkspacePreference: input.executionWorkspacePreference ?? null,
             executionWorkspaceSettings: input.executionWorkspaceSettings ?? null,
+            ...(automationLabelIds.length > 0 ? { labelIds: automationLabelIds } : {}),
           });
         } catch (error) {
           const isOpenExecutionConflict =
@@ -2839,7 +2868,7 @@ export function routineService(
       });
     },
 
-    runPipelineStageEntryRoutine: async (id: string, input: RunRoutine & { descriptionAppendix?: string | null }, actor?: Actor) => {
+    runPipelineStageEntryRoutine: async (id: string, input: RunRoutine & { descriptionAppendix?: string | null; issueLabelIds?: string[] | null }, actor?: Actor) => {
       const routine = await getRoutineById(id);
       if (!routine) throw notFound("Routine not found");
       if (routine.status === "archived") throw conflict("Routine is archived");
@@ -2861,6 +2890,7 @@ export function routineService(
         executionWorkspaceSettings:
           (input.executionWorkspaceSettings as Record<string, unknown> | null | undefined) ?? null,
         descriptionAppendix: input.descriptionAppendix ?? null,
+        issueLabelIds: input.issueLabelIds ?? null,
         actor,
       });
     },

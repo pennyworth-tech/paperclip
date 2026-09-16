@@ -187,6 +187,14 @@ type PipelineAutomationExecutionContext = {
   executionWorkspaceId: string | null;
   executionWorkspacePreference: ExecutionWorkspaceMode | null;
   executionWorkspaceSettings: IssueExecutionWorkspaceSettings | null;
+  /**
+   * Label ids stamped onto the issue the stage automation creates at fire
+   * time: the per-stage `kind:` and domain labels.
+   * Carried on the server-controlled automation config, never the public
+   * run input — agents do not choose labels. The `source:` label is derived
+   * from the routine's own pipeline origin and cannot be overridden here.
+   */
+  issueLabelIds: string[];
 };
 
 export interface ResolvedPipelineCaseConversationSource {
@@ -815,6 +823,11 @@ function readExecutionWorkspaceSettings(value: unknown): IssueExecutionWorkspace
     : null;
 }
 
+function readAutomationIssueLabelIds(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return [...new Set(value.filter((id): id is string => typeof id === "string" && id.trim().length > 0))];
+}
+
 function readAutomationExecutionContext(
   source?: Partial<PipelineAutomationExecutionContext> | null,
 ): PipelineAutomationExecutionContext {
@@ -824,6 +837,7 @@ function readAutomationExecutionContext(
     executionWorkspaceId: readOptionalTrimmedString(source?.executionWorkspaceId),
     executionWorkspacePreference: readExecutionWorkspacePreference(source?.executionWorkspacePreference),
     executionWorkspaceSettings: readExecutionWorkspaceSettings(source?.executionWorkspaceSettings),
+    issueLabelIds: readAutomationIssueLabelIds(source?.issueLabelIds),
   };
 }
 
@@ -2993,6 +3007,7 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
           variables,
         },
         variables,
+        issueLabelIds: automation.issueLabelIds,
         descriptionAppendix: [
           buildPipelineAutomationIssueTitlePrefix(detail),
           buildPipelineStageEntryPreamble(detail),
