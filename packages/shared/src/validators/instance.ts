@@ -55,6 +55,7 @@ export const instanceExperimentalSettingsSchema = z.object({
   enableClassicTaskInterface: z.boolean().default(false),
   enableTaskWatchdogs: z.boolean().default(false),
   enableIssuePlanDecompositions: z.boolean().default(false),
+  requireReviewIssueVerdictOpener: z.boolean().default(false),
   enableExperimentalFileViewer: z.boolean().default(false),
   enableExternalObjects: z.boolean().default(false),
   enableSmokeLab: z.boolean().default(false),

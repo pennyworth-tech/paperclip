@@ -135,6 +135,14 @@ export const INSTANCE_FEATURE_CATALOG: Record<InstanceFeatureKey, FeatureCatalog
     cloudDefault: false,
     selfHostedDefault: false,
   },
+  requireReviewIssueVerdictOpener: {
+    title: "Require Review Issue Verdict Opener",
+    description:
+      "Refuse to close a review issue (title matches the PR review shape) unless a comment authored by the assigned reviewer has a first line matching <APPROVE|REQUEST CHANGES|NEEDS INFO> — PR #<n> at head <40-hex-sha>. Shape-only; freshness is the sweep's job.",
+    tier: "managed",
+    cloudDefault: false,
+    selfHostedDefault: false,
+  },
   enableExperimentalFileViewer: {
     title: "Experimental File Viewer",
     description:

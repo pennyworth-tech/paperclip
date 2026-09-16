@@ -65,6 +65,17 @@ export interface InstanceExperimentalSettings {
   enableClassicTaskInterface: boolean;
   enableTaskWatchdogs: boolean;
   enableIssuePlanDecompositions: boolean;
+  /**
+   * When enabled, an issue whose title identifies it as a PR review issue
+   * (e.g. "Review PR #N (<repo>) — …") cannot transition to `done`
+   * unless a comment authored by the assigned reviewer has a first line
+   * matching the verdict opener
+   * `<APPROVE|REQUEST CHANGES|NEEDS INFO> — PR #<n> at head <40-hex-sha>`.
+   * Shape-only; freshness (the sha being the pull request's current head)
+   * is checked separately, not here. Default `false`; opt-in because it
+   * changes when an issue may be closed.
+   */
+  requireReviewIssueVerdictOpener: boolean;
   enableExperimentalFileViewer: boolean;
   enableExternalObjects: boolean;
   enableSmokeLab: boolean;

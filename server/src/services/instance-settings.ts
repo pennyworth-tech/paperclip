@@ -231,6 +231,8 @@ export function normalizeExperimentalSettings(raw: unknown): InstanceExperimenta
       enableConferenceRoomChat: parsed.data.enableConferenceRoomChat ?? false,
       enableClassicTaskInterface: parsed.data.enableClassicTaskInterface ?? false,
       enableIssuePlanDecompositions: parsed.data.enableIssuePlanDecompositions ?? false,
+      requireReviewIssueVerdictOpener:
+        parsed.data.requireReviewIssueVerdictOpener ?? false,
       enableExperimentalFileViewer: parsed.data.enableExperimentalFileViewer ?? false,
       enableTaskWatchdogs: parsed.data.enableTaskWatchdogs ?? false,
       enableExternalObjects: parsed.data.enableExternalObjects ?? false,
@@ -271,6 +273,7 @@ export function normalizeExperimentalSettings(raw: unknown): InstanceExperimenta
     enableClassicTaskInterface: false,
     enableTaskWatchdogs: false,
     enableIssuePlanDecompositions: false,
+    requireReviewIssueVerdictOpener: false,
     enableExperimentalFileViewer: false,
     enableExternalObjects: false,
     enableSmokeLab: false,

@@ -89,6 +89,12 @@ import {
 import { mergeExecutionWorkspaceConfig } from "./execution-workspaces.js";
 import { buildInitialIssueMonitorFields, normalizeIssueExecutionPolicy } from "./issue-execution-policy.js";
 import { instanceSettingsService } from "./instance-settings.js";
+import {
+  firstNonBlankLine,
+  isReviewIssueTitle,
+  parseReviewVerdictOpener,
+  REVIEW_VERDICT_OPENER_GUARD_CODE,
+} from "./review-verdict-opener.js";
 import { redactCurrentUserText } from "../log-redaction.js";
 import { redactSensitiveText } from "../redaction.js";
 import { resolveIssueGoalId, resolveNextIssueGoalId } from "./issue-goal-fallback.js";
@@ -204,6 +210,92 @@ function applyStatusSideEffects(
     patch.cancelledAt = new Date();
   }
   return patch;
+}
+
+/**
+ * PR review verdict opener guard. Refuses a transition into `done` when the
+ * issue is a PR review issue but carries no comment whose first line matches
+ * the verdict opener and is authored by the assigned reviewer. The check is
+ * shape-only — freshness (the named sha being the pull request's current
+ * head) is a separate concern; the control plane performs no network calls.
+ *
+ * Three reasons this lives here, not in the route handler:
+ *
+ *   1. Every terminal transition funnels through `issueService.update` —
+ *      HTTP PATCH, the sweep's `svc.update`, recovery actions, tree
+ *      control, status cards — so a single guard catches every caller.
+ *   2. The actor is not part of the predicate: any caller that legitimately
+ *      reaches the `done` transition on a review issue must have a verdict
+ *      comment first. Authentication is `authorization`'s job, not this
+ *      guard's.
+ *   3. The verdict-opener format belongs to the instance's review protocol;
+ *      keeping the helper next to the rest of the status-transition logic
+ *      means a future change to that protocol has one place to update.
+ */
+async function assertReviewIssueHasVerdictOpener(
+  dbOrTx: Db,
+  existing: typeof issues.$inferSelect,
+): Promise<void> {
+  // No assignee means no reviewer to attribute the verdict to. Defensive:
+  // a review issue is supposed to have one (the docs are explicit), but if
+  // the predicate was loosened to admit a title without an assignee, this
+  // guard must not invent one to satisfy itself.
+  const reviewerAgentId = existing.assigneeAgentId;
+  if (!reviewerAgentId) {
+    throw conflict(
+      "Cannot close review issue: no assigned reviewer to author a verdict comment.",
+      {
+        code: REVIEW_VERDICT_OPENER_GUARD_CODE,
+        reason: "no_reviewer",
+        issueId: existing.id,
+      },
+    );
+  }
+
+  // Walk the issue's comments in created order. `assignedReviewerAuthored`
+  // is the single source of truth for "was this written by the reviewer,
+  // including cases where the writer was a non-human sentinel whose
+  // attribution was recovered to the agent later (`derivedAuthorAgentId` on
+  // `issue_comments`).
+  const rows = await dbOrTx
+    .select({
+      id: issueComments.id,
+      body: issueComments.body,
+      authorAgentId: issueComments.authorAgentId,
+      derivedAuthorAgentId: issueComments.derivedAuthorAgentId,
+    })
+    .from(issueComments)
+    .where(
+      and(
+        eq(issueComments.issueId, existing.id),
+        eq(issueComments.companyId, existing.companyId),
+        isNull(issueComments.deletedAt),
+        or(
+          eq(issueComments.authorAgentId, reviewerAgentId),
+          eq(issueComments.derivedAuthorAgentId, reviewerAgentId),
+        ),
+      ),
+    )
+    .orderBy(asc(issueComments.createdAt));
+
+  for (const row of rows) {
+    const opener = parseReviewVerdictOpener(firstNonBlankLine(row.body));
+    if (opener) return;
+  }
+
+  throw conflict(
+    "Cannot close review issue: no comment by the assigned reviewer has a verdict opener matching "
+      + "<APPROVE|REQUEST CHANGES|NEEDS INFO> — PR #<n> at head <40-hex-sha>.",
+    {
+      code: REVIEW_VERDICT_OPENER_GUARD_CODE,
+      reason: "no_conforming_verdict_opener",
+      issueId: existing.id,
+      assigneeAgentId: reviewerAgentId,
+      commentsChecked: rows.length,
+      expectedFormat:
+        "<APPROVE|REQUEST CHANGES|NEEDS INFO> — PR #<n> at head <40-hex-sha>",
+    },
+  );
 }
 
 function workspaceWorktreeRequiresProjectDetails() {
@@ -7983,6 +8075,19 @@ export function issueService(db: Db) {
 
       if (issueData.status) {
         assertTransition(existing.status, issueData.status);
+      }
+
+      // PR review verdict opener guard. Fires only on the transition
+      // into `done`, only when the instance setting enables it,
+      // and only on titles the predicate identifies as a PR review issue —
+      // every other issue is untouched. Refusal names what is missing so the
+      // caller can fix the comment, not the predicate.
+      const reviewVerdictGuardEnabled = issueData.status === "done"
+        && existing.status !== "done"
+        && isReviewIssueTitle(existing.title)
+        && (await instanceSettings.getExperimental()).requireReviewIssueVerdictOpener === true;
+      if (reviewVerdictGuardEnabled) {
+        await assertReviewIssueHasVerdictOpener(dbOrTx as Db, existing);
       }
 
       const patch: Partial<typeof issues.$inferInsert> = {
