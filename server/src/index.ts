@@ -39,6 +39,7 @@ import {
   getManagedInstanceConfig,
   type ManagedInstanceConfig,
 } from "./services/managed-config.js";
+import { assertConfiguredBuiltinAdapterTypesValid } from "./adapters/builtin-adapter-types.js";
 import { getOperatorSettingDefaults } from "./services/setting-defaults.js";
 import { setupEnvironmentCustomImageTerminalWebSocketServer } from "./realtime/environment-custom-image-terminal-ws.js";
 import { setupLiveEventsWebSocketServer } from "./realtime/live-events-ws.js";
@@ -685,6 +686,16 @@ export async function startServer(): Promise<StartedServer> {
         "cloud managed configuration active",
       );
     }
+    // Built-in adapters the same document declares. Resolved and imported
+    // here, before the heartbeat scheduler is constructed below, because
+    // `getServerAdapter()` silently falls back to the process adapter for an
+    // unknown type: a run dispatched while one of these is still loading
+    // would go to the wrong executor and would look like it ran. Awaiting
+    // before anything holds a scheduler reference closes that window, and
+    // sitting inside this try/catch gives it the same fail-closed log.
+    assertConfiguredBuiltinAdapterTypesValid();
+    const { assertConfiguredBuiltinAdaptersLoaded } = await import("./adapters/registry.js");
+    await assertConfiguredBuiltinAdaptersLoaded();
   } catch (err) {
     logger.error({ err }, "invalid PAPERCLIP_MANAGED_CONFIG; refusing to start (fail closed)");
     throw err;

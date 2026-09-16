@@ -53,6 +53,7 @@ describe("parseManagedConfigEnv", () => {
       catalogVersion: "2026.720.0",
       features: { enableApps: false, enablePipelines: true },
       plugins: { autoInstall: ["daytona", "kubernetes"], catalog: [] },
+      adapters: { builtin: [] },
       environments: [],
     });
   });
@@ -67,6 +68,7 @@ describe("parseManagedConfigEnv", () => {
       catalogVersion: "2026.720.0",
       features: {},
       plugins: { autoInstall: [], catalog: [] },
+      adapters: { builtin: [] },
       environments: [],
     });
   });
@@ -325,6 +327,72 @@ describe("parseManagedConfigEnv plugins.catalog section", () => {
     expect(() => parseManagedConfigEnv(envWith(withCatalog([entry()], ["daytona"])))).toThrow(
       /"plugins.catalog\[0\].key" is "acme-operations", which is not in "plugins.autoInstall"/,
     );
+  });
+});
+
+describe("parseManagedConfigEnv adapters.builtin section", () => {
+  const entry = (overrides: Record<string, unknown> = {}) => ({
+    type: "my_adapter",
+    relativePath: "my-adapter",
+    ...overrides,
+  });
+
+  const withAdapters = (adapters: unknown) => validDoc({ adapters });
+
+  it("defaults to an empty list when the section is absent (pre-section documents keep booting)", () => {
+    expect(parseManagedConfigEnv(envWith(validDoc()))?.adapters.builtin).toEqual([]);
+  });
+
+  it("parses a declared adapter", () => {
+    const config = parseManagedConfigEnv(envWith(withAdapters({ builtin: [entry()] })));
+    expect(config?.adapters.builtin).toEqual([
+      { type: "my_adapter", relativePath: "my-adapter" },
+    ]);
+  });
+
+  it("throws on a malformed section or entry", () => {
+    expect(() => parseManagedConfigEnv(envWith(withAdapters([])))).toThrow(
+      /"adapters" must be an object/,
+    );
+    expect(() => parseManagedConfigEnv(envWith(withAdapters({ external: [] })))).toThrow(
+      /"adapters" has unknown key "external"/,
+    );
+    expect(() => parseManagedConfigEnv(envWith(withAdapters({ builtin: {} })))).toThrow(
+      /"adapters.builtin" must be an array/,
+    );
+    expect(() => parseManagedConfigEnv(envWith(withAdapters({ builtin: ["x"] })))).toThrow(
+      /"adapters.builtin\[0\]" must be an object/,
+    );
+    expect(() =>
+      parseManagedConfigEnv(envWith(withAdapters({ builtin: [entry({ packageName: "x" })] }))),
+    ).toThrow(/"adapters.builtin\[0\]" has unknown key "packageName"/);
+    expect(() =>
+      parseManagedConfigEnv(envWith(withAdapters({ builtin: [{ type: "my_adapter" }] }))),
+    ).toThrow(/"adapters.builtin\[0\]" requires "relativePath"/);
+  });
+
+  it("throws on a malformed adapter type", () => {
+    for (const type of ["My_Adapter", "1adapter", "my-adapter", "a", ""]) {
+      expect(() =>
+        parseManagedConfigEnv(envWith(withAdapters({ builtin: [entry({ type })] }))),
+      ).toThrow(/"adapters.builtin\[0\].type" must be an adapter type/);
+    }
+  });
+
+  it("rejects a relativePath that could escape the adapter root", () => {
+    for (const relativePath of ["../../etc", "/etc/passwd", "~/evil", "a\\b", ".hidden", "a/b/c/d"]) {
+      expect(() =>
+        parseManagedConfigEnv(envWith(withAdapters({ builtin: [entry({ relativePath })] }))),
+      ).toThrow(/"adapters.builtin\[0\].relativePath"/);
+    }
+  });
+
+  it("throws on a duplicate type within the section", () => {
+    expect(() =>
+      parseManagedConfigEnv(
+        envWith(withAdapters({ builtin: [entry(), entry({ relativePath: "other" })] })),
+      ),
+    ).toThrow(/"adapters.builtin" has duplicate type "my_adapter"/);
   });
 });
 

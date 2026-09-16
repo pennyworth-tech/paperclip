@@ -1,5 +1,6 @@
 import path from "node:path";
 import fs from "node:fs";
+import { canonicalize, isInsideRoot } from "./path-containment.js";
 import type { PaperclipPluginManifestV1 } from "@paperclipai/shared";
 
 /**
@@ -199,44 +200,6 @@ export interface ResolvedBundledPlugin {
   pluginKey: string;
   /** Absolute path handed to `loader.installPlugin({ localPath })`. */
   localPath: string;
-}
-
-/**
- * Canonicalize a path for containment comparison. Symlinks are resolved so a
- * link inside the catalog cannot point install resolution at a directory
- * outside it.
- *
- * A path that does not exist is canonicalized as far as it does: the nearest
- * existing ancestor is resolved with `realpath` and the remaining segments are
- * appended lexically. Resolving only whole paths was wrong in both directions.
- * It produced a false NEGATIVE whenever the catalog root itself sat behind a
- * symlink and an elected bundle was simply absent from the image — the root
- * canonicalized, the missing bundle path did not, and a managed instance that
- * should have logged "bundle not present; skipping" refused to boot instead.
- * And it produced a false POSITIVE for a not-yet-existing path *under* a
- * symlinked intermediate directory, which compared as inside the root while
- * resolving outside it.
- */
-function canonicalize(p: string): string {
-  let current = path.resolve(p);
-  const trailing: string[] = [];
-  // Bounded by construction: every iteration removes one segment, and
-  // `path.dirname` of a root is that root, which ends the walk.
-  for (;;) {
-    try {
-      return path.join(fs.realpathSync(current), ...trailing.reverse());
-    } catch {
-      const parent = path.dirname(current);
-      if (parent === current) return path.resolve(p);
-      trailing.push(path.basename(current));
-      current = parent;
-    }
-  }
-}
-
-function isInsideRoot(candidate: string, root: string): boolean {
-  const rel = path.relative(root, candidate);
-  return rel === "" || (!rel.startsWith("..") && !path.isAbsolute(rel));
 }
 
 /**

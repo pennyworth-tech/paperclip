@@ -419,6 +419,21 @@ export interface AcpTargetDescriptor {
 
 export interface ServerAdapterModule {
   type: string;
+  /**
+   * Human-readable name for the adapter listing. Adapters the user interface
+   * has a compiled-in entry for leave this unset — that entry wins — so this
+   * carries display metadata for adapters the interface cannot know about,
+   * such as one declared by configuration. Falls back to `type`.
+   */
+  displayName?: string;
+  /** One-line description shown beside the label. */
+  description?: string;
+  /**
+   * Icon name, resolved against the user interface's own icon set. A name is
+   * a selector, not an image: an unrecognized one falls back to a default, and
+   * no dynamic import, URL, or markup is ever derived from it.
+   */
+  iconName?: string;
   execute(ctx: AdapterExecutionContext): Promise<AdapterExecutionResult>;
   testEnvironment(ctx: AdapterEnvironmentTestContext): Promise<AdapterEnvironmentTestResult>;
   acp?: AcpTargetDescriptor;

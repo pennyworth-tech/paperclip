@@ -66,15 +66,45 @@ function resolvePackageDir(record: Pick<AdapterPluginRecord, "localPath" | "pack
     : path.resolve(getAdapterPluginsDir(), "node_modules", record.packageName);
 }
 
-function resolvePackageEntryPoint(packageDir: string): string {
+/**
+ * Resolve the file to import for a package, optionally through a subpath
+ * export (`"./server"`). The package root (`"."`) falls back to `main`, as
+ * Node does; a named subpath has no such fallback and must be exported.
+ */
+function resolvePackageEntryPoint(packageDir: string, subpath = "."): string {
   const pkgJsonPath = path.join(packageDir, "package.json");
   const pkg = JSON.parse(fs.readFileSync(pkgJsonPath, "utf-8"));
 
-  if (pkg.exports && typeof pkg.exports === "object" && pkg.exports["."]) {
-    const exp = pkg.exports["."];
-    return typeof exp === "string" ? exp : (exp.import ?? exp.default ?? "index.js");
+  if (pkg.exports && typeof pkg.exports === "object" && pkg.exports[subpath]) {
+    const exp = pkg.exports[subpath];
+    const resolved = typeof exp === "string" ? exp : (exp.import ?? exp.default);
+    if (resolved) return resolved;
+  }
+  if (subpath !== ".") {
+    throw new Error(`Package at "${packageDir}" does not export "${subpath}".`);
   }
   return pkg.main ?? "index.js";
+}
+
+/**
+ * Resolve an entry point against its package directory and refuse one that
+ * escapes it.
+ *
+ * `exports` and `main` are package-authored strings, so `"../../../evil.js"`
+ * is expressible; without this the import would reach outside the directory
+ * that containment checks were performed on. `extractUiParserSource` already
+ * refuses the same escape for the parser file — this applies the rule to the
+ * entry point too, where it matters more, since that path is imported and
+ * executed rather than read and shipped to a sandbox.
+ */
+function resolveModulePath(packageDir: string, entryPoint: string, packageName: string): string {
+  const modulePath = path.resolve(packageDir, entryPoint);
+  if (!modulePath.startsWith(packageDir + path.sep)) {
+    throw new Error(
+      `Package "${packageName}" entry point "${entryPoint}" escapes its package directory; refusing to load.`,
+    );
+  }
+  return modulePath;
 }
 
 // ---------------------------------------------------------------------------
@@ -181,13 +211,14 @@ export function validateAdapterModule(mod: unknown, packageName: string): Server
 export async function loadExternalAdapterPackage(
   packageName: string,
   localPath?: string,
+  entrySubpath = ".",
 ): Promise<ServerAdapterModule> {
   const packageDir = localPath
     ? path.resolve(localPath)
     : path.resolve(getAdapterPluginsDir(), "node_modules", packageName);
 
-  const entryPoint = resolvePackageEntryPoint(packageDir);
-  const modulePath = path.resolve(packageDir, entryPoint);
+  const entryPoint = resolvePackageEntryPoint(packageDir, entrySubpath);
+  const modulePath = resolveModulePath(packageDir, entryPoint, packageName);
   const uiParserSource = extractUiParserSource(packageDir, packageName);
 
   logger.info({ packageName, packageDir, entryPoint, modulePath, hasUiParser: !!uiParserSource }, "Loading external adapter package");
@@ -226,7 +257,7 @@ export async function reloadExternalAdapter(
 
   const packageDir = resolvePackageDir(record);
   const entryPoint = resolvePackageEntryPoint(packageDir);
-  const modulePath = path.resolve(packageDir, entryPoint);
+  const modulePath = resolveModulePath(packageDir, entryPoint, record.packageName);
   const fileUrl = pathToFileURL(modulePath).href;
 
   // Bust ESM module cache so re-import loads fresh code from disk.
