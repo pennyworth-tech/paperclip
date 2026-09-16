@@ -48,7 +48,12 @@ describe("cloud image bundled plugins", () => {
   it.each([...new Set([...dockerfileDefault, ...workflowArg])])(
     "plugin %s is buildable and resolvable by the auto-installer",
     (name) => {
-      const dir = path.join(repoRoot, "packages", "plugins", "sandbox-providers", name);
+      // A CLOUD_BUNDLED_PLUGINS entry containing `/` is a path relative to
+      // packages/plugins/; a bare name means sandbox-providers/<name>. Mirror
+      // the Dockerfile's own resolution rule so this guard stays correct if a
+      // path-form entry is ever added.
+      const rel = name.includes("/") ? name : `sandbox-providers/${name}`;
+      const dir = path.join(repoRoot, "packages", "plugins", ...rel.split("/"));
       expect(existsSync(dir), `${dir} must exist`).toBe(true);
       expect(
         existsSync(path.join(dir, "src", "manifest.ts")),
@@ -63,7 +68,7 @@ describe("cloud image bundled plugins", () => {
       // baked into the image but absent from the catalog (or vice versa)
       // can never be auto-installed.
       const catalogEntry = BUNDLED_PLUGIN_CATALOG.find(
-        (entry) => entry.relativePath === `sandbox-providers/${name}`,
+        (entry) => entry.relativePath === rel,
       );
       expect(catalogEntry, `${name} must be listed in BUNDLED_PLUGIN_CATALOG`).toBeTruthy();
     },
