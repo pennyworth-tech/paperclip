@@ -1479,6 +1479,8 @@ export interface PluginIssuesClient {
     >> & {
       blockedByIssueIds?: string[];
       labelIds?: string[];
+      /** Add labels atomically without replacing existing labels. Mutually exclusive with labelIds. */
+      addLabelIds?: string[];
       executionWorkspaceSettings?: Record<string, unknown> | null;
     },
     companyId: string,

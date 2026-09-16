@@ -61,7 +61,10 @@ import { conflict, forbidden, notFound, unauthorized, unprocessable } from "../e
 import { logger } from "../middleware/logger.js";
 import { getTelemetryClient } from "../telemetry.js";
 import { getConfiguredSecretProvider } from "../secrets/configured-provider.js";
-import { issueService } from "./issues.js";
+import {
+  filterCompanyLabelIds,
+  issueService,
+} from "./issues.js";
 import { assertAssignableAgent } from "./agent-assignability.js";
 import { visibleIssueCondition } from "./issue-visibility.js";
 import { secretService } from "./secrets.js";
@@ -1714,6 +1717,14 @@ export function routineService(
     descriptionAppendix?: string | null;
     nextRunAtOverride?: Date | null;
     actor?: Actor;
+    /**
+     * Label ids carried by a server-controlled dispatch surface (the pipeline
+     * stage automation config). Deliberately NOT a member of the public
+     * `RunRoutine` schema: this is stage configuration, so the
+     * manual/api run path cannot set them — only `runPipelineStageEntryRoutine`
+     * forwards this member through.
+     */
+    issueLabelIds?: string[] | null;
   }) {
     const projectId = input.projectId ?? input.routine.projectId ?? null;
     const projectWorkspaceId = input.projectWorkspaceId ?? null;
@@ -1881,6 +1892,11 @@ export function routineService(
           return updated ?? createdRun;
         }
 
+        // Stage configuration carries generic label IDs. Deleted or foreign
+        // labels are ignored so stale configuration cannot break dispatch.
+        const automationLabelIds = await filterCompanyLabelIds(
+          txDb, input.routine.companyId, input.issueLabelIds ?? [],
+        );
         try {
           createdIssue = await issueSvc.create(input.routine.companyId, {
             projectId,
@@ -1904,6 +1920,7 @@ export function routineService(
             executionWorkspaceId: input.executionWorkspaceId ?? null,
             executionWorkspacePreference: input.executionWorkspacePreference ?? null,
             executionWorkspaceSettings: input.executionWorkspaceSettings ?? null,
+            ...(automationLabelIds.length > 0 ? { labelIds: automationLabelIds } : {}),
           });
         } catch (error) {
           const isOpenExecutionConflict =
@@ -2846,7 +2863,7 @@ export function routineService(
       });
     },
 
-    runPipelineStageEntryRoutine: async (id: string, input: RunRoutine & { descriptionAppendix?: string | null }, actor?: Actor) => {
+    runPipelineStageEntryRoutine: async (id: string, input: RunRoutine & { descriptionAppendix?: string | null; issueLabelIds?: string[] | null }, actor?: Actor) => {
       const routine = await getRoutineById(id);
       if (!routine) throw notFound("Routine not found");
       if (routine.status === "archived") throw conflict("Routine is archived");
@@ -2868,6 +2885,7 @@ export function routineService(
         executionWorkspaceSettings:
           (input.executionWorkspaceSettings as Record<string, unknown> | null | undefined) ?? null,
         descriptionAppendix: input.descriptionAppendix ?? null,
+        issueLabelIds: input.issueLabelIds ?? null,
         actor,
       });
     },

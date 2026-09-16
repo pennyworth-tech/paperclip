@@ -1964,6 +1964,7 @@ export function buildHostServices(
         }
         const updated = (await issues.update(params.issueId, {
           ...(patch as any),
+          companyGuard: companyId,
           actorAgentId,
           actorUserId,
         })) as Issue;

@@ -6744,6 +6744,27 @@ async function countBlockedInboxIssues(
   }, 0);
 }
 
+/**
+ * Filters caller-carried label ids down to the company's existing labels. A
+ * stale id on the carrying surface (a stage automation config outliving a
+ * deleted label) must drop the stamp, not fail the issue create — the
+ * platform's own `assertValidLabelIds` would reject the whole write.
+ */
+export async function filterCompanyLabelIds(
+  dbOrTx: Db | any,
+  companyId: string,
+  labelIds: readonly string[],
+): Promise<string[]> {
+  const wanted = [...new Set(labelIds.filter((id): id is string => typeof id === "string" && isUuidLike(id)))];
+  if (wanted.length === 0) return [];
+  const rows: Array<{ id: string }> = await dbOrTx
+    .select({ id: labels.id })
+    .from(labels)
+    .where(and(eq(labels.companyId, companyId), inArray(labels.id, wanted)));
+  const present = new Set(rows.map((row) => row.id));
+  return wanted.filter((id) => present.has(id));
+}
+
 export function issueService(db: Db) {
   const instanceSettings = instanceSettingsService(db);
   const treeControlSvc = issueTreeControlService(db);
@@ -10761,6 +10782,7 @@ export function issueService(db: Db) {
       id: string,
       data: Partial<typeof issues.$inferInsert> & {
         labelIds?: string[];
+        addLabelIds?: string[];
         blockedByIssueIds?: string[];
         actorAgentId?: string | null;
         actorUserId?: string | null;
@@ -10806,12 +10828,19 @@ export function issueService(db: Db) {
 
       const {
         labelIds: nextLabelIds,
+        addLabelIds,
         blockedByIssueIds,
         actorAgentId,
         actorUserId,
         companyGuard,
         ...issueData
       } = data;
+      if (addLabelIds !== undefined && (
+        nextLabelIds !== undefined || !Array.isArray(addLabelIds) ||
+        addLabelIds.some((value) => typeof value !== "string" || !isUuidLike(value))
+      )) {
+        throw unprocessable("addLabelIds must be an array of label IDs and cannot be combined with labelIds");
+      }
       if (
         issueData.assigneeAgentId !== undefined &&
         issueData.assigneeAgentId !== existing.assigneeAgentId
@@ -11087,7 +11116,7 @@ export function issueService(db: Db) {
         }
 
         const [previousLabelsByIssueId, previousRelationSummaries] = await Promise.all([
-          nextLabelIds !== undefined
+          nextLabelIds !== undefined || addLabelIds !== undefined
             ? labelMapForIssues(tx, [id])
             : Promise.resolve(new Map<string, IssueLabelRow[]>()),
           blockedByIssueIds !== undefined
@@ -11252,11 +11281,17 @@ export function issueService(db: Db) {
             await finalizeStatusCardsForStalledGeneration(tx, updated);
           }
         }
-        if (nextLabelIds !== undefined) {
+        if (nextLabelIds !== undefined || addLabelIds !== undefined) {
+          // The issue row is locked above. Read/merge labels under that same
+          // lock so concurrent enrichment cannot erase another writer's labels.
+          const resolvedLabelIds = nextLabelIds ?? [...new Set([
+            ...(previousLabelsByIssueId.get(id) ?? []).map((label) => label.id),
+            ...(addLabelIds ?? []),
+          ])];
           await syncIssueLabels(
             updated.id,
             existing.companyId,
-            nextLabelIds,
+            resolvedLabelIds,
             tx,
           );
         }
@@ -11318,7 +11353,7 @@ export function issueService(db: Db) {
           receiptExisting as unknown as Record<string, unknown>,
           updated as unknown as Record<string, unknown>,
           {
-            ...(nextLabelIds !== undefined
+            ...(nextLabelIds !== undefined || addLabelIds !== undefined
               ? {
                   labelIds: {
                     from: (previousLabelsByIssueId.get(id) ?? []).map(
