@@ -1459,14 +1459,31 @@ describeEmbeddedPostgres("plugin orchestration APIs", () => {
       })).rejects.toMatchObject({ status: 403, details: { code: "review_required", approver: { kind: "linked_reviewer", id: seeded.reviewerAId } } });
       expect(await reviewDecidedCount(caseId)).toBe(0);
 
+      // A refused decision carrying fields writes neither the fields nor a version bump.
+      await expect(services.pipelines.reviewCase({
+        caseId,
+        companyId,
+        decision: "approve",
+        fields: { headSha: "b".repeat(40), verdictKind: "APPROVE" },
+        expectedVersion: seeded.version,
+        actorAgentId: seeded.reviewerBId,
+        actorRunId: runB,
+      })).rejects.toMatchObject({ status: 403 });
+      const unchanged = await services.pipelines.getCase({ caseId, companyId });
+      expect(unchanged).toMatchObject({ version: seeded.version });
+      expect(unchanged?.fields).not.toHaveProperty("verdictKind");
+
       const result = await services.pipelines.reviewCase({
         caseId,
         companyId,
         decision: "approve",
+        fields: { headSha: "a".repeat(40), verdictKind: "APPROVE" },
         expectedVersion: seeded.version,
         actorAgentId: seeded.reviewerAId,
         actorRunId: runA,
       });
+      const after = await services.pipelines.getCase({ caseId, companyId });
+      expect(after?.fields).toMatchObject({ headSha: "a".repeat(40), verdictKind: "APPROVE" });
       expect(result).toMatchObject({ caseId, decision: "approve" });
       expect(result.version).toBeGreaterThan(seeded.version);
       expect(result.stageId).not.toBe(seeded.reviewStage.id);

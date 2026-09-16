@@ -1168,6 +1168,7 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
             companyId,
             decision: input.decision,
             reason: input.reason,
+            ...(input.fields !== undefined ? { fields: input.fields } : {}),
             expectedVersion: input.expectedVersion,
             actorAgentId: input.actorAgentId,
             actorRunId: input.actorRunId,

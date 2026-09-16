@@ -2110,6 +2110,7 @@ export interface WorkerToHostMethods {
       companyId: string;
       decision: PluginPipelineReviewDecision;
       reason?: string | null;
+      fields?: Record<string, unknown>;
       expectedVersion: number;
       actorAgentId: string;
       actorRunId: string;
