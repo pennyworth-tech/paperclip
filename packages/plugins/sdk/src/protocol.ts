@@ -2627,6 +2627,50 @@ export class JsonRpcCallError extends Error {
   }
 }
 
+/**
+ * Structured failure fields the host attaches as `error.data` when a
+ * worker→host call fails. `code` is the host's machine code (e.g. an HTTP
+ * error's `details.code` such as `"review_required"`), `status` its HTTP
+ * status when the failure was an HTTP error.
+ */
+export interface PluginHostErrorData {
+  code: string | null;
+  status: number | null;
+  details: unknown;
+}
+
+/** Stable machine codes for refusals the bridge itself reports numerically. */
+const HOST_ERROR_CODES_BY_RPC_CODE: Readonly<Record<number, string>> = {
+  [PLUGIN_RPC_ERROR_CODES.CAPABILITY_DENIED]: "capability_denied",
+  [PLUGIN_RPC_ERROR_CODES.INVOCATION_SCOPE_DENIED]: "invocation_scope_denied",
+  [PLUGIN_RPC_ERROR_CODES.TIMEOUT]: "timeout",
+};
+
+/**
+ * Error a plugin worker receives when a host service call (`ctx.*`) fails.
+ * Branch on `code` / `status`; `message` is for humans only.
+ */
+export class PluginHostError extends Error {
+  override readonly name = "PluginHostError";
+  /** Machine code, e.g. `"review_required"`, `"version_conflict"`, `"capability_denied"`; null when the host gave none. */
+  readonly code: string | null;
+  /** HTTP status of the host-side failure, or null when it was not an HTTP error. */
+  readonly status: number | null;
+  /** The host error's structured details, or null. */
+  readonly details: unknown;
+  /** The JSON-RPC error code of the response. */
+  readonly rpcCode: number;
+
+  constructor(error: JsonRpcError) {
+    super(error.message);
+    const data = (error.data ?? {}) as Partial<PluginHostErrorData>;
+    this.rpcCode = error.code;
+    this.code = typeof data.code === "string" ? data.code : HOST_ERROR_CODES_BY_RPC_CODE[error.code] ?? null;
+    this.status = typeof data.status === "number" ? data.status : null;
+    this.details = data.details ?? null;
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Reset helper (testing only)
 // ---------------------------------------------------------------------------

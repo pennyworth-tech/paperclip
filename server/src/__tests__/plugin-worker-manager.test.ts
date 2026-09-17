@@ -27,6 +27,7 @@ vi.mock("../middleware/logger.js", () => {
 });
 
 import { logger } from "../middleware/logger.js";
+import { HttpError } from "../errors.js";
 import {
   appendStderrExcerpt,
   createPluginWorkerHandle,
@@ -303,6 +304,65 @@ describe("plugin-worker-manager stderr failure context", () => {
         { companyId: "company-a" },
         { invocationScope: { companyId: "company-a" } },
       );
+    } finally {
+      await handle.stop().catch(() => undefined);
+    }
+  });
+
+  it("sends a host handler's HttpError code, status and details to the worker as error data", async () => {
+    const handle = createPluginWorkerHandle("test.plugin", {
+      entrypointPath: INVOCATION_SCOPE_WORKER_ENTRYPOINT,
+      manifest: TEST_MANIFEST,
+      config: {},
+      instanceInfo: { instanceId: "instance-1", hostVersion: "1.0.0" },
+      apiVersion: 1,
+      hostHandlers: {
+        "companies.get": async () => {
+          throw new HttpError(403, "Stage approval requires the case's linked reviewer", { code: "review_required" });
+        },
+      },
+    });
+
+    try {
+      await handle.start();
+      // The fixture worker relays the host's error response verbatim.
+      await expect(handle.call("getData", {
+        key: "probe",
+        companyId: "company-1",
+        params: { mode: "echo", requestedCompanyId: "company-1" },
+      } as HostToWorkerMethods["getData"][0])).rejects.toMatchObject({
+        message: "Stage approval requires the case's linked reviewer",
+        data: { code: "review_required", status: 403, details: { code: "review_required" } },
+      });
+    } finally {
+      await handle.stop().catch(() => undefined);
+    }
+  });
+
+  it("reports a capability refusal by its numeric CAPABILITY_DENIED code", async () => {
+    const handle = createPluginWorkerHandle("test.plugin", {
+      entrypointPath: INVOCATION_SCOPE_WORKER_ENTRYPOINT,
+      manifest: TEST_MANIFEST,
+      config: {},
+      instanceInfo: { instanceId: "instance-1", hostVersion: "1.0.0" },
+      apiVersion: 1,
+      hostHandlers: createHostClientHandlers({
+        pluginId: "test.plugin",
+        capabilities: [],
+        services: {} as HostServices,
+      }),
+    });
+
+    try {
+      await handle.start();
+      await expect(handle.call("getData", {
+        key: "probe",
+        companyId: "company-1",
+        params: { mode: "echo", requestedCompanyId: "company-1" },
+      } as HostToWorkerMethods["getData"][0])).rejects.toMatchObject({
+        code: PLUGIN_RPC_ERROR_CODES.CAPABILITY_DENIED,
+        data: undefined,
+      });
     } finally {
       await handle.stop().catch(() => undefined);
     }

@@ -44,8 +44,10 @@ import {
   encodeChannelBytes,
   decodeChannelBytes,
 } from "@paperclipai/plugin-sdk";
+import { HttpError } from "../errors.js";
 import type {
   JsonRpcId,
+  PluginHostErrorData,
   PluginInvocationContext,
   PluginInvocationScope,
   JsonRpcResponse,
@@ -1062,6 +1064,13 @@ export function createPluginWorkerHandle(
       return;
     }
     childProcess.stdin.write(serialized);
+  }
+
+  /** Structured fields for the worker's PluginHostError; only HTTP errors carry them. */
+  function hostErrorData(err: unknown): PluginHostErrorData | undefined {
+    if (!(err instanceof HttpError)) return undefined;
+    const code = (err.details as { code?: unknown } | null | undefined)?.code;
+    return { code: typeof code === "string" ? code : null, status: err.status, details: err.details ?? null };
   }
 
   function errorCodeForWorkerHostError(err: unknown): number {
@@ -2794,6 +2803,7 @@ export function createPluginWorkerHandle(
             request.id,
             errorCodeForWorkerHostError(err),
             errorMessage,
+            hostErrorData(err),
           ),
         );
       } catch {

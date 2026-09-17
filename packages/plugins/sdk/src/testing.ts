@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { pluginOperationIssueOriginKind } from "@paperclipai/shared";
+import { JSONRPC_ERROR_CODES, PLUGIN_RPC_ERROR_CODES, PluginHostError, type PluginHostErrorData } from "./protocol.js";
 import type {
   PaperclipPluginManifestV1,
   PluginCapability,
@@ -457,7 +458,15 @@ function allowsEvent(filter: EventFilter | undefined, event: PluginEvent): boole
 
 function requireCapability(manifest: PaperclipPluginManifestV1, allowed: Set<PluginCapability>, capability: PluginCapability) {
   if (allowed.has(capability)) return;
-  throw new Error(`Plugin '${manifest.id}' is missing required capability '${capability}' in test harness`);
+  throw new PluginHostError({
+    code: PLUGIN_RPC_ERROR_CODES.CAPABILITY_DENIED,
+    message: `Plugin '${manifest.id}' is missing required capability '${capability}' in test harness`,
+  });
+}
+
+/** A host HTTP failure as the worker receives it across the bridge. */
+function hostHttpError(message: string, data: PluginHostErrorData): PluginHostError {
+  return new PluginHostError({ code: JSONRPC_ERROR_CODES.INTERNAL_ERROR, message, data });
 }
 
 function requireCompanyId(companyId?: string): string {
@@ -2072,9 +2081,17 @@ export function createTestHarness(options: TestHarnessOptions): TestHarness {
       async reviewCase(caseId, input, companyId) {
         requireCapability(manifest, capabilitySet, "pipeline.cases.review");
         const pipelineCase = pipelineCases.get(caseId);
-        if (!pipelineCase || pipelineCase.companyId !== companyId) throw new Error(`Pipeline case not found: ${caseId}`);
-        if (pipelineCase.stageKind !== "review") throw new Error("Pipeline case is not in a review stage");
-        if (pipelineCase.version !== input.expectedVersion) throw new Error("Pipeline case version conflict");
+        if (!pipelineCase || pipelineCase.companyId !== companyId) {
+          throw hostHttpError(`Pipeline case not found: ${caseId}`, { code: null, status: 404, details: null });
+        }
+        if (pipelineCase.stageKind !== "review") {
+          const details = { code: "validation" };
+          throw hostHttpError("Pipeline case is not in a review stage", { code: "validation", status: 422, details });
+        }
+        if (pipelineCase.version !== input.expectedVersion) {
+          const details = { code: "version_conflict", version: pipelineCase.version, stage: { id: pipelineCase.stageId } };
+          throw hostHttpError("Pipeline case version conflict", { code: "version_conflict", status: 409, details });
+        }
         // The harness does not model stage transitions or approver rules.
         if (input.fields !== undefined) pipelineCase.fields = { ...input.fields };
         pipelineCase.version += 1;

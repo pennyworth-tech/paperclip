@@ -132,7 +132,7 @@ import {
   isJsonRpcSuccessResponse,
   isJsonRpcErrorResponse,
   JsonRpcParseError,
-  JsonRpcCallError,
+  PluginHostError,
   encodeChannelBytes,
 } from "./protocol.js";
 
@@ -407,7 +407,7 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
       const timer = setTimeout(() => {
         settle(
           reject,
-          new JsonRpcCallError({
+          new PluginHostError({
             code: PLUGIN_RPC_ERROR_CODES.TIMEOUT,
             message: `Worker→host call "${method}" timed out after ${timeout}ms`,
           }),
@@ -419,7 +419,7 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
           if (isJsonRpcSuccessResponse(response)) {
             settle(resolve, response.result as WorkerToHostMethods[M][1]);
           } else if (isJsonRpcErrorResponse(response)) {
-            settle(reject, new JsonRpcCallError(response.error));
+            settle(reject, new PluginHostError(response.error));
           } else {
             settle(reject, new Error(`Unexpected response format for "${method}"`));
           }
@@ -1602,7 +1602,9 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
       // METHOD_NOT_FOUND, METHOD_NOT_IMPLEMENTED) — fall back to
       // WORKER_ERROR for untyped exceptions.
       const errorCode =
-        typeof (err as any)?.code === "number"
+        err instanceof PluginHostError
+          ? err.rpcCode
+          : typeof (err as any)?.code === "number"
           ? (err as any).code
           : PLUGIN_RPC_ERROR_CODES.WORKER_ERROR;
 
