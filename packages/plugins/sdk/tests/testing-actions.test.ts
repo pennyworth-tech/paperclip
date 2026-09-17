@@ -152,3 +152,44 @@ describe("createTestHarness issue interactions", () => {
     });
   });
 });
+
+describe("createTestHarness host errors", () => {
+  const pipelineCase = {
+    id: "case-1",
+    companyId: "company-a",
+    pipelineId: "pipeline-1",
+    caseKey: "C-1",
+    title: "Case",
+    summary: null,
+    fields: {},
+    version: 2,
+    stageId: "stage-review",
+    stageKey: "review",
+    stageKind: "review",
+    terminalKind: null,
+    retiredAt: null,
+    issueLinks: [],
+  };
+  const review = { decision: "approve" as const, expectedVersion: 1, actorAgentId: "agent-1", actorRunId: "run-1" };
+
+  it("refuses a missing capability with code capability_denied", async () => {
+    const harness = createTestHarness({ manifest });
+    harness.seed({ pipelineCases: [pipelineCase] });
+    await expect(harness.ctx.pipelines.reviewCase("case-1", review, "company-a")).rejects.toMatchObject({
+      name: "PluginHostError",
+      code: "capability_denied",
+      status: null,
+    });
+  });
+
+  it("refuses a stale expectedVersion with code version_conflict and status 409", async () => {
+    const harness = createTestHarness({ manifest: { ...manifest, capabilities: ["pipeline.cases.review"] } });
+    harness.seed({ pipelineCases: [pipelineCase] });
+    await expect(harness.ctx.pipelines.reviewCase("case-1", review, "company-a")).rejects.toMatchObject({
+      name: "PluginHostError",
+      code: "version_conflict",
+      status: 409,
+      message: "Pipeline case version conflict",
+    });
+  });
+});

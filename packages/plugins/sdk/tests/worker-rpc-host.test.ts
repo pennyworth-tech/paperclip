@@ -16,7 +16,9 @@ import {
   isJsonRpcResponse,
   isJsonRpcNotification,
   parseMessage,
+  JSONRPC_ERROR_CODES,
   PLUGIN_RPC_ERROR_CODES,
+  PluginHostError,
   serializeMessage,
   type JsonRpcNotification,
   type JsonRpcResponse,
@@ -1095,6 +1097,108 @@ describe("worker duplex channel dispatch", () => {
     } finally {
       worker.stop();
       hostReadline.close();
+    }
+  });
+});
+
+describe("worker→host structured errors", () => {
+  it("surfaces the host's machine code and HTTP status on PluginHostError", async () => {
+    const hostToWorker = new PassThrough();
+    const workerToHost = new PassThrough();
+    const hostReadline = createInterface({ input: workerToHost });
+    const pending = new Map<string, (response: JsonRpcResponse) => void>();
+    let nextRequestId = 1;
+    const captured: Record<string, unknown> = {};
+    const capture = (err: unknown) => {
+      const e = err as PluginHostError;
+      return { isHostError: e instanceof PluginHostError, code: e.code, status: e.status, details: e.details, message: e.message };
+    };
+    const plugin = definePlugin({
+      async setup(ctx) {
+        ctx.actions.register("probe", async () => {
+          await ctx.pipelines
+            .reviewCase("case-1", { decision: "approve", expectedVersion: 1, actorAgentId: "a", actorRunId: "r" }, "company-a")
+            .catch((err) => { captured.review = capture(err); });
+          await ctx.companies.get("company-a").catch((err) => { captured.company = capture(err); });
+          return null;
+        });
+      },
+    });
+    const worker = startWorkerRpcHost({ plugin, stdin: hostToWorker, stdout: workerToHost });
+
+    function callWorker(method: string, params: unknown) {
+      const id = `host-${nextRequestId++}`;
+      const result = new Promise<unknown>((resolve, reject) => {
+        pending.set(id, (response) => {
+          if ("error" in response && response.error) return reject(new Error(response.error.message));
+          resolve((response as { result?: unknown }).result);
+        });
+      });
+      hostToWorker.write(serializeMessage(createRequest(method, params, id)));
+      return result;
+    }
+
+    hostReadline.on("line", (line) => {
+      const message = parseMessage(line);
+      if (isJsonRpcResponse(message)) {
+        pending.get(String(message.id))?.(message);
+        pending.delete(String(message.id));
+        return;
+      }
+      if (!isJsonRpcRequest(message)) return;
+      if (message.method === "pipelines.cases.review") {
+        hostToWorker.write(serializeMessage(createErrorResponse(
+          message.id,
+          JSONRPC_ERROR_CODES.INTERNAL_ERROR,
+          "Stage approval requires the case's linked reviewer",
+          { code: "review_required", status: 403, details: { code: "review_required" } },
+        )));
+      } else if (message.method === "companies.get") {
+        hostToWorker.write(serializeMessage(createErrorResponse(
+          message.id,
+          PLUGIN_RPC_ERROR_CODES.CAPABILITY_DENIED,
+          "missing capability",
+        )));
+      }
+    });
+
+    try {
+      await callWorker("initialize", {
+        manifest: {
+          id: "paperclip.host-error-test",
+          apiVersion: 1,
+          version: "1.0.0",
+          displayName: "Host error test",
+          description: "Test plugin",
+          author: "Paperclip",
+          categories: ["automation"],
+          capabilities: [],
+          entrypoints: {},
+        },
+        config: {},
+        databaseNamespace: null,
+      });
+      await callWorker("performAction", { key: "probe", params: {} });
+
+      expect(captured.review).toEqual({
+        isHostError: true,
+        code: "review_required",
+        status: 403,
+        details: { code: "review_required" },
+        message: "Stage approval requires the case's linked reviewer",
+      });
+      expect(captured.company).toEqual({
+        isHostError: true,
+        code: "capability_denied",
+        status: null,
+        details: null,
+        message: "missing capability",
+      });
+    } finally {
+      worker.stop();
+      hostReadline.close();
+      hostToWorker.destroy();
+      workerToHost.destroy();
     }
   });
 });
