@@ -272,11 +272,39 @@ describeEmbeddedPostgres("pipelineService", () => {
         caseId: created.case.id,
         toStageKey: "done",
         expectedVersion: created.case.version,
-        actor: userActor,
+        actor: { type: "agent", agentId: reviewerA.id, runId: randomUUID() },
       })).rejects.toMatchObject({ status: 403, details: { code: "review_required" } });
 
       expect(await eventCount(created.case.id)).toBe(before);
       expect(await reviewDecidedEvents(created.case.id)).toHaveLength(0);
+    });
+
+    it("does not authorize the assignee of a closed review issue", async () => {
+      const { company, created, reviewerA } = await seedLinkedReviewerCase();
+      await seedLinkedIssue({ companyId: company.id, caseId: created.case.id, role: "review", assigneeAgentId: reviewerA.id, status: "cancelled" });
+
+      await expect(svc.reviewCase({
+        companyId: company.id,
+        caseId: created.case.id,
+        decision: "approve",
+        expectedVersion: created.case.version,
+        actor: { type: "agent", agentId: reviewerA.id, runId: randomUUID() },
+      })).rejects.toMatchObject({ status: 403, details: { code: "review_required", approver: { kind: "linked_reviewer", id: null } } });
+      expect(await reviewDecidedEvents(created.case.id)).toHaveLength(0);
+    });
+
+    it("lets a board user decide when no reviewer is linked", async () => {
+      const { company, created } = await seedLinkedReviewerCase();
+
+      const result = await svc.reviewCase({
+        companyId: company.id,
+        caseId: created.case.id,
+        decision: "approve",
+        expectedVersion: created.case.version,
+        actor: userActor,
+      });
+
+      expect(result.reviewEvent).toMatchObject({ type: "review_decided", actorType: "user" });
     });
   });
 

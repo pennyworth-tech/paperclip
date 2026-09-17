@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
-import { and, asc, desc, eq, inArray, isNotNull, isNull, ne, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, isNotNull, isNull, ne, notInArray, or, sql } from "drizzle-orm";
 import { alias } from "drizzle-orm/pg-core";
 import type { Db } from "@paperclipai/db";
 import {
@@ -1093,12 +1093,16 @@ async function assertActorCanApproveStageExit(
         eq(pipelineCaseIssueLinks.role, "review"),
         isNull(pipelineCaseIssueLinks.retiredAt),
         eq(issues.companyId, pipelineCase.companyId),
+        notInArray(issues.status, ["done", "cancelled"]),
       ))
       .orderBy(desc(pipelineCaseIssueLinks.createdAt), desc(pipelineCaseIssueLinks.id))
       .limit(1)
       .then((rows) => rows[0] ?? null);
     const reviewerAgentId = reviewLink?.assigneeAgentId ?? null;
     if (reviewerAgentId && actor.type === "agent" && actor.agentId === reviewerAgentId) return;
+    // A board user may always move the case: the gate exists to keep other agents out, and a
+    // case whose review issue is unassigned, closed or retired must not be stuck for good.
+    if (actor.type === "user") return;
     throw new HttpError(403, "Stage approval requires the case's linked reviewer", {
       code: "review_required",
       approver: { kind: "linked_reviewer", id: reviewerAgentId },
