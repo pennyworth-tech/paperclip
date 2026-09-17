@@ -79,6 +79,7 @@ import { request as httpRequest } from "node:http";
 import { request as httpsRequest } from "node:https";
 import { isIP } from "node:net";
 import { logger } from "../middleware/logger.js";
+import { forbidden, notFound, unprocessable } from "../errors.js";
 import { getTelemetryClient } from "../telemetry.js";
 import { accessService } from "./access.js";
 import { authorizationService, type AuthorizationActor } from "./authorization.js";
@@ -1071,7 +1072,7 @@ export function buildHostServices(
       .where(eq(agentsTable.id, agentId))
       .limit(1);
     if (!agent || agent.companyId !== companyId) {
-      throw new Error(`actorAgentId "${agentId}" does not belong to this company`);
+      throw forbidden(`actorAgentId "${agentId}" does not belong to this company`, { code: "actor_run_mismatch" });
     }
     const [run] = await db
       .select({ companyId: heartbeatRuns.companyId, agentId: heartbeatRuns.agentId })
@@ -1079,10 +1080,10 @@ export function buildHostServices(
       .where(eq(heartbeatRuns.id, runId))
       .limit(1);
     if (!run || run.companyId !== companyId) {
-      throw new Error(`actorRunId "${runId}" does not belong to this company`);
+      throw forbidden(`actorRunId "${runId}" does not belong to this company`, { code: "actor_run_mismatch" });
     }
     if (run.agentId !== agentId) {
-      throw new Error(`actorRunId "${runId}" does not belong to actorAgentId "${agentId}"`);
+      throw forbidden(`actorRunId "${runId}" does not belong to actorAgentId "${agentId}"`, { code: "actor_run_mismatch" });
     }
   };
 
@@ -2820,10 +2821,10 @@ export function buildHostServices(
           .from(pipelineCases)
           .where(and(eq(pipelineCases.id, params.caseId), eq(pipelineCases.companyId, companyId)))
           .limit(1);
-        if (!pipelineCase) throw new Error("Pipeline case not found");
+        if (!pipelineCase) throw notFound("Pipeline case not found", { code: "case_not_found" });
         const issue = requireInCompany("Issue", await issues.getById(params.issueId), companyId);
         if (Boolean(params.actorAgentId) !== Boolean(params.actorRunId)) {
-          throw new Error("actorAgentId and actorRunId must be supplied together");
+          throw unprocessable("actorAgentId and actorRunId must be supplied together", { code: "actor_required" });
         }
         if (params.actorAgentId && params.actorRunId) {
           await requireAgentRunInCompany(companyId, params.actorAgentId, params.actorRunId);
@@ -2854,9 +2855,15 @@ export function buildHostServices(
         const companyId = ensureCompanyId(params.companyId);
         await ensurePluginAvailableForCompany(companyId);
         if (!params.actorAgentId || !params.actorRunId) {
-          throw new Error("actorAgentId and actorRunId are required to record a review decision");
+          throw unprocessable("actorAgentId and actorRunId are required to record a review decision", { code: "actor_required" });
         }
         await requireAgentRunInCompany(companyId, params.actorAgentId, params.actorRunId);
+        const [pipelineCase] = await db
+          .select({ id: pipelineCases.id })
+          .from(pipelineCases)
+          .where(and(eq(pipelineCases.id, params.caseId), eq(pipelineCases.companyId, companyId)))
+          .limit(1);
+        if (!pipelineCase) throw notFound("Pipeline case not found", { code: "case_not_found" });
         // The pipeline service applies the stage's approver rule (including
         // linked_reviewer) to this agent actor exactly as the REST route does.
         const result = await pipelineSvc.reviewCase({

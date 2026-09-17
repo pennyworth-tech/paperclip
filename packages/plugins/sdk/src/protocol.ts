@@ -2614,7 +2614,7 @@ export class JsonRpcParseError extends Error {
  * Captures the full `JsonRpcError` so callers can inspect the code and data.
  */
 export class JsonRpcCallError extends Error {
-  override readonly name = "JsonRpcCallError";
+  override readonly name: string = "JsonRpcCallError";
   /** The JSON-RPC error code. */
   readonly code: number;
   /** Optional structured error data from the response. */
@@ -2628,10 +2628,14 @@ export class JsonRpcCallError extends Error {
 }
 
 /**
- * Structured failure fields the host attaches as `error.data` when a
- * worker→host call fails. `code` is the host's machine code (e.g. an HTTP
- * error's `details.code` such as `"review_required"`), `status` its HTTP
- * status when the failure was an HTTP error.
+ * Structured failure fields carried as JSON-RPC `error.data`: by the host when
+ * a worker→host call fails, and by the worker when a handler rethrows a
+ * `PluginHostError` (or any error with `hostCode` / `status` / `details`).
+ * `code` is the machine code (e.g. an HTTP error's `details.code` such as
+ * `"review_required"`, or a network error's `cause.code` such as
+ * `"ECONNRESET"`), `status` the HTTP status when the failure was an HTTP
+ * error. For non-HTTP host failures `details` is `{ name }` (e.g.
+ * `"AbortError"`, `"TimeoutError"`).
  */
 export interface PluginHostErrorData {
   code: string | null;
@@ -2648,24 +2652,24 @@ const HOST_ERROR_CODES_BY_RPC_CODE: Readonly<Record<number, string>> = {
 
 /**
  * Error a plugin worker receives when a host service call (`ctx.*`) fails.
- * Branch on `code` / `status`; `message` is for humans only.
+ *
+ * A `JsonRpcCallError`: `code` is still the numeric JSON-RPC error code and
+ * `data` the raw `error.data`. The structured host fields live on `hostCode`,
+ * `status` and `details`. Branch on those; `message` is for humans only.
  */
-export class PluginHostError extends Error {
-  override readonly name = "PluginHostError";
-  /** Machine code, e.g. `"review_required"`, `"version_conflict"`, `"capability_denied"`; null when the host gave none. */
-  readonly code: string | null;
+export class PluginHostError extends JsonRpcCallError {
+  override readonly name: string = "PluginHostError";
+  /** Host machine code, e.g. `"review_required"`, `"version_conflict"`, `"capability_denied"`; null when the host gave none. */
+  readonly hostCode: string | null;
   /** HTTP status of the host-side failure, or null when it was not an HTTP error. */
   readonly status: number | null;
   /** The host error's structured details, or null. */
   readonly details: unknown;
-  /** The JSON-RPC error code of the response. */
-  readonly rpcCode: number;
 
   constructor(error: JsonRpcError) {
-    super(error.message);
+    super(error);
     const data = (error.data ?? {}) as Partial<PluginHostErrorData>;
-    this.rpcCode = error.code;
-    this.code = typeof data.code === "string" ? data.code : HOST_ERROR_CODES_BY_RPC_CODE[error.code] ?? null;
+    this.hostCode = typeof data.code === "string" ? data.code : HOST_ERROR_CODES_BY_RPC_CODE[error.code] ?? null;
     this.status = typeof data.status === "number" ? data.status : null;
     this.details = data.details ?? null;
   }

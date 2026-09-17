@@ -2061,7 +2061,10 @@ export function createTestHarness(options: TestHarnessOptions): TestHarness {
       async createReviewLink(caseId, input, companyId) {
         requireCapability(manifest, capabilitySet, "pipeline.cases.links.write");
         const pipelineCase = pipelineCases.get(caseId);
-        if (!pipelineCase || pipelineCase.companyId !== companyId) throw new Error(`Pipeline case not found: ${caseId}`);
+        if (!pipelineCase || pipelineCase.companyId !== companyId) {
+          const details = { code: "case_not_found" };
+          throw hostHttpError(`Pipeline case not found: ${caseId}`, { code: "case_not_found", status: 404, details });
+        }
         const issue = issues.get(input.issueId);
         if (!issue || issue.companyId !== companyId) throw new Error(`Issue not found: ${input.issueId}`);
         const link = {
@@ -2082,7 +2085,8 @@ export function createTestHarness(options: TestHarnessOptions): TestHarness {
         requireCapability(manifest, capabilitySet, "pipeline.cases.review");
         const pipelineCase = pipelineCases.get(caseId);
         if (!pipelineCase || pipelineCase.companyId !== companyId) {
-          throw hostHttpError(`Pipeline case not found: ${caseId}`, { code: null, status: 404, details: null });
+          const details = { code: "case_not_found" };
+          throw hostHttpError(`Pipeline case not found: ${caseId}`, { code: "case_not_found", status: 404, details });
         }
         if (pipelineCase.stageKind !== "review") {
           const details = { code: "validation" };

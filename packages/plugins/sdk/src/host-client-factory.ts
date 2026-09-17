@@ -553,8 +553,9 @@ const METHOD_CAPABILITY_MAP: Record<WorkerToHostMethodName, PluginCapability | n
  *
  * If a capability check fails, the handler throws a `CapabilityDeniedError`
  * with code `CAPABILITY_DENIED`. The worker manager catches this and sends a
- * JSON-RPC error response to the worker, which surfaces as a `JsonRpcCallError`
- * in the plugin's SDK client.
+ * JSON-RPC error response to the worker, which surfaces as a `PluginHostError`
+ * (a `JsonRpcCallError` with `hostCode` `"capability_denied"`) in the plugin's
+ * SDK client.
  *
  * @param options - Plugin ID, capabilities, and service adapters
  * @returns A handler map suitable for `WorkerStartOptions.hostHandlers`

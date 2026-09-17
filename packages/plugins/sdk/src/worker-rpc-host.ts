@@ -109,6 +109,7 @@ import type {
   PluginDuplexChannelStopParams,
   PluginDuplexChannelCloseParams,
   PluginInvocationContext,
+  PluginHostErrorData,
   WorkerToHostMethodName,
   WorkerToHostMethods,
 } from "./protocol.js";
@@ -1602,14 +1603,28 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
       // METHOD_NOT_FOUND, METHOD_NOT_IMPLEMENTED) — fall back to
       // WORKER_ERROR for untyped exceptions.
       const errorCode =
-        err instanceof PluginHostError
-          ? err.rpcCode
-          : typeof (err as any)?.code === "number"
+        typeof (err as any)?.code === "number"
           ? (err as any).code
           : PLUGIN_RPC_ERROR_CODES.WORKER_ERROR;
 
-      sendMessage(createErrorResponse(id, errorCode, errorMessage));
+      sendMessage(createErrorResponse(id, errorCode, errorMessage, hostErrorDataOf(err)));
     }
+  }
+
+  /**
+   * Structured fields of a rethrown host failure (a `PluginHostError`, or any
+   * error carrying `hostCode` / `status` / `details`), so the host sees them
+   * as `error.data` instead of only the message.
+   */
+  function hostErrorDataOf(err: unknown): PluginHostErrorData | undefined {
+    if (typeof err !== "object" || err === null) return undefined;
+    const { hostCode, status, details } = err as { hostCode?: unknown; status?: unknown; details?: unknown };
+    if (hostCode === undefined && status === undefined && details === undefined) return undefined;
+    return {
+      code: typeof hostCode === "string" ? hostCode : null,
+      status: typeof status === "number" ? status : null,
+      details: details ?? null,
+    };
   }
 
   /**

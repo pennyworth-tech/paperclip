@@ -18,6 +18,7 @@ import {
   parseMessage,
   JSONRPC_ERROR_CODES,
   PLUGIN_RPC_ERROR_CODES,
+  JsonRpcCallError,
   PluginHostError,
   serializeMessage,
   type JsonRpcNotification,
@@ -1102,40 +1103,24 @@ describe("worker duplex channel dispatch", () => {
 });
 
 describe("worker→host structured errors", () => {
-  it("surfaces the host's machine code and HTTP status on PluginHostError", async () => {
+  const reviewInput = { decision: "approve" as const, expectedVersion: 1, actorAgentId: "a", actorRunId: "r" };
+
+  async function withWorker(
+    plugin: ReturnType<typeof definePlugin>,
+    run: (callWorker: (method: string, params: unknown) => Promise<JsonRpcResponse>) => Promise<void>,
+  ) {
     const hostToWorker = new PassThrough();
     const workerToHost = new PassThrough();
     const hostReadline = createInterface({ input: workerToHost });
     const pending = new Map<string, (response: JsonRpcResponse) => void>();
     let nextRequestId = 1;
-    const captured: Record<string, unknown> = {};
-    const capture = (err: unknown) => {
-      const e = err as PluginHostError;
-      return { isHostError: e instanceof PluginHostError, code: e.code, status: e.status, details: e.details, message: e.message };
-    };
-    const plugin = definePlugin({
-      async setup(ctx) {
-        ctx.actions.register("probe", async () => {
-          await ctx.pipelines
-            .reviewCase("case-1", { decision: "approve", expectedVersion: 1, actorAgentId: "a", actorRunId: "r" }, "company-a")
-            .catch((err) => { captured.review = capture(err); });
-          await ctx.companies.get("company-a").catch((err) => { captured.company = capture(err); });
-          return null;
-        });
-      },
-    });
     const worker = startWorkerRpcHost({ plugin, stdin: hostToWorker, stdout: workerToHost });
 
     function callWorker(method: string, params: unknown) {
       const id = `host-${nextRequestId++}`;
-      const result = new Promise<unknown>((resolve, reject) => {
-        pending.set(id, (response) => {
-          if ("error" in response && response.error) return reject(new Error(response.error.message));
-          resolve((response as { result?: unknown }).result);
-        });
-      });
+      const response = new Promise<JsonRpcResponse>((resolve) => pending.set(id, resolve));
       hostToWorker.write(serializeMessage(createRequest(method, params, id)));
-      return result;
+      return response;
     }
 
     hostReadline.on("line", (line) => {
@@ -1163,7 +1148,7 @@ describe("worker→host structured errors", () => {
     });
 
     try {
-      await callWorker("initialize", {
+      const init = await callWorker("initialize", {
         manifest: {
           id: "paperclip.host-error-test",
           apiVersion: 1,
@@ -1178,27 +1163,95 @@ describe("worker→host structured errors", () => {
         config: {},
         databaseNamespace: null,
       });
-      await callWorker("performAction", { key: "probe", params: {} });
-
-      expect(captured.review).toEqual({
-        isHostError: true,
-        code: "review_required",
-        status: 403,
-        details: { code: "review_required" },
-        message: "Stage approval requires the case's linked reviewer",
-      });
-      expect(captured.company).toEqual({
-        isHostError: true,
-        code: "capability_denied",
-        status: null,
-        details: null,
-        message: "missing capability",
-      });
+      expect(init).not.toHaveProperty("error");
+      await run(callWorker);
     } finally {
       worker.stop();
       hostReadline.close();
       hostToWorker.destroy();
       workerToHost.destroy();
     }
+  }
+
+  it("surfaces the host's machine code and HTTP status on PluginHostError", async () => {
+    const captured: Record<string, unknown> = {};
+    const capture = (err: unknown) => {
+      const e = err as PluginHostError;
+      return {
+        isHostError: e instanceof PluginHostError,
+        isCallError: e instanceof JsonRpcCallError,
+        code: e.code,
+        data: e.data,
+        hostCode: e.hostCode,
+        status: e.status,
+        details: e.details,
+        message: e.message,
+      };
+    };
+    const plugin = definePlugin({
+      async setup(ctx) {
+        ctx.actions.register("probe", async () => {
+          await ctx.pipelines
+            .reviewCase("case-1", reviewInput, "company-a")
+            .catch((err) => { captured.review = capture(err); });
+          await ctx.companies.get("company-a").catch((err) => { captured.company = capture(err); });
+          return null;
+        });
+      },
+    });
+
+    await withWorker(plugin, async (callWorker) => {
+      await callWorker("performAction", { key: "probe", params: {} });
+
+      expect(captured.review).toEqual({
+        isHostError: true,
+        isCallError: true,
+        code: JSONRPC_ERROR_CODES.INTERNAL_ERROR,
+        data: { code: "review_required", status: 403, details: { code: "review_required" } },
+        hostCode: "review_required",
+        status: 403,
+        details: { code: "review_required" },
+        message: "Stage approval requires the case's linked reviewer",
+      });
+      expect(captured.company).toEqual({
+        isHostError: true,
+        isCallError: true,
+        code: PLUGIN_RPC_ERROR_CODES.CAPABILITY_DENIED,
+        data: undefined,
+        hostCode: "capability_denied",
+        status: null,
+        details: null,
+        message: "missing capability",
+      });
+    });
+  });
+
+  it("returns a rethrown host error's code, status and details to the host as error data", async () => {
+    const plugin = definePlugin({
+      async setup(ctx) {
+        ctx.actions.register("rethrow", async () => {
+          await ctx.pipelines.reviewCase("case-1", reviewInput, "company-a");
+          return null;
+        });
+        ctx.actions.register("plain", async () => {
+          throw new Error("plain failure");
+        });
+      },
+    });
+
+    await withWorker(plugin, async (callWorker) => {
+      const rethrown = await callWorker("performAction", { key: "rethrow", params: {} });
+      expect(rethrown).toMatchObject({
+        error: {
+          code: JSONRPC_ERROR_CODES.INTERNAL_ERROR,
+          message: "Stage approval requires the case's linked reviewer",
+          data: { code: "review_required", status: 403, details: { code: "review_required" } },
+        },
+      });
+
+      const plain = await callWorker("performAction", { key: "plain", params: {} });
+      expect(plain).toMatchObject({ error: { code: PLUGIN_RPC_ERROR_CODES.WORKER_ERROR, message: "plain failure" } });
+      expect((plain as { error: { data?: unknown } }).error.data).toBeUndefined();
+    });
   });
 });

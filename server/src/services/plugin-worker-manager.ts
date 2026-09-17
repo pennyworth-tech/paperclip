@@ -1066,11 +1066,22 @@ export function createPluginWorkerHandle(
     childProcess.stdin.write(serialized);
   }
 
-  /** Structured fields for the worker's PluginHostError; only HTTP errors carry them. */
+  /**
+   * Structured fields for the worker's PluginHostError. An HttpError gives its
+   * `details.code`, status and details; any other Error (e.g. a ctx.http.fetch
+   * socket, abort or timeout failure) gives its string `cause.code` / `code`
+   * and `{ name }`, so the worker can tell them apart without the message.
+   */
   function hostErrorData(err: unknown): PluginHostErrorData | undefined {
-    if (!(err instanceof HttpError)) return undefined;
-    const code = (err.details as { code?: unknown } | null | undefined)?.code;
-    return { code: typeof code === "string" ? code : null, status: err.status, details: err.details ?? null };
+    if (err instanceof HttpError) {
+      const code = (err.details as { code?: unknown } | null | undefined)?.code;
+      return { code: typeof code === "string" ? code : null, status: err.status, details: err.details ?? null };
+    }
+    if (!(err instanceof Error)) return undefined;
+    const causeCode = (err.cause as { code?: unknown } | null | undefined)?.code;
+    const ownCode = (err as { code?: unknown }).code;
+    const code = typeof causeCode === "string" ? causeCode : typeof ownCode === "string" ? ownCode : null;
+    return { code, status: null, details: { name: err.name } };
   }
 
   function errorCodeForWorkerHostError(err: unknown): number {

@@ -339,6 +339,54 @@ describe("plugin-worker-manager stderr failure context", () => {
     }
   });
 
+  it.each([
+    {
+      label: "a socket failure by its cause code",
+      error: () => new TypeError("fetch failed", { cause: Object.assign(new Error("read ECONNRESET"), { code: "ECONNRESET" }) }),
+      data: { code: "ECONNRESET", status: null, details: { name: "TypeError" } },
+    },
+    {
+      label: "an abort by its name",
+      error: () => new DOMException("This operation was aborted", "AbortError"),
+      data: { code: null, status: null, details: { name: "AbortError" } },
+    },
+    {
+      label: "a timeout by its name",
+      error: () => new DOMException("The operation timed out", "TimeoutError"),
+      data: { code: null, status: null, details: { name: "TimeoutError" } },
+    },
+    {
+      label: "an error with its own string code",
+      error: () => Object.assign(new Error("connect ECONNREFUSED"), { code: "ECONNREFUSED" }),
+      data: { code: "ECONNREFUSED", status: null, details: { name: "Error" } },
+    },
+  ])("sends $label to the worker as error data", async ({ error, data }) => {
+    const handle = createPluginWorkerHandle("test.plugin", {
+      entrypointPath: INVOCATION_SCOPE_WORKER_ENTRYPOINT,
+      manifest: TEST_MANIFEST,
+      config: {},
+      instanceInfo: { instanceId: "instance-1", hostVersion: "1.0.0" },
+      apiVersion: 1,
+      hostHandlers: {
+        "companies.get": async () => {
+          throw error();
+        },
+      },
+    });
+
+    try {
+      await handle.start();
+      // The fixture worker relays the host's error response verbatim.
+      await expect(handle.call("getData", {
+        key: "probe",
+        companyId: "company-1",
+        params: { mode: "echo", requestedCompanyId: "company-1" },
+      } as HostToWorkerMethods["getData"][0])).rejects.toMatchObject({ data });
+    } finally {
+      await handle.stop().catch(() => undefined);
+    }
+  });
+
   it("reports a capability refusal by its numeric CAPABILITY_DENIED code", async () => {
     const handle = createPluginWorkerHandle("test.plugin", {
       entrypointPath: INVOCATION_SCOPE_WORKER_ENTRYPOINT,
@@ -361,7 +409,7 @@ describe("plugin-worker-manager stderr failure context", () => {
         params: { mode: "echo", requestedCompanyId: "company-1" },
       } as HostToWorkerMethods["getData"][0])).rejects.toMatchObject({
         code: PLUGIN_RPC_ERROR_CODES.CAPABILITY_DENIED,
-        data: undefined,
+        data: { code: null, status: null, details: { name: "CapabilityDeniedError" } },
       });
     } finally {
       await handle.stop().catch(() => undefined);
