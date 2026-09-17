@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 
+import { JSONRPC_ERROR_CODES, JsonRpcCallError, PLUGIN_RPC_ERROR_CODES } from "../src/protocol.js";
 import { createTestHarness } from "../src/testing.js";
 import type { PaperclipPluginManifestV1 } from "../src/types.js";
 
@@ -175,9 +176,11 @@ describe("createTestHarness host errors", () => {
   it("refuses a missing capability with code capability_denied", async () => {
     const harness = createTestHarness({ manifest });
     harness.seed({ pipelineCases: [pipelineCase] });
+    await expect(harness.ctx.pipelines.reviewCase("case-1", review, "company-a")).rejects.toBeInstanceOf(JsonRpcCallError);
     await expect(harness.ctx.pipelines.reviewCase("case-1", review, "company-a")).rejects.toMatchObject({
       name: "PluginHostError",
-      code: "capability_denied",
+      code: PLUGIN_RPC_ERROR_CODES.CAPABILITY_DENIED,
+      hostCode: "capability_denied",
       status: null,
     });
   });
@@ -187,7 +190,8 @@ describe("createTestHarness host errors", () => {
     harness.seed({ pipelineCases: [pipelineCase] });
     await expect(harness.ctx.pipelines.reviewCase("case-1", review, "company-a")).rejects.toMatchObject({
       name: "PluginHostError",
-      code: "version_conflict",
+      code: JSONRPC_ERROR_CODES.INTERNAL_ERROR,
+      hostCode: "version_conflict",
       status: 409,
       message: "Pipeline case version conflict",
     });

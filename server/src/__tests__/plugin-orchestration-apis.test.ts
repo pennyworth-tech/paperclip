@@ -1509,18 +1509,52 @@ describeEmbeddedPostgres("plugin orchestration APIs", () => {
         expectedVersion: seeded.version,
         actorAgentId: seeded.reviewerAId,
         actorRunId: runB,
-      })).rejects.toThrow(`does not belong to actorAgentId "${seeded.reviewerAId}"`);
+      })).rejects.toMatchObject({ status: 403, details: { code: "actor_run_mismatch" } });
       await expect(services.pipelines.createReviewLink({
         caseId,
         companyId,
         issueId: seeded.reviewIssueId,
         actorAgentId: seeded.reviewerAId,
         actorRunId: runB,
-      })).rejects.toThrow("does not belong to actorAgentId");
+      })).rejects.toMatchObject({ status: 403, details: { code: "actor_run_mismatch" } });
 
       const [after] = await db.select().from(pipelineCases).where(eq(pipelineCases.id, caseId));
       expect(after!.version).toBe(seeded.version);
       expect(after!.stageId).toBe(seeded.reviewStage.id);
+      expect(await reviewDecidedCount(caseId)).toBe(0);
+    });
+
+    it("refuses a missing actor or unknown case with structured codes", async () => {
+      const seeded = await seedLinkedReviewerCase();
+      const { companyId, caseId } = seeded;
+      const services = buildHostServices(db, "plugin-record-id", "backlit.operations", createEventBusStub());
+      const runA = await seeded.runFor(seeded.reviewerAId);
+
+      await expect(services.pipelines.reviewCase({
+        caseId,
+        companyId,
+        decision: "approve",
+        expectedVersion: seeded.version,
+      } as Parameters<typeof services.pipelines.reviewCase>[0])).rejects.toMatchObject({ status: 422, details: { code: "actor_required" } });
+      await expect(services.pipelines.createReviewLink({
+        caseId,
+        companyId,
+        issueId: seeded.reviewIssueId,
+        actorAgentId: seeded.reviewerAId,
+      })).rejects.toMatchObject({ status: 422, details: { code: "actor_required" } });
+      await expect(services.pipelines.reviewCase({
+        caseId: randomUUID(),
+        companyId,
+        decision: "approve",
+        expectedVersion: seeded.version,
+        actorAgentId: seeded.reviewerAId,
+        actorRunId: runA,
+      })).rejects.toMatchObject({ status: 404, details: { code: "case_not_found" } });
+      await expect(services.pipelines.createReviewLink({
+        caseId: randomUUID(),
+        companyId,
+        issueId: seeded.reviewIssueId,
+      })).rejects.toMatchObject({ status: 404, details: { code: "case_not_found" } });
       expect(await reviewDecidedCount(caseId)).toBe(0);
     });
 
