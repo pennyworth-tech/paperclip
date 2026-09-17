@@ -3685,6 +3685,55 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
     });
   });
 
+  it("keeps a reuse_existing request and its workspace binding when isolated workspaces are off", async () => {
+    const companyId = randomUUID();
+    const projectId = randomUUID();
+    const executionWorkspaceId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await instanceSettingsService(db).updateExperimental({ enableIsolatedWorkspaces: false });
+    await db.insert(projects).values({ id: projectId, companyId, name: "Workspace project", status: "in_progress" });
+    await db.insert(executionWorkspaces).values({
+      id: executionWorkspaceId,
+      companyId,
+      projectId,
+      mode: "shared_workspace",
+      strategyType: "project_primary",
+      name: "Shared",
+      status: "active",
+      providerType: "local_fs",
+    });
+
+    const review = await svc.create(companyId, {
+      projectId,
+      title: "Review PR #601",
+      executionWorkspacePreference: "reuse_existing",
+      executionWorkspaceSettings: { mode: "isolated_workspace" },
+    });
+    expect(review.executionWorkspacePreference).toBe("reuse_existing");
+    expect(review.executionWorkspaceSettings).toBeNull();
+
+    // The heartbeat's post-run binding goes through the same update path.
+    const bound = await svc.update(review.id, {
+      executionWorkspaceId,
+      executionWorkspacePreference: "reuse_existing",
+      executionWorkspaceSettings: { mode: "shared_workspace" },
+    });
+    expect(bound?.executionWorkspaceId).toBe(executionWorkspaceId);
+    expect(bound?.executionWorkspacePreference).toBe("reuse_existing");
+
+    const isolated = await svc.create(companyId, {
+      projectId,
+      title: "Isolated",
+      executionWorkspacePreference: "isolated_workspace",
+    });
+    expect(isolated.executionWorkspacePreference).toBeNull();
+  });
+
   it("clamps helper-created child requestDepth to the safe maximum", async () => {
     const companyId = randomUUID();
     const projectId = randomUUID();

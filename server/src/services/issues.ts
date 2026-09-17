@@ -7543,8 +7543,13 @@ export function issueService(db: Db) {
       } = data;
       const isolatedWorkspacesEnabled = (await instanceSettings.getExperimental()).enableIsolatedWorkspaces;
       if (!isolatedWorkspacesEnabled) {
-        delete issueData.executionWorkspaceId;
-        delete issueData.executionWorkspacePreference;
+        // `reuse_existing` is a resume request, not an isolation mode: the
+        // heartbeat binds it to the run's persisted workspace through this
+        // same update, so stripping it made workspace reuse unreachable.
+        if (issueData.executionWorkspacePreference !== "reuse_existing") {
+          delete issueData.executionWorkspaceId;
+          delete issueData.executionWorkspacePreference;
+        }
         delete issueData.executionWorkspaceSettings;
       }
       if (data.assigneeAgentId && data.assigneeUserId) {
@@ -8165,8 +8170,13 @@ export function issueService(db: Db) {
       } = data;
       const isolatedWorkspacesEnabled = (await instanceSettings.getExperimental()).enableIsolatedWorkspaces;
       if (!isolatedWorkspacesEnabled) {
-        delete issueData.executionWorkspaceId;
-        delete issueData.executionWorkspacePreference;
+        // `reuse_existing` is a resume request, not an isolation mode: the
+        // heartbeat binds it to the run's persisted workspace through this
+        // same update, so stripping it made workspace reuse unreachable.
+        if (issueData.executionWorkspacePreference !== "reuse_existing") {
+          delete issueData.executionWorkspaceId;
+          delete issueData.executionWorkspacePreference;
+        }
         delete issueData.executionWorkspaceSettings;
       }
 
