@@ -55,6 +55,8 @@ import type {
   PluginEvent,
   PluginIssueCheckoutOwnership,
   PluginPipelineCase,
+  PluginPipelineCaseDocument,
+  PluginPipelineCaseDocumentWrite,
   PluginPipelineCaseIssueLink,
   PluginPipelineReviewDecision,
   PluginPipelineReviewResult,
@@ -2051,6 +2053,27 @@ export interface WorkerToHostMethods {
   "pipelines.cases.get": [
     params: { caseId: string; companyId: string },
     result: PluginPipelineCase | null,
+  ];
+  "pipelines.cases.getDocument": [
+    params: { caseId: string; companyId: string; key: string },
+    result: PluginPipelineCaseDocument | null,
+  ];
+  "pipelines.cases.putDocument": [
+    params: {
+      caseId: string;
+      companyId: string;
+      key: string;
+      body: string;
+      title?: string;
+      format?: string;
+      changeSummary?: string | null;
+      /**
+       * Omit to create; on an existing document this must be the latest
+       * revision id or the host refuses with `stale_base_revision`.
+       */
+      baseRevisionId?: string | null;
+    },
+    result: PluginPipelineCaseDocumentWrite,
   ];
   "pipelines.cases.createReviewLink": [
     params: {

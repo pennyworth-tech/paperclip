@@ -1671,6 +1671,27 @@ export interface PluginPipelineCase {
   issueLinks: PluginPipelineCaseIssueLink[];
 }
 
+/** A case document as the host returns it: the link, the document, its latest revision. */
+export interface PluginPipelineCaseDocument {
+  link: { companyId: string; caseId: string; documentId: string; key: string };
+  document: {
+    id: string;
+    companyId: string;
+    title: string;
+    format: string;
+    latestBody: string;
+    latestRevisionId: string | null;
+    latestRevisionNumber: number;
+  };
+  revision: { id: string; revisionNumber: number; title: string | null; body: string } | null;
+}
+
+export interface PluginPipelineCaseDocumentWrite {
+  created: boolean;
+  document: PluginPipelineCaseDocument["document"];
+  revision: { id: string; revisionNumber: number };
+}
+
 export interface PluginPipelineReviewResult {
   caseId: string;
   decision: PluginPipelineReviewDecision;
@@ -1685,7 +1706,8 @@ export interface PluginPipelineReviewResult {
  * decisions as an authenticated agent run.
  *
  * Requires `pipeline.cases.read` for `getCase`, `pipeline.cases.links.write`
- * for `createReviewLink`, and `pipeline.cases.review` for `reviewCase`.
+ * for `createReviewLink`, `pipeline.cases.review` for `reviewCase`, and
+ * `pipeline.cases.documents.read` / `.write` for the document pair.
  */
 export interface PluginPipelinesClient {
   /** Read a case with its stage and issue links; `null` when not in the company. */
@@ -1722,6 +1744,29 @@ export interface PluginPipelinesClient {
     },
     companyId: string,
   ): Promise<PluginPipelineReviewResult>;
+  /**
+   * Read a case document by key; `null` when there is none. Reading `body`
+   * mints it from the case summary first, exactly as the REST route does.
+   */
+  getDocument(caseId: string, key: string, companyId: string): Promise<PluginPipelineCaseDocument | null>;
+  /**
+   * Write a case document. The write is a system-actor write — a plugin job has
+   * no agent run behind it, so unlike the agent-key REST route this needs no
+   * run id. Omit `baseRevisionId` to create; on an existing document it must be
+   * the latest revision id or the host refuses with code `stale_base_revision`.
+   */
+  putDocument(
+    caseId: string,
+    input: {
+      key: string;
+      body: string;
+      title?: string;
+      format?: string;
+      changeSummary?: string | null;
+      baseRevisionId?: string | null;
+    },
+    companyId: string,
+  ): Promise<PluginPipelineCaseDocumentWrite>;
 }
 
 /**

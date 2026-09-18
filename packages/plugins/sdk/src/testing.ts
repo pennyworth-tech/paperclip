@@ -43,6 +43,7 @@ import type {
   PluginLocalFolderStatus,
   PluginAccessMember,
   PluginPipelineCase,
+  PluginPipelineCaseDocument,
   PrincipalPermissionGrant,
   PermissionKey,
   PrincipalType,
@@ -514,6 +515,7 @@ export function createTestHarness(options: TestHarnessOptions): TestHarness {
   const attachmentContentById = new Map<string, string>();
   const approvals = new Map<string, Approval>();
   const pipelineCases = new Map<string, PluginPipelineCase>();
+  const pipelineCaseDocuments = new Map<string, PluginPipelineCaseDocument>();
   const issueDocuments = new Map<string, IssueDocument>();
   const agents = new Map<string, Agent>();
   const goals = new Map<string, Goal>();
@@ -2057,6 +2059,60 @@ export function createTestHarness(options: TestHarnessOptions): TestHarness {
         requireCapability(manifest, capabilitySet, "pipeline.cases.read");
         const pipelineCase = pipelineCases.get(caseId);
         return pipelineCase && pipelineCase.companyId === companyId ? pipelineCase : null;
+      },
+      async getDocument(caseId, key, companyId) {
+        requireCapability(manifest, capabilitySet, "pipeline.cases.documents.read");
+        const pipelineCase = pipelineCases.get(caseId);
+        if (!pipelineCase || pipelineCase.companyId !== companyId) {
+          throw hostHttpError(`Pipeline case not found: ${caseId}`, {
+            code: "case_not_found",
+            status: 404,
+            details: { code: "case_not_found" },
+          });
+        }
+        return pipelineCaseDocuments.get(`${caseId}:${key}`) ?? null;
+      },
+      async putDocument(caseId, input, companyId) {
+        requireCapability(manifest, capabilitySet, "pipeline.cases.documents.write");
+        const pipelineCase = pipelineCases.get(caseId);
+        if (!pipelineCase || pipelineCase.companyId !== companyId) {
+          throw hostHttpError(`Pipeline case not found: ${caseId}`, {
+            code: "case_not_found",
+            status: 404,
+            details: { code: "case_not_found" },
+          });
+        }
+        const slot = `${caseId}:${input.key}`;
+        const existing = pipelineCaseDocuments.get(slot) ?? null;
+        // The one-writer rule the host enforces, so a fake can exercise it.
+        if ((existing?.document.latestRevisionId ?? null) !== (input.baseRevisionId ?? null)) {
+          throw hostHttpError("Pipeline case document was updated by someone else", {
+            code: "stale_base_revision",
+            status: 409,
+            details: {
+              code: "stale_base_revision",
+              latestRevisionId: existing?.document.latestRevisionId ?? null,
+              latestRevisionNumber: existing?.document.latestRevisionNumber ?? null,
+            },
+          });
+        }
+        const revisionNumber = (existing?.document.latestRevisionNumber ?? 0) + 1;
+        const revisionId = randomUUID();
+        const document = {
+          id: existing?.document.id ?? randomUUID(),
+          companyId,
+          title: input.title ?? existing?.document.title ?? input.key,
+          format: input.format ?? existing?.document.format ?? "markdown",
+          latestBody: input.body,
+          latestRevisionId: revisionId,
+          latestRevisionNumber: revisionNumber,
+        };
+        pipelineCaseDocuments.set(slot, {
+          link: { companyId, caseId, documentId: document.id, key: input.key },
+          document,
+          revision: { id: revisionId, revisionNumber, title: document.title, body: input.body },
+        });
+        return { created: !existing, document, revision: { id: revisionId, revisionNumber } };
       },
       async createReviewLink(caseId, input, companyId) {
         requireCapability(manifest, capabilitySet, "pipeline.cases.links.write");

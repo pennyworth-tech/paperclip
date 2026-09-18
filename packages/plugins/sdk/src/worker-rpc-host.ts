@@ -1174,6 +1174,23 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
             actorRunId: input.actorRunId,
           });
         },
+
+        async getDocument(caseId, key, companyId) {
+          return callHost("pipelines.cases.getDocument", { caseId, companyId, key });
+        },
+
+        async putDocument(caseId, input, companyId) {
+          return callHost("pipelines.cases.putDocument", {
+            caseId,
+            companyId,
+            key: input.key,
+            body: input.body,
+            title: input.title,
+            format: input.format,
+            changeSummary: input.changeSummary,
+            baseRevisionId: input.baseRevisionId,
+          });
+        },
       },
 
       agents: {

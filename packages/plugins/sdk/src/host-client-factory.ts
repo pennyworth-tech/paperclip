@@ -260,11 +260,13 @@ export interface HostServices {
     decide(params: WorkerToHostMethods["approvals.decide"][0]): Promise<WorkerToHostMethods["approvals.decide"][1]>;
   };
 
-  /** Provides `pipelines.cases.get`, `pipelines.cases.createReviewLink`, `pipelines.cases.review`. */
+  /** Provides `pipelines.cases.get`, `pipelines.cases.createReviewLink`, `pipelines.cases.review`, and the case-document pair. */
   pipelines: {
     getCase(params: WorkerToHostMethods["pipelines.cases.get"][0]): Promise<WorkerToHostMethods["pipelines.cases.get"][1]>;
     createReviewLink(params: WorkerToHostMethods["pipelines.cases.createReviewLink"][0]): Promise<WorkerToHostMethods["pipelines.cases.createReviewLink"][1]>;
     reviewCase(params: WorkerToHostMethods["pipelines.cases.review"][0]): Promise<WorkerToHostMethods["pipelines.cases.review"][1]>;
+    getDocument(params: WorkerToHostMethods["pipelines.cases.getDocument"][0]): Promise<WorkerToHostMethods["pipelines.cases.getDocument"][1]>;
+    putDocument(params: WorkerToHostMethods["pipelines.cases.putDocument"][0]): Promise<WorkerToHostMethods["pipelines.cases.putDocument"][1]>;
   };
 
   /** Provides `issues.documents.list`, `issues.documents.get`, `issues.documents.upsert`, `issues.documents.delete`. */
@@ -487,6 +489,8 @@ const METHOD_CAPABILITY_MAP: Record<WorkerToHostMethodName, PluginCapability | n
 
   // Pipelines
   "pipelines.cases.get": "pipeline.cases.read",
+  "pipelines.cases.getDocument": "pipeline.cases.documents.read",
+  "pipelines.cases.putDocument": "pipeline.cases.documents.write",
   "pipelines.cases.createReviewLink": "pipeline.cases.links.write",
   "pipelines.cases.review": "pipeline.cases.review",
 
@@ -977,6 +981,12 @@ export function createHostClientHandlers(
     }),
     "pipelines.cases.review": gated("pipelines.cases.review", async (params) => {
       return services.pipelines.reviewCase(params);
+    }),
+    "pipelines.cases.getDocument": gated("pipelines.cases.getDocument", async (params) => {
+      return services.pipelines.getDocument(params);
+    }),
+    "pipelines.cases.putDocument": gated("pipelines.cases.putDocument", async (params) => {
+      return services.pipelines.putDocument(params);
     }),
 
     // Issue Documents

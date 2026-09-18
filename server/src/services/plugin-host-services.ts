@@ -46,6 +46,12 @@ import { budgetService } from "./budgets.js";
 import { issueApprovalService } from "./issue-approvals.js";
 import { approvalService } from "./approvals.js";
 import { pipelineService } from "./pipelines.js";
+import {
+  parsePipelineCaseDocumentInput,
+  parsePipelineDocumentKey,
+  putPipelineCaseDocument,
+  readPipelineCaseDocument,
+} from "./pipeline-case-documents.js";
 import { getStorageService } from "../storage/index.js";
 import { subscribeCompanyLiveEvents } from "./live-events.js";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
@@ -813,6 +819,16 @@ export function buildHostServices(
    * availability gate to enforce here.
    */
   const ensurePluginAvailableForCompany = async (_companyId: string) => {};
+
+  async function requirePipelineCaseInCompany(companyId: string, caseId: string) {
+    const [row] = await db
+      .select({ id: pipelineCases.id })
+      .from(pipelineCases)
+      .where(and(eq(pipelineCases.id, caseId), eq(pipelineCases.companyId, companyId)))
+      .limit(1);
+    if (!row) throw notFound("Pipeline case not found", { code: "case_not_found" });
+    return row;
+  }
 
   const getLocalFolderDeclaration = (folderKey: string) =>
     requireLocalFolderDeclaration(options.manifest?.localFolders, folderKey);
@@ -2224,22 +2240,35 @@ export function buildHostServices(
         await ensurePluginAvailableForCompany(companyId);
         const issue = requireInCompany("Issue", await issues.getById(params.issueId), companyId);
         if (!issue.assigneeAgentId) {
-          throw new Error("Issue has no assigned agent to wake");
+          throw unprocessable("Issue has no assigned agent to wake", { code: "no_assignee" });
         }
         if (["backlog", "done", "cancelled"].includes(issue.status)) {
-          throw new Error(`Issue is not wakeable in status: ${issue.status}`);
+          throw unprocessable(`Issue is not wakeable in status: ${issue.status}`, {
+            code: "issue_not_wakeable",
+            issueStatus: issue.status,
+          });
         }
         const relations = await issues.getRelationSummaries(issue.id);
         const unresolvedBlockers = relations.blockedBy.filter((blocker) => blocker.status !== "done");
         if (unresolvedBlockers.length > 0) {
-          throw new Error("Issue is blocked by unresolved blockers");
+          throw unprocessable("Issue is blocked by unresolved blockers", {
+            code: "issue_blocked",
+            blockerIssueIds: unresolvedBlockers.map((blocker) => blocker.id),
+          });
         }
         const budgetBlock = await budgets.getInvocationBlock(companyId, issue.assigneeAgentId, {
           issueId: issue.id,
           projectId: issue.projectId,
         });
         if (budgetBlock) {
-          throw new Error(budgetBlock.reason);
+          // Deferral, not failure: a paused company or a spent budget clears on
+          // its own, so the caller should retry rather than abandon the work.
+          throw unprocessable(budgetBlock.reason, {
+            code: "invocation_blocked",
+            scopeType: budgetBlock.scopeType,
+            scopeId: budgetBlock.scopeId,
+            scopeName: budgetBlock.scopeName,
+          });
         }
         const contextSource = params.contextSource ?? "plugin.issue.requestWakeup";
         const run = await heartbeat.wakeup(issue.assigneeAgentId, {
@@ -2295,19 +2324,30 @@ export function buildHostServices(
             throw new Error("Issue has no assigned agent to wake");
           }
           if (["backlog", "done", "cancelled"].includes(issue.status)) {
-            throw new Error(`Issue is not wakeable in status: ${issue.status}`);
+            throw unprocessable(`Issue is not wakeable in status: ${issue.status}`, {
+              code: "issue_not_wakeable",
+              issueStatus: issue.status,
+            });
           }
           const relations = await issues.getRelationSummaries(issue.id);
           const unresolvedBlockers = relations.blockedBy.filter((blocker) => blocker.status !== "done");
           if (unresolvedBlockers.length > 0) {
-            throw new Error("Issue is blocked by unresolved blockers");
+            throw unprocessable("Issue is blocked by unresolved blockers", {
+              code: "issue_blocked",
+              blockerIssueIds: unresolvedBlockers.map((blocker) => blocker.id),
+            });
           }
           const budgetBlock = await budgets.getInvocationBlock(companyId, issue.assigneeAgentId, {
             issueId: issue.id,
             projectId: issue.projectId,
           });
           if (budgetBlock) {
-            throw new Error(budgetBlock.reason);
+            throw unprocessable(budgetBlock.reason, {
+              code: "invocation_blocked",
+              scopeType: budgetBlock.scopeType,
+              scopeId: budgetBlock.scopeId,
+              scopeName: budgetBlock.scopeName,
+            });
           }
           const contextSource = params.contextSource ?? "plugin.issue.requestWakeups";
           const run = await heartbeat.wakeup(issue.assigneeAgentId, {
@@ -2816,12 +2856,7 @@ export function buildHostServices(
       async createReviewLink(params) {
         const companyId = ensureCompanyId(params.companyId);
         await ensurePluginAvailableForCompany(companyId);
-        const [pipelineCase] = await db
-          .select({ id: pipelineCases.id })
-          .from(pipelineCases)
-          .where(and(eq(pipelineCases.id, params.caseId), eq(pipelineCases.companyId, companyId)))
-          .limit(1);
-        if (!pipelineCase) throw notFound("Pipeline case not found", { code: "case_not_found" });
+        await requirePipelineCaseInCompany(companyId, params.caseId);
         const issue = requireInCompany("Issue", await issues.getById(params.issueId), companyId);
         if (Boolean(params.actorAgentId) !== Boolean(params.actorRunId)) {
           throw unprocessable("actorAgentId and actorRunId must be supplied together", { code: "actor_required" });
@@ -2851,6 +2886,53 @@ export function buildHostServices(
         });
         return toPluginCaseIssueLink(link, { status: issue.status, assigneeAgentId: issue.assigneeAgentId ?? null });
       },
+      async getDocument(params) {
+        const companyId = ensureCompanyId(params.companyId);
+        await ensurePluginAvailableForCompany(companyId);
+        const key = parsePipelineDocumentKey(params.key);
+        await requirePipelineCaseInCompany(companyId, params.caseId);
+        return (await readPipelineCaseDocument(db, { companyId, caseId: params.caseId, key })) as any;
+      },
+      async putDocument(params) {
+        const companyId = ensureCompanyId(params.companyId);
+        await ensurePluginAvailableForCompany(companyId);
+        const key = parsePipelineDocumentKey(params.key);
+        await requirePipelineCaseInCompany(companyId, params.caseId);
+        // A plugin job has no agent run behind it, so the write is attributed
+        // to the system — that is the whole reason this host call exists
+        // instead of the agent-key REST route, which demands a run id.
+        const input = parsePipelineCaseDocumentInput({
+          body: params.body,
+          title: params.title,
+          format: params.format,
+          changeSummary: params.changeSummary,
+          baseRevisionId: params.baseRevisionId,
+        });
+        const result = await putPipelineCaseDocument(db, {
+          companyId,
+          caseId: params.caseId,
+          key,
+          actor: { type: "system" },
+          input,
+        });
+        await logPluginActivity({
+          companyId,
+          action: result.created ? "pipeline.case_document_created" : "pipeline.case_document_updated",
+          entityType: "pipeline_case",
+          entityId: params.caseId,
+          details: {
+            documentKey: key,
+            documentId: result.document.id,
+            revisionId: result.revision!.id,
+            revisionNumber: result.revision!.revisionNumber,
+          },
+        });
+        return {
+          created: result.created,
+          document: result.document,
+          revision: { id: result.revision!.id, revisionNumber: result.revision!.revisionNumber },
+        } as any;
+      },
       async reviewCase(params) {
         const companyId = ensureCompanyId(params.companyId);
         await ensurePluginAvailableForCompany(companyId);
@@ -2858,12 +2940,7 @@ export function buildHostServices(
           throw unprocessable("actorAgentId and actorRunId are required to record a review decision", { code: "actor_required" });
         }
         await requireAgentRunInCompany(companyId, params.actorAgentId, params.actorRunId);
-        const [pipelineCase] = await db
-          .select({ id: pipelineCases.id })
-          .from(pipelineCases)
-          .where(and(eq(pipelineCases.id, params.caseId), eq(pipelineCases.companyId, companyId)))
-          .limit(1);
-        if (!pipelineCase) throw notFound("Pipeline case not found", { code: "case_not_found" });
+        await requirePipelineCaseInCompany(companyId, params.caseId);
         // The pipeline service applies the stage's approver rule (including
         // linked_reviewer) to this agent actor exactly as the REST route does.
         const result = await pipelineSvc.reviewCase({

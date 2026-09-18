@@ -1368,6 +1368,10 @@ export const PLUGIN_CAPABILITIES = [
   "pipeline.cases.read",
   "pipeline.cases.links.write",
   "pipeline.cases.review",
+  // Case documents (the merge dossier and friends). A plugin write is a
+  // system-actor write: no agent run backs it, so it carries no run id.
+  "pipeline.cases.documents.read",
+  "pipeline.cases.documents.write",
   "issue.documents.write",
   "projects.managed",
   "routines.managed",

@@ -37,6 +37,13 @@ import {
   type PipelineStageKind,
 } from "../services/pipelines.js";
 import {
+  getPipelineCaseDocumentRow,
+  parsePipelineDocumentKey,
+  putPipelineCaseDocument,
+  requirePipelineCaseDocument,
+  upsertPipelineCaseDocumentSchema,
+} from "../services/pipeline-case-documents.js";
+import {
   COMPANY_CASE_EVENTS_DEFAULT_LIMIT,
   COMPANY_CASE_EVENTS_MAX_LIMIT,
   COMPANY_CASE_EVENTS_MAX_TYPES,
@@ -222,13 +229,6 @@ const bulkReviewSchema = z.object({
 const upsertPipelineDocumentSchema = z.object({
   title: z.string().trim().min(1).max(200).optional(),
   body: z.string().max(200_000),
-  baseRevisionId: z.string().guid().nullable().optional(),
-});
-const upsertPipelineCaseDocumentSchema = z.object({
-  title: z.string().trim().min(1).max(200).optional(),
-  format: z.string().trim().min(1).max(80).optional().default("markdown"),
-  body: z.string().max(200_000),
-  changeSummary: z.string().trim().max(1_000).nullable().optional(),
   baseRevisionId: z.string().guid().nullable().optional(),
 });
 const intakeFieldTypes = new Set(["select", "text", "multiline"]);
@@ -555,13 +555,6 @@ async function listPipelineDocumentRevisions(db: Db, input: { companyId: string;
     .then((rows) => rows.map(mapPipelineDocumentRevision));
 }
 
-function parseDocumentKey(rawKey: unknown) {
-  const parsed = issueDocumentKeySchema.safeParse(String(rawKey ?? "").trim().toLowerCase());
-  if (!parsed.success) {
-    throw badRequest("Invalid document key", parsed.error.issues);
-  }
-  return parsed.data;
-}
 
 function mapPipelineCaseDocumentRevision(row: {
   id: string;
@@ -579,21 +572,6 @@ function mapPipelineCaseDocumentRevision(row: {
   createdAt: Date;
 }) {
   return row;
-}
-
-async function getPipelineCaseDocumentRow(db: PipelineRouteDb, input: { companyId: string; caseId: string; key: string }) {
-  return db
-    .select({ link: pipelineCaseDocuments, document: documents, revision: documentRevisions })
-    .from(pipelineCaseDocuments)
-    .innerJoin(documents, eq(pipelineCaseDocuments.documentId, documents.id))
-    .leftJoin(documentRevisions, eq(documents.latestRevisionId, documentRevisions.id))
-    .where(and(
-      eq(pipelineCaseDocuments.companyId, input.companyId),
-      eq(pipelineCaseDocuments.caseId, input.caseId),
-      eq(pipelineCaseDocuments.key, input.key),
-    ))
-    .limit(1)
-    .then((rows: Array<{ link: typeof pipelineCaseDocuments.$inferSelect; document: typeof documents.$inferSelect; revision: typeof documentRevisions.$inferSelect | null }>) => rows[0] ?? null);
 }
 
 async function listPipelineCaseDocumentRevisions(db: Db, input: { companyId: string; caseId: string; key: string }) {
@@ -644,69 +622,6 @@ function activityActorForPipelineRoute(actor: PipelineActor) {
     return { actorType: "user" as const, actorId: actor.userId, agentId: null, runId: null };
   }
   return { actorType: "system" as const, actorId: "pipeline", agentId: null, runId: null };
-}
-
-function issueIdFromPipelineRouteRunContext(contextSnapshot: unknown) {
-  if (!contextSnapshot || typeof contextSnapshot !== "object" || Array.isArray(contextSnapshot)) return null;
-  const context = contextSnapshot as Record<string, unknown>;
-  const issueId = context.issueId ?? context.taskId;
-  return typeof issueId === "string" && issueId.trim().length > 0 ? issueId.trim() : null;
-}
-
-async function sourceTrustForPipelineCaseDocumentWrite(
-  dbOrTx: Db | any,
-  input: {
-    companyId: string;
-    caseId: string;
-    actor: PipelineActor;
-  },
-) {
-  if (input.actor.type !== "agent") return null;
-
-  const conversationSource = await resolvePipelineCaseConversationSource(dbOrTx, input.companyId, input.caseId);
-  let issue = conversationSource?.isActive ? conversationSource.issue : null;
-
-  if (!issue) {
-    const runIssueId = await dbOrTx
-      .select({ contextSnapshot: heartbeatRuns.contextSnapshot })
-      .from(heartbeatRuns)
-      .where(and(
-        eq(heartbeatRuns.companyId, input.companyId),
-        eq(heartbeatRuns.id, input.actor.runId),
-        eq(heartbeatRuns.agentId, input.actor.agentId),
-      ))
-      .limit(1)
-      .then((rows: Array<{ contextSnapshot: unknown }>) =>
-        issueIdFromPipelineRouteRunContext(rows[0]?.contextSnapshot),
-      );
-
-    issue = runIssueId
-      ? await dbOrTx
-          .select()
-          .from(issueRows)
-          .where(and(eq(issueRows.companyId, input.companyId), eq(issueRows.id, runIssueId)))
-          .limit(1)
-          .then((rows: Array<typeof issueRows.$inferSelect>) => rows[0] ?? null)
-      : null;
-  }
-
-  if (!issue) return null;
-
-  return resolveActorSourceTrustForIssue({
-    db: dbOrTx as Db,
-    issue: {
-      id: issue.id,
-      companyId: issue.companyId,
-      projectId: issue.projectId,
-      executionPolicy: issue.executionPolicy,
-    },
-    actor: {
-      actorType: "agent",
-      actorId: input.actor.agentId,
-      agentId: input.actor.agentId,
-      runId: input.actor.runId,
-    },
-  });
 }
 
 async function assertCaseAccess(db: Db, req: Request, caseId: string) {
@@ -1571,194 +1486,21 @@ export function pipelineRoutes(db: Db, options: Parameters<typeof pipelineServic
 
   router.get("/cases/:caseId/documents/:key", async (req, res) => {
     const caseId = req.params.caseId as string;
-    const key = parseDocumentKey(req.params.key);
+    const key = parsePipelineDocumentKey(req.params.key);
     const companyId = await assertCaseAccess(db, req, caseId);
-    const row = await db.transaction(async (tx) => {
-      const existing = await getPipelineCaseDocumentRow(tx, { companyId, caseId, key });
-      if (existing || key !== "body") return existing;
-      const caseRow = await tx
-        .select({ summary: pipelineCases.summary })
-        .from(pipelineCases)
-        .where(and(eq(pipelineCases.companyId, companyId), eq(pipelineCases.id, caseId)))
-        .limit(1)
-        .then((rows) => rows[0] ?? null);
-      if (!caseRow?.summary?.trim()) return null;
-      await ensurePipelineCaseBodyDocumentFromSummary(tx, {
-        companyId,
-        caseId,
-        summary: caseRow.summary,
-        actor: { type: "system" },
-      });
-      return getPipelineCaseDocumentRow(tx, { companyId, caseId, key });
-    });
-    if (!row) throw notFound("Pipeline case document not found");
-    res.json(row);
+    res.json(await requirePipelineCaseDocument(db, { companyId, caseId, key }));
   });
 
   router.put("/cases/:caseId/documents/:key", validate(upsertPipelineCaseDocumentSchema), async (req, res) => {
     const caseId = req.params.caseId as string;
-    const key = parseDocumentKey(req.params.key);
+    const key = parsePipelineDocumentKey(req.params.key);
     const companyId = await assertCaseAccess(db, req, caseId);
     const pipelineId = await resolveCasePipelineId(db, { companyId, caseId });
     await assertPipelineWriteAccess(req, { access, companyId, pipelineId });
     const actor = actorForMutation(req);
-    const sourceTrust = await sourceTrustForPipelineCaseDocumentWrite(db, { companyId, caseId, actor });
 
-    const result = await db.transaction(async (tx) => {
-      const existing = await tx
-        .select({ link: pipelineCaseDocuments, document: documents, revision: documentRevisions })
-        .from(pipelineCaseDocuments)
-        .innerJoin(documents, eq(pipelineCaseDocuments.documentId, documents.id))
-        .leftJoin(documentRevisions, eq(documents.latestRevisionId, documentRevisions.id))
-        .where(and(
-          eq(pipelineCaseDocuments.companyId, companyId),
-          eq(pipelineCaseDocuments.caseId, caseId),
-          eq(pipelineCaseDocuments.key, key),
-        ))
-        .limit(1)
-        .then((rows) => rows[0] ?? null);
+    const result = await putPipelineCaseDocument(db, { companyId, caseId, key, actor, input: req.body });
 
-      if (existing && !req.body.baseRevisionId) {
-        throw conflict("Pipeline case document update requires baseRevisionId", {
-          code: "stale_base_revision",
-          latestRevisionId: existing.document.latestRevisionId,
-          latestRevisionNumber: existing.document.latestRevisionNumber,
-        });
-      }
-      if (existing && req.body.baseRevisionId !== existing.document.latestRevisionId) {
-        throw conflict("Pipeline case document was updated by someone else", {
-          code: "stale_base_revision",
-          latestRevision: existing.revision
-            ? {
-              id: existing.revision.id,
-              revisionNumber: existing.revision.revisionNumber,
-              title: existing.revision.title,
-              createdAt: existing.revision.createdAt,
-              createdByAgentId: existing.revision.createdByAgentId,
-              createdByUserId: existing.revision.createdByUserId,
-            }
-            : null,
-          latestRevisionId: existing.document.latestRevisionId,
-          latestRevisionNumber: existing.document.latestRevisionNumber,
-        });
-      }
-      if (!existing && req.body.baseRevisionId) {
-        throw conflict("Pipeline case document does not exist yet", {
-          code: "stale_base_revision",
-          latestRevision: null,
-          latestRevisionId: null,
-          latestRevisionNumber: null,
-        });
-      }
-
-      const now = new Date();
-      const [document] = existing
-        ? await tx.update(documents).set({
-          title: req.body.title ?? existing.document.title,
-          format: req.body.format,
-          updatedAt: now,
-          updatedByAgentId: actor.type === "agent" ? actor.agentId : null,
-          updatedByUserId: actor.type === "user" ? actor.userId : null,
-          sourceTrust,
-        }).where(eq(documents.id, existing.document.id)).returning()
-        : await tx.insert(documents).values({
-          companyId,
-          title: req.body.title ?? key,
-          format: req.body.format,
-          latestBody: req.body.body,
-          latestRevisionNumber: 1,
-          createdByAgentId: actor.type === "agent" ? actor.agentId : null,
-          createdByUserId: actor.type === "user" ? actor.userId : null,
-          updatedByAgentId: actor.type === "agent" ? actor.agentId : null,
-          updatedByUserId: actor.type === "user" ? actor.userId : null,
-          sourceTrust,
-          createdAt: now,
-          updatedAt: now,
-        }).returning();
-      const nextRevisionNumber = existing ? existing.document.latestRevisionNumber + 1 : 1;
-      const [revision] = await tx.insert(documentRevisions).values({
-        companyId,
-        documentId: document!.id,
-        revisionNumber: nextRevisionNumber,
-        title: req.body.title ?? document!.title,
-        format: req.body.format,
-        body: req.body.body,
-        changeSummary: req.body.changeSummary ?? null,
-        createdByAgentId: actor.type === "agent" ? actor.agentId : null,
-        createdByUserId: actor.type === "user" ? actor.userId : null,
-        createdByRunId: actor.type === "agent" ? actor.runId : null,
-        createdAt: now,
-      }).returning();
-      await tx.update(documents).set({
-        title: req.body.title ?? document!.title,
-        format: req.body.format,
-        latestBody: req.body.body,
-        latestRevisionId: revision!.id,
-        latestRevisionNumber: revision!.revisionNumber,
-        updatedAt: now,
-        updatedByAgentId: actor.type === "agent" ? actor.agentId : null,
-        updatedByUserId: actor.type === "user" ? actor.userId : null,
-        sourceTrust,
-      }).where(eq(documents.id, document!.id));
-      if (!existing) {
-        await tx.insert(pipelineCaseDocuments).values({ companyId, caseId, documentId: document!.id, key, createdAt: now, updatedAt: now });
-      } else {
-        await tx.update(pipelineCaseDocuments).set({ updatedAt: now }).where(eq(pipelineCaseDocuments.documentId, document!.id));
-      }
-
-      if (key === "body") {
-        const conversationSource = await resolvePipelineCaseConversationSource(tx, companyId, caseId);
-        if (conversationSource?.isActive) {
-          await tx.insert(issueDocuments).values({
-            companyId,
-            issueId: conversationSource.issue.id,
-            documentId: document!.id,
-            key: PIPELINE_CASE_BODY_DOCUMENT_KEY,
-            createdAt: now,
-            updatedAt: now,
-          }).onConflictDoUpdate({
-            target: [issueDocuments.companyId, issueDocuments.issueId, issueDocuments.key],
-            set: { documentId: document!.id, updatedAt: now },
-          });
-        }
-      }
-
-      const linkedIssueDocuments = await tx
-        .select({ issueId: issueDocuments.issueId, key: issueDocuments.key })
-        .from(issueDocuments)
-        .where(and(eq(issueDocuments.companyId, companyId), eq(issueDocuments.documentId, document!.id)));
-
-      return {
-        created: !existing,
-        document: {
-          ...document!,
-          title: req.body.title ?? document!.title,
-          format: req.body.format,
-          latestBody: req.body.body,
-          latestRevisionId: revision!.id,
-          latestRevisionNumber: revision!.revisionNumber,
-          updatedAt: now,
-          updatedByAgentId: actor.type === "agent" ? actor.agentId : null,
-          updatedByUserId: actor.type === "user" ? actor.userId : null,
-          sourceTrust,
-        },
-        revision,
-        linkedIssueDocuments,
-      };
-    });
-
-    if (!result.created) {
-      await Promise.all(result.linkedIssueDocuments.map((link) =>
-        documentAnnotationsSvc.remapOpenThreadsForDocument({
-          issueId: link.issueId,
-          key: link.key,
-          documentId: result.document.id,
-          nextRevisionId: result.document.latestRevisionId,
-          nextRevisionNumber: result.document.latestRevisionNumber,
-          nextBody: result.document.latestBody,
-        })
-      ));
-    }
     await logActivity(db, {
       companyId,
       ...activityActorForPipelineRoute(actor),
@@ -1778,7 +1520,7 @@ export function pipelineRoutes(db: Db, options: Parameters<typeof pipelineServic
 
   router.get("/cases/:caseId/documents/:key/revisions", async (req, res) => {
     const caseId = req.params.caseId as string;
-    const key = parseDocumentKey(req.params.key);
+    const key = parsePipelineDocumentKey(req.params.key);
     const companyId = await assertCaseAccess(db, req, caseId);
     const revisions = await listPipelineCaseDocumentRevisions(db, { companyId, caseId, key });
     res.json(revisions);
@@ -1786,7 +1528,7 @@ export function pipelineRoutes(db: Db, options: Parameters<typeof pipelineServic
 
   router.post("/cases/:caseId/documents/:key/revisions/:revisionId/restore", async (req, res) => {
     const caseId = req.params.caseId as string;
-    const key = parseDocumentKey(req.params.key);
+    const key = parsePipelineDocumentKey(req.params.key);
     const revisionId = req.params.revisionId as string;
     const companyId = await assertCaseAccess(db, req, caseId);
     const pipelineId = await resolveCasePipelineId(db, { companyId, caseId });
