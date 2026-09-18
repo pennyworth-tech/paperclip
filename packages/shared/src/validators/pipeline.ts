@@ -157,3 +157,12 @@ export type PipelineStageConfig = z.infer<typeof pipelineStageConfigSchema>;
 export type PipelineAutomationRetryScope = z.infer<typeof pipelineAutomationRetryScopeSchema>;
 export type PipelineAutomationRetryCleanupOptions = z.infer<typeof pipelineAutomationRetryCleanupOptionsSchema>;
 export type PipelineAutomationRetryRequest = z.infer<typeof pipelineAutomationRetryRequestSchema>;
+
+/** Shared REST and plugin validation for case document writes. */
+export const upsertPipelineCaseDocumentSchema = z.object({
+  title: z.string().trim().min(1).max(200).optional(),
+  format: z.string().trim().min(1).max(80).optional().default("markdown"),
+  body: z.string().max(200_000),
+  changeSummary: z.string().trim().max(1_000).nullable().optional(),
+  baseRevisionId: z.string().guid().nullable().optional(),
+});

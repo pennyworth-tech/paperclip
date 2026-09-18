@@ -139,10 +139,4 @@ export const upsertPipelineDocumentSchema = z.object({
   body: z.string().max(200_000),
   baseRevisionId: z.string().guid().nullable().optional(),
 });
-export const upsertPipelineCaseDocumentSchema = z.object({
-  title: z.string().trim().min(1).max(200).optional(),
-  format: z.string().trim().min(1).max(80).optional().default("markdown"),
-  body: z.string().max(200_000),
-  changeSummary: z.string().trim().max(1_000).nullable().optional(),
-  baseRevisionId: z.string().guid().nullable().optional(),
-});
+export { upsertPipelineCaseDocumentSchema } from "@paperclipai/shared";

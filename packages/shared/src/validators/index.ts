@@ -730,6 +730,7 @@ export {
   pipelineStageAutomationSchema,
   pipelineStageApproverSchema,
   pipelineStageConfigSchema,
+  upsertPipelineCaseDocumentSchema,
   pipelineStageKindSchema,
   pipelineStageOnEnterSchema,
   pipelineStageVariableSchema,

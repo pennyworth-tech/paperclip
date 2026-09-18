@@ -105,6 +105,8 @@ const OPERATION_CAPABILITIES: Record<string, readonly PluginCapability[]> = {
   "issue.interactions.respond": ["issue.interactions.respond"],
   "approvals.respond": ["approvals.respond"],
   "approvals.decide": ["approvals.respond"],
+  "pipelines.cases.getDocument": ["pipeline.cases.documents.read"],
+  "pipelines.cases.putDocument": ["pipeline.cases.documents.write"],
   "pipelines.cases.createReviewLink": ["pipeline.cases.links.write"],
   "pipelines.cases.review": ["pipeline.cases.review"],
   "activity.log": ["activity.log.write"],

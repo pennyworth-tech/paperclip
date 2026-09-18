@@ -26,6 +26,7 @@ import {
   issues,
   pipelineAutomationExecutions,
   pipelineCaseBlockers,
+  documentRevisions,
   pipelineCaseEvents,
   pipelineCaseIssueLinks,
   pipelineCases,
@@ -1558,6 +1559,58 @@ describeEmbeddedPostgres("plugin orchestration APIs", () => {
       expect(await reviewDecidedCount(caseId)).toBe(0);
     });
 
+    it("writes a case document as the system, with no agent run behind it", async () => {
+      const seeded = await seedLinkedReviewerCase();
+      const { companyId, caseId } = seeded;
+      const services = buildHostServices(db, "plugin-record-id", "backlit.operations", createEventBusStub());
+
+      await expect(services.pipelines.getDocument({ caseId, companyId, key: "merge-dossier" })).resolves.toBeNull();
+
+      const created = await services.pipelines.putDocument({
+        caseId,
+        companyId,
+        key: "merge-dossier",
+        body: "## Dossier\n\nfirst",
+        title: "Merge dossier",
+      });
+      expect(created).toMatchObject({ created: true, revision: { revisionNumber: 1 } });
+
+      // The write is the plugin's, not an agent's: no run id, no agent id.
+      const [revision] = await db
+        .select({ createdByRunId: documentRevisions.createdByRunId, createdByAgentId: documentRevisions.createdByAgentId, createdByUserId: documentRevisions.createdByUserId })
+        .from(documentRevisions)
+        .where(eq(documentRevisions.id, created.revision.id));
+      expect(revision).toMatchObject({ createdByRunId: null, createdByAgentId: null, createdByUserId: null });
+
+      const read = await services.pipelines.getDocument({ caseId, companyId, key: "merge-dossier" });
+      expect(read).toMatchObject({ document: { latestBody: "## Dossier\n\nfirst", latestRevisionNumber: 1 } });
+
+      const updated = await services.pipelines.putDocument({
+        caseId,
+        companyId,
+        key: "merge-dossier",
+        body: "## Dossier\n\nsecond",
+        baseRevisionId: created.document.latestRevisionId,
+      });
+      expect(updated).toMatchObject({ created: false, revision: { revisionNumber: 2 } });
+
+      // A stale base revision is refused with a code, not a message to parse.
+      await expect(services.pipelines.putDocument({
+        caseId,
+        companyId,
+        key: "merge-dossier",
+        body: "## Dossier\n\nthird",
+        baseRevisionId: created.document.latestRevisionId,
+      })).rejects.toMatchObject({ status: 409, details: { code: "stale_base_revision" } });
+
+      await expect(services.pipelines.putDocument({
+        caseId,
+        companyId: randomUUID(),
+        key: "merge-dossier",
+        body: "nope",
+      })).rejects.toMatchObject({ status: 404, details: { code: "case_not_found" } });
+    });
+
     it("gates the pipeline bridge methods on their capabilities", async () => {
       const seeded = await seedLinkedReviewerCase();
       const services = buildHostServices(db, "plugin-record-id", "backlit.operations", createEventBusStub());
@@ -1575,6 +1628,17 @@ describeEmbeddedPostgres("plugin orchestration APIs", () => {
         caseId: seeded.caseId,
         companyId: seeded.companyId,
         issueId: seeded.reviewIssueId,
+      })).rejects.toMatchObject({ code: PLUGIN_RPC_ERROR_CODES.CAPABILITY_DENIED });
+      await expect(denied["pipelines.cases.putDocument"]({
+        caseId: seeded.caseId,
+        companyId: seeded.companyId,
+        key: "merge-dossier",
+        body: "denied",
+      })).rejects.toMatchObject({ code: PLUGIN_RPC_ERROR_CODES.CAPABILITY_DENIED });
+      await expect(denied["pipelines.cases.getDocument"]({
+        caseId: seeded.caseId,
+        companyId: seeded.companyId,
+        key: "merge-dossier",
       })).rejects.toMatchObject({ code: PLUGIN_RPC_ERROR_CODES.CAPABILITY_DENIED });
       await expect(denied["pipelines.cases.get"](
         { caseId: seeded.caseId, companyId: seeded.companyId },
