@@ -34,7 +34,7 @@ describe("applyChildEnvAllowlist", () => {
       PAPERCLIP_API_KEY: "run-token",
       PAPERCLIP_API_URL: "http://127.0.0.1:3100",
       PAPERCLIP_RUN_ID: "run_1",
-      PAPERCLIP_TASK_ID: "BAC-4671",
+      PAPERCLIP_TASK_ID: "TASK-123",
       PAPERCLIP_WAKE_REASON: "comment",
       PAPERCLIP_APPROVAL_ID: "apr_1",
       PAPERCLIP_RUNTIME_SERVICES_JSON: "[]",

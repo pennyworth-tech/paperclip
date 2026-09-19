@@ -132,8 +132,8 @@ describe("inspectWorktreeHealth", () => {
     // A path that does not exist is the deterministic stand-in for every way git
     // can fail here. The assertion that matters is the negative one: "clean" is
     // the reading that unlocks `reset --hard`, so a failed probe must never
-    // produce it. This is the same rule the herdr prober encodes by forcing
-    // BLD=-1 on a failed status (paperclip-herdr-adapter/src/pane-git.ts:252-254).
+    // produce it. This is the same rule a downstream pane prober encodes by forcing
+    // BLD=-1 on a failed status (a downstream pane prober).
     const missingPath = path.join(os.tmpdir(), `paperclip-worktree-health-missing-${process.pid}`);
 
     const health = await inspectWorktreeHealth(missingPath);

@@ -17,8 +17,8 @@ import { workspaceGitOperationScheduler } from "./workspace-git-operation-schedu
  * those probes was skipped on exactly the path that needs them most.
  *
  * FAIL TO UNKNOWN, NEVER TO CLEAN. Every probe here reports "unknown" when its
- * git command fails. That rule is copied from the herdr pane prober
- * (packages/paperclip-herdr-adapter/src/pane-git.ts:252-254), whose comment
+ * git command fails. That rule is copied from a downstream pane prober
+ * (a downstream pane prober), whose comment
  * states the reason exactly:
  *
  *   "`wc -l` on a failed git would report 0, and 0 dirty files is exactly the

@@ -752,15 +752,15 @@ describe("runChildProcess", () => {
   });
 });
 
-// BAC-4671 G4: a harness child must receive an explicitly allowlisted
+// A harness child must receive an explicitly allowlisted
 // environment, not the server's own process env minus a few known-bad keys.
-// Spec: openspec/changes/bac-4671-retire-herdr-combined-container-vm/
+// Spec: the session-continuity requirements
 // specs/agent-execution-plane/spec.md:206-241 ("A harness child SHALL receive
 // an allowlisted environment, and SHALL NOT inherit the server's own
 // credentials" / "A harness child inspects its environment" / "The boundary
 // is exercised, not asserted" — the test must assert absence of the server
 // credential from inside a running harness, not merely inspect the spawn
-// call). Tasks: openspec/.../bac-4671-retire-herdr-combined-container-vm/
+// call). Tasks: the session-continuity requirements
 // tasks.md:55 (4.5).
 //
 // Every test in this block spawns a REAL child through the REAL
@@ -910,7 +910,7 @@ describe("runChildProcess — child env allowlist boundary", () => {
         ANTHROPIC_API_KEY: "sk-ant-real",
         CLAUDE_CONFIG_DIR: "/home/agent/.claude",
         CODEX_HOME: "/home/agent/.codex",
-        LITELLM_TAGS: "agent:agent-1,issue:BAC-4671",
+        LITELLM_TAGS: "agent:agent-1,issue:TASK-123",
         HTTPS_PROXY: "http://proxy.internal:8443",
         NODE_EXTRA_CA_CERTS: "/etc/ssl/private-ca.pem",
       },
@@ -921,7 +921,7 @@ describe("runChildProcess — child env allowlist boundary", () => {
         expect(childEnv.ANTHROPIC_API_KEY).toBe("sk-ant-real");
         expect(childEnv.CLAUDE_CONFIG_DIR).toBe("/home/agent/.claude");
         expect(childEnv.CODEX_HOME).toBe("/home/agent/.codex");
-        expect(childEnv.LITELLM_TAGS).toBe("agent:agent-1,issue:BAC-4671");
+        expect(childEnv.LITELLM_TAGS).toBe("agent:agent-1,issue:TASK-123");
         expect(childEnv.HTTPS_PROXY).toBe("http://proxy.internal:8443");
         expect(childEnv.NODE_EXTRA_CA_CERTS).toBe("/etc/ssl/private-ca.pem");
       },

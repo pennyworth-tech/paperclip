@@ -158,9 +158,9 @@ export function createStreamSessionIdLatch(input: {
  * The CLI keys its JSONL transcripts by an encoding of the project directory:
  * every character outside `[a-zA-Z0-9-]` becomes `-`, and existing hyphens pass
  * through unchanged. Verified against a live `~/.claude/projects` listing — for
- * example the directory `/Users/ngoodman/dev/pw/backlit-os` is stored as
- * `-Users-ngoodman-dev-pw-backlit-os`, and a path under `/private/tmp/claude-501/`
- * keeps the hyphen in `claude-501` while turning the following `/` into its own
+ * example the directory `/home/dev/project` is stored as
+ * `-home-dev-project`, and a path under `/private/tmp/runner-7/`
+ * keeps the hyphen in `runner-7` while turning the following `/` into its own
  * `-`, producing the doubled `501--Users` seen on disk.
  *
  * `recordedCwd` must be the cwd that was recorded alongside the session, not the

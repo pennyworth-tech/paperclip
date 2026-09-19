@@ -138,20 +138,20 @@ describe("createStreamSessionIdLatch", () => {
 
 describe("buildClaudeTranscriptProbePath", () => {
   // Verified against a live ~/.claude/projects listing; see the helper's doc
-  // comment. The doubled hyphen in "claude-501--Users" is the tell that an
+  // comment. The doubled hyphen in "runner-7--Users" is the tell that an
   // existing hyphen passes through while the following slash becomes its own.
   it("mirrors the CLI's project-directory encoding", () => {
     expect(
       buildClaudeTranscriptProbePath({
         claudeConfigDir: "/home/agent/.claude",
-        recordedCwd: "/Users/ngoodman/dev/pw/backlit-os",
+        recordedCwd: "/home/dev/project",
         sessionId: "5c1f0f1e-0000-4000-8000-000000000001",
       }),
     ).toBe(
       path.join(
         "/home/agent/.claude",
         "projects",
-        "-Users-ngoodman-dev-pw-backlit-os",
+        "-home-dev-project",
         "5c1f0f1e-0000-4000-8000-000000000001.jsonl",
       ),
     );
@@ -159,10 +159,10 @@ describe("buildClaudeTranscriptProbePath", () => {
     expect(
       buildClaudeTranscriptProbePath({
         claudeConfigDir: "/home/agent/.claude",
-        recordedCwd: "/private/tmp/claude-501/-Users-ngoodman-dev-pw-backlit-os",
+        recordedCwd: "/private/tmp/runner-7/-home-dev-project",
         sessionId: "abc",
       }),
-    ).toContain("-private-tmp-claude-501--Users-ngoodman-dev-pw-backlit-os");
+    ).toContain("-private-tmp-runner-7--home-dev-project");
   });
 
   // The recorded cwd, not the current one: a session minted in worktree A and
