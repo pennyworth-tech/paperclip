@@ -1467,6 +1467,16 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       isRetry = false,
     ): AdapterExecutionResult => {
       if (attempt.monitor?.fired) {
+        // Same rule as the timeout branch below, and for the same reason. The
+        // monitor kills a codex that has gone quiet, which is a run that may
+        // have already named its thread and written turns to disk. Returning
+        // three explicit nulls is not neutral: resolveNextSessionState falls
+        // back to the pre-dispatch snapshot and writes it over the checkpoint
+        // this run persisted mid-stream. On the retry lane it is worse still —
+        // `clearSessionOnMissingSession` is true there, so the session is
+        // cleared outright and the host-side rescue cannot reach it, because
+        // `clearSession` wins by design.
+        const monitorSessionId = attempt.streamSessionId;
         const errorMessage = formatOutputInactivityMonitorErrorMessage(attempt.monitor.elapsedMsSinceLastEvent);
         return {
           exitCode: null,
@@ -1477,9 +1487,13 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           errorFamily: null,
           usage: attempt.parsed.usage,
           usageBasis: attempt.parsed.usageBasis,
-          sessionId: null,
-          sessionParams: null,
-          sessionDisplayId: null,
+          ...(monitorSessionId
+            ? {
+                sessionId: monitorSessionId,
+                sessionParams: buildSessionParams(monitorSessionId),
+                sessionDisplayId: monitorSessionId,
+              }
+            : { sessionId: null, sessionParams: null, sessionDisplayId: null }),
           provider: "openai",
           biller: resolveCodexBiller(effectiveEnv, billingType),
           model,
@@ -1496,7 +1510,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
             },
           },
           summary: attempt.parsed.summary,
-          clearSession: clearSessionOnMissingSession,
+          // Only clear when the harness genuinely never named a thread. A
+          // stream-confirmed id is the thing worth keeping.
+          clearSession: Boolean(clearSessionOnMissingSession && !monitorSessionId),
         };
       }
       if (attempt.proc.timedOut) {

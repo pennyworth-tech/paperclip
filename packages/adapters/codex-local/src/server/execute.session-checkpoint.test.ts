@@ -426,6 +426,46 @@ describe("codex_local session checkpointing", () => {
     expect(result.clearSession).toBe(false);
   });
 
+  // The inactivity monitor kills a codex that has gone quiet. That is a run
+  // which may already have named its thread and written turns to disk, so the
+  // branch must keep the id for exactly the reason the timeout branch does —
+  // and on the retry lane it matters more, because clearSessionOnMissingSession
+  // is true there and a bare `clearSession: true` wins over the host's rescue.
+  it("carries the streamed thread out of an inactivity kill instead of clearing it", async () => {
+    const startedLine = JSON.stringify({ type: "thread.started", thread_id: "thread-went-quiet" });
+
+    runAdapterExecutionTargetProcess.mockImplementation(async (
+      _runId: string,
+      _target: unknown,
+      _command: string,
+      _args: string[],
+      procOpts: ProcOpts,
+    ) => {
+      await procOpts.onLog("stdout", startedLine);
+      // Outlive the configured inactivity window with no further output: that
+      // silence is what the monitor is watching for.
+      await new Promise((resolve) => setTimeout(resolve, 60));
+      return {
+        exitCode: null,
+        signal: "SIGKILL",
+        timedOut: false,
+        stdout: startedLine,
+        stderr: "",
+        pid: 321,
+        startedAt: new Date().toISOString(),
+      };
+    });
+
+    const ctx = buildCtx();
+    ctx.config.outputInactivityTimeoutMs = 20;
+    const result = await execute(ctx as never);
+
+    expect(result.errorCode).toBe("codex_output_inactivity_monitor");
+    expect(result.sessionId).toBe("thread-went-quiet");
+    expect(result.sessionParams).toMatchObject({ sessionId: "thread-went-quiet" });
+    expect(result.clearSession).toBe(false);
+  });
+
   // Codex cannot be handed a thread id, so a run killed before it named one has
   // nothing to keep. The result must stay silent about the session rather than
   // inventing one, which leaves the pre-dispatch params in place.
