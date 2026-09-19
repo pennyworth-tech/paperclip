@@ -2343,6 +2343,7 @@ export function refreshPaperclipWorkspaceEnvForExecution(input: {
     executionCwd: shapedWorkspaceEnv.workspaceCwd,
     executionTargetIsRemote: input.executionTargetIsRemote,
   });
+  const forwardedConfigKeys: string[] = [];
   for (const [key, value] of Object.entries(shapedEnvConfig)) {
     // Adapter/user-configured env must never override a Paperclip-managed
     // runtime variable. Non-PAPERCLIP_* keys (plain values and resolved
@@ -2355,11 +2356,34 @@ export function refreshPaperclipWorkspaceEnvForExecution(input: {
     if (isForbiddenConfigEnvKey(key)) continue;
     if (isPaperclipRuntimeEnvKey(key) && key in input.env) continue;
     input.env[key] = value;
+    forwardedConfigKeys.push(key);
+  }
+
+  // Record the config-bound keys this loop forwarded so the deny-by-default
+  // child env allowlist does not silently sever them: a config binding may
+  // name any variable (a resolved `secret_ref` such as GH_TOKEN is the common
+  // case) and no static list can anticipate those names. The marker is
+  // rewritten unconditionally from what this loop actually forwarded, so a
+  // config binding that names the marker itself cannot widen the allowlist.
+  delete input.env[CHILD_ENV_CONFIG_KEYS_VAR];
+  if (forwardedConfigKeys.length > 0) {
+    input.env[CHILD_ENV_CONFIG_KEYS_VAR] = forwardedConfigKeys.join(",");
   }
 
   return shapedWorkspaceEnv;
 }
 
+/**
+ * Strip the host-only PAPERCLIP_* variables the Paperclip server was itself
+ * started with, so they do not shadow the per-run values the adapter assigns.
+ *
+ * This is NOT the security boundary. It only covers the PAPERCLIP_* namespace,
+ * so every other host variable in the server's own process env — DATABASE_URL
+ * and every service credential beside it — flowed straight through to the
+ * spawned harness. {@link applyChildEnvAllowlist} is the enforcing pass;
+ * `runChildProcess` still runs this one first because a PAPERCLIP_* key the
+ * allowlist admits by namespace must not arrive holding the server's value.
+ */
 export function sanitizeInheritedPaperclipEnv(baseEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...baseEnv };
   delete env.PAPERCLIPAI_CMD;
@@ -2371,6 +2395,195 @@ export function sanitizeInheritedPaperclipEnv(baseEnv: NodeJS.ProcessEnv): NodeJ
     delete env[key];
   }
   return env;
+}
+
+/**
+ * The variable names a locally spawned harness child may receive by exact
+ * name, matched case-insensitively (Windows env keys are case-insensitive, and
+ * the proxy variables are conventionally spelled in both cases).
+ *
+ * Every name here is grouped by the reason it must reach the child. A name
+ * with no reason does not belong in the list: the merged child env is built
+ * from the Paperclip server's own `process.env`, which holds the database URL
+ * and every other host credential the server needs and no agent may read.
+ */
+const CHILD_ENV_ALLOWED_KEYS = new Set<string>([
+  // Process plumbing. Without these a spawned CLI cannot find its executable,
+  // its home, a writable temp directory, or a usable locale. `Path`/`PATHEXT`
+  // and the Windows interpreter roots are the win32 spellings that
+  // `resolveCommandPath` and `defaultPathForPlatform` already support.
+  "PATH",
+  "PATHEXT",
+  "HOME",
+  "USERPROFILE",
+  "SHELL",
+  "COMSPEC",
+  "SYSTEMROOT",
+  "WINDIR",
+  "USER",
+  "USERNAME",
+  "LOGNAME",
+  "TMPDIR",
+  "TMP",
+  "TEMP",
+  "TERM",
+  "LANG",
+  "TZ",
+  "PWD",
+  // Headless/TTY presentation the adapters set deliberately on the env they
+  // spawn with: `buildKimiHeadlessEnv` writes CI and NO_COLOR,
+  // `buildGeminiHeadlessEnv` writes COLORTERM, and the login paths write
+  // NO_BROWSER. These are adapter-authored values in the caller's own env, so
+  // dropping them would silently undo the headless shaping.
+  "CI",
+  "NO_COLOR",
+  "COLORTERM",
+  "NO_BROWSER",
+  // Node version managers. The harness CLIs are Node programs, and on a host
+  // that installs them through nvm/volta/asdf/fnm the shim on PATH reads its
+  // root from these. `sanitizeRemoteExecutionEnv` already treats NVM_DIR as
+  // host identity for the same reason (remote-execution-env.ts). Dropping them
+  // turns a working `claude` into "command not found" on such a host.
+  "NVM_DIR",
+  "NVM_BIN",
+  "VOLTA_HOME",
+  "ASDF_DIR",
+  "ASDF_DATA_DIR",
+  "FNM_DIR",
+  "PNPM_HOME",
+  "BUN_INSTALL",
+  // Workspace identity that {@link applyPaperclipWorkspaceEnv} writes outside
+  // the PAPERCLIP_* namespace, so the namespace prefix below does not cover it.
+  "AGENT_HOME",
+  // Provider credentials and routes whose names carry no shared prefix.
+  "GOOGLE_API_KEY",
+  // Proxy and TLS trust. A harness that must egress through a proxy or trust a
+  // private CA fails with an opaque network error when these are severed.
+  "HTTP_PROXY",
+  "HTTPS_PROXY",
+  "ALL_PROXY",
+  "NO_PROXY",
+  "NODE_EXTRA_CA_CERTS",
+  "SSL_CERT_FILE",
+  "SSL_CERT_DIR",
+  "REQUESTS_CA_BUNDLE",
+  // Git transport the agent uses to fetch and push its own work.
+  "GIT_SSH_COMMAND",
+  "SSH_AUTH_SOCK",
+]);
+
+/**
+ * Namespaces a locally spawned harness child may receive whole, matched
+ * case-insensitively on the uppercased key.
+ *
+ * A prefix is here only when the whole namespace is either Paperclip's own or
+ * a harness/provider namespace whose members are generated per run and cannot
+ * be enumerated without rotting: a new provider route or a new PAPERCLIP_*
+ * runtime variable must not be severed the day it is added.
+ */
+const CHILD_ENV_ALLOWED_PREFIXES = [
+  // Paperclip's reserved runtime namespace — identity, wake, approval,
+  // workspace and runtime-service variables the adapter assigns per run. See
+  // `isPaperclipRuntimeEnvKey`. `PAPERCLIPAI_CMD` is `PAPERCLIPAI_`-prefixed,
+  // so it does not match and stays dropped.
+  "PAPERCLIP_",
+  // Locale.
+  "LC_",
+  // XDG roots. OpenCode's runtime config is written under XDG_CONFIG_HOME.
+  "XDG_",
+  // Harness homes, auth and model routes, one namespace per local adapter.
+  // The Claude Code nesting guards (CLAUDECODE, CLAUDE_CODE_ENTRYPOINT, …) are
+  // deleted in `runChildProcess` BEFORE the allowlist runs, so admitting the
+  // CLAUDE_ namespace here does not undo that strip.
+  "CLAUDE_",
+  "ANTHROPIC_",
+  "AWS_",
+  "OPENAI_",
+  "CODEX_",
+  "OPENCODE_",
+  "GEMINI_",
+  "GOOGLE_GENAI_",
+  "GROK_",
+  "XAI_",
+  "KIMI_",
+  "MOONSHOT_",
+  "CURSOR_",
+  "PI_",
+  "OPENROUTER_",
+  "ZAI_",
+  "LITELLM_",
+] as const;
+
+/**
+ * The internal marker variable that carries the adapter/user config env keys
+ * {@link refreshPaperclipWorkspaceEnvForExecution} forwarded for this run.
+ *
+ * Config env is the one legitimate source of caller-intended arbitrary keys: a
+ * `secret_ref` binding can name anything (GH_TOKEN is the common case), and a
+ * static allowlist can never know those names. The forwarding loop records
+ * what it forwarded; {@link applyChildEnvAllowlist} admits exactly those keys
+ * and then deletes the marker, so it never reaches the child.
+ */
+const CHILD_ENV_CONFIG_KEYS_VAR = "PAPERCLIP_CHILD_ENV_CONFIG_KEYS";
+
+export interface ChildEnvAllowlistPolicy {
+  /**
+   * Extra key names this spawn may forward on top of the static allowlist.
+   * Unioned with the names read from {@link CHILD_ENV_CONFIG_KEYS_VAR}.
+   */
+  additionalAllowed?: readonly string[];
+}
+
+function isAllowedChildEnvKey(key: string, additionalAllowed: Set<string>): boolean {
+  const upper = key.toUpperCase();
+  if (CHILD_ENV_ALLOWED_KEYS.has(upper)) return true;
+  if (additionalAllowed.has(upper)) return true;
+  return CHILD_ENV_ALLOWED_PREFIXES.some((prefix) => upper.startsWith(prefix));
+}
+
+/**
+ * Filter a merged child environment down to the deny-by-default allowlist.
+ *
+ * This is the single enforcing pass, and it deliberately runs on the MERGED
+ * env rather than on the inherited half alone. The two halves are not
+ * separable by origin: the model-discovery probes build their `opts.env` as
+ * `{ ...process.env, ...env }` (opencode-local/src/server/models.ts,
+ * pi-local/src/server/models.ts) and the hermes adapter spreads `process.env`
+ * into the env it spawns with, so a host variable arrives through the caller's
+ * own object as readily as through the inherited base. Filtering the merged
+ * result catches every caller of `runChildProcess`, present and future,
+ * instead of trusting each adapter to sanitize what it passes.
+ *
+ * Returns a new env plus the names of the dropped keys. Values are never
+ * returned or logged — see {@link redactEnvForLogs} for the same rule applied
+ * to invocation logging.
+ */
+export function applyChildEnvAllowlist(
+  env: NodeJS.ProcessEnv,
+  policy: ChildEnvAllowlistPolicy = {},
+): { env: NodeJS.ProcessEnv; droppedKeys: string[] } {
+  const additionalAllowed = new Set<string>();
+  for (const key of policy.additionalAllowed ?? []) {
+    additionalAllowed.add(key.toUpperCase());
+  }
+  for (const key of (env[CHILD_ENV_CONFIG_KEYS_VAR] ?? "").split(",")) {
+    const trimmed = key.trim();
+    if (trimmed) additionalAllowed.add(trimmed.toUpperCase());
+  }
+
+  const next: NodeJS.ProcessEnv = {};
+  const droppedKeys: string[] = [];
+  for (const [key, value] of Object.entries(env)) {
+    // The marker is Paperclip's own bookkeeping; the child never sees it.
+    if (key === CHILD_ENV_CONFIG_KEYS_VAR) continue;
+    if (isAllowedChildEnvKey(key, additionalAllowed)) {
+      next[key] = value;
+      continue;
+    }
+    droppedKeys.push(key);
+  }
+  droppedKeys.sort();
+  return { env: next, droppedKeys };
 }
 
 export function defaultPathForPlatform() {
@@ -3377,10 +3590,28 @@ export async function runChildProcess(
       delete rawMerged[key];
     }
 
-    const mergedEnv = ensurePathInEnv(rawMerged);
+    const pathedEnv = ensurePathInEnv(rawMerged);
     if (opts.localProcessSandbox?.homeDir) {
-      mergedEnv.HOME = opts.localProcessSandbox.homeDir;
+      pathedEnv.HOME = opts.localProcessSandbox.homeDir;
     }
+
+    // The deny-by-default boundary, applied at the single spawn site so no
+    // adapter has to remember it. It runs here — after PATH is ensured and the
+    // sandbox HOME override is applied, and before `resolveSpawnTarget` — so
+    // the command is resolved against the same env the child will get, and so
+    // the sandbox's own `target.env` (generated below, deliberately) is merged
+    // in afterwards and never filtered.
+    const allowlisted = applyChildEnvAllowlist(pathedEnv);
+    if (allowlisted.droppedKeys.length > 0) {
+      // Names only, never values: a silent drop turns a missing credential
+      // into an unexplainable harness failure, but the values are the host's
+      // secrets and must not reach a log line.
+      console.debug(
+        { runId, droppedCount: allowlisted.droppedKeys.length, droppedKeys: allowlisted.droppedKeys },
+        "dropped host environment variables that are not on the child env allowlist",
+      );
+    }
+    const mergedEnv = allowlisted.env;
     void resolveSpawnTarget(command, args, opts.cwd, mergedEnv, {
       remoteExecution: opts.remoteExecution ?? null,
       remoteEnv: opts.remoteExecution ? opts.env : null,

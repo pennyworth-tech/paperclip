@@ -9,6 +9,7 @@ import {
   activityLog,
   agents,
   agentRuntimeState,
+  agentTaskSessions,
   agentWakeupRequests,
   authUsers,
   budgetPolicies,
@@ -415,6 +416,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     for (let attempt = 0; attempt < 5; attempt += 1) {
       await db.delete(activityLog);
       await db.delete(heartbeatRunEvents);
+      await db.delete(agentTaskSessions);
       try {
         await db.delete(heartbeatRuns);
         break;
@@ -431,6 +433,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       // attempt so a late insert cannot hold the agents foreign key.
       await db.delete(agentWakeupRequests);
       await db.delete(agentRuntimeState);
+      await db.delete(agentTaskSessions);
       try {
         await db.delete(agents);
         break;
@@ -1544,10 +1547,14 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     ).toEqual([{ status: "running" }]);
   });
 
-  it("terminalizes a never-started local-adapter run without a process-loss retry and releases the issue", async () => {
-    // A local-child run that never recorded a pid earns no process-loss retry
-    // (nothing proved a process to lose), but the reservation — the issue
-    // execution lock — must still be released.
+  it("queues one process-loss retry for a never-started local-adapter run and releases the issue", async () => {
+    // A local-child run that never recorded a pid is the shape a server
+    // restart leaves behind: the child was claimed and lost before the spawn
+    // callback wrote its process metadata. The pid-bearing arm cannot see it
+    // (it gates on the very metadata that was never written), so it used to
+    // terminalize unretried — a silently dropped wake. It now earns the same
+    // single enqueueProcessLossRetry as every other lost execution, and the
+    // reservation — the issue execution lock — is still released either way.
     const { agentId, runId, issueId } = await seedRunFixture({
       adapterType: "codex_local",
       agentStatus: "idle",
@@ -1563,17 +1570,21 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       .select()
       .from(heartbeatRuns)
       .where(eq(heartbeatRuns.agentId, agentId));
+    // The never-started verdict is still carried by the error code: the new
+    // arm changes whether the run is retried, not how the loss is classified.
     expect(runs.find((row) => row.id === runId)).toMatchObject({
       status: "failed",
       errorCode: "process_never_started",
     });
-    // No PROCESS-LOSS retry (nothing proved a process to lose). The immediate
-    // issue-recovery path may enqueue its own continuation reusing
-    // retryOfRunId — that is the designed resume, not a process-loss retry,
-    // and it is told apart by its wake reason.
-    expect(
-      runs.filter((row) => (row.contextSnapshot as Record<string, unknown> | null)?.wakeReason === "process_lost_retry"),
-    ).toHaveLength(0);
+    // Exactly one, and identified by wake reason: the immediate issue-recovery
+    // path also reuses retryOfRunId, so retryOfRunId alone cannot tell a
+    // process-loss retry from the designed resume.
+    const processLossRetries = runs.filter(
+      (row) => (row.contextSnapshot as Record<string, unknown> | null)?.wakeReason === "process_lost_retry",
+    );
+    expect(processLossRetries).toHaveLength(1);
+    expect(processLossRetries[0]?.retryOfRunId).toBe(runId);
+    expect(processLossRetries[0]?.processLossRetryCount).toBe(1);
 
     // The damage this guards against is the fenced issue: assert the dead run no longer
     // owns either reservation column. A promoted recovery run may legitimately
@@ -1586,6 +1597,212 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       })
     );
     expect(issue).not.toBeNull();
+  });
+
+  it("resumes a checkpointed session on the process-loss retry for a never-started local-adapter run", async () => {
+    // The never-started arm exists to earn a retry, but a retry that starts
+    // cold on a checkpointed session buys nothing (spec.md: "the retry SHALL
+    // pass the interrupted run's harness session id to the harness as a
+    // resume argument"). resolveSessionBeforeForWakeup reads the task-session
+    // row by taskKey (issueId, here) and stamps it onto the retry row as
+    // sessionIdBefore -- this is the plumbing enqueueProcessLossRetry shares
+    // with every other retry path, exercised here specifically on the new
+    // never-started arm.
+    const { companyId, agentId, runId, issueId } = await seedRunFixture({
+      adapterType: "codex_local",
+      agentStatus: "idle",
+      processPid: null,
+      processGroupId: null,
+    });
+    await db.insert(agentTaskSessions).values({
+      companyId,
+      agentId,
+      adapterType: "codex_local",
+      taskKey: issueId,
+      sessionParamsJson: { sessionId: "checkpointed-before-loss" },
+      sessionDisplayId: "checkpointed-before-loss",
+      lastRunId: runId,
+      lastError: null,
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reapOrphanedRuns();
+    expect(result).toEqual({ reaped: 1, runIds: [runId] });
+
+    const retryRun = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.retryOfRunId, runId))
+      .then((rows) => rows[0] ?? null);
+    expect(retryRun?.sessionIdBefore).toBe("checkpointed-before-loss");
+  });
+
+  it("does not retry a never-started local-adapter run twice", async () => {
+    // The new never-started arm sits behind the same
+    // `processLossRetryCount < 1` guard as every other arm: a run that already
+    // consumed its one process-loss retry gets none, however it was lost.
+    const { agentId, runId } = await seedRunFixture({
+      adapterType: "codex_local",
+      agentStatus: "idle",
+      processPid: null,
+      processGroupId: null,
+      processLossRetryCount: 1,
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reapOrphanedRuns();
+    expect(result).toEqual({ reaped: 1, runIds: [runId] });
+
+    const runs = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, agentId));
+    expect(
+      runs.filter(
+        (row) => (row.contextSnapshot as Record<string, unknown> | null)?.wakeReason === "process_lost_retry",
+      ),
+    ).toHaveLength(0);
+    expect(runs.filter((row) => (row.processLossRetryCount ?? 0) > 1)).toHaveLength(0);
+    expect(runs.find((row) => row.id === runId)?.errorCode).toBe("process_never_started");
+  });
+
+  it("leaves a never-started monitor dispatch to a future monitor wake instead of retrying it", async () => {
+    // The monitor carve-out on the never-started arm, mirroring the one
+    // remoteExecutionLost already carries: the issue has a monitor check
+    // scheduled in the future, so that wake will redispatch the work. A
+    // process-loss retry here would run the same monitor dispatch twice.
+    const { companyId, agentId, runId, issueId } = await seedRunFixture({
+      adapterType: "codex_local",
+      agentStatus: "idle",
+      processPid: null,
+      processGroupId: null,
+      contextSnapshot: { wakeReason: "issue_monitor_due" },
+    });
+    await db
+      .update(issues)
+      .set({ monitorNextCheckAt: new Date("2099-03-19T00:00:00.000Z") })
+      .where(and(eq(issues.id, issueId), eq(issues.companyId, companyId)));
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reapOrphanedRuns();
+    expect(result).toEqual({ reaped: 1, runIds: [runId] });
+
+    const runs = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, agentId));
+    expect(runs.find((row) => row.id === runId)?.status).toBe("failed");
+    expect(
+      runs.filter(
+        (row) => (row.contextSnapshot as Record<string, unknown> | null)?.wakeReason === "process_lost_retry",
+      ),
+    ).toHaveLength(0);
+  });
+
+  it("does not retry a pid-less local-adapter run whose harness had already produced output", async () => {
+    // The workspace guard on the never-started arm. Arm (a) can redispatch
+    // safely because it NAMES the process it lost and either skips the run or
+    // kills the group first; this arm has no name to check, so it fires only
+    // on positive evidence that no harness entered the worktree. Output past
+    // the pre-dispatch watermark comes only from a spawned child, so this run
+    // is a live-or-recently-live harness whose handle was lost --
+    // redispatching would put a second harness into the same worktree, which
+    // is the corruption the change exists to prevent. The run is still
+    // terminalized; it just earns no retry.
+    const { agentId, runId } = await seedRunFixture({
+      adapterType: "codex_local",
+      agentStatus: "idle",
+      processPid: null,
+      processGroupId: null,
+      lastOutputAt: new Date("2026-03-19T00:00:00.000Z"),
+    });
+    // Two chunks of preamble before dispatch, then a third from the harness.
+    await db
+      .update(heartbeatRuns)
+      .set({ resultJson: { preDispatchOutputSeq: 2 }, lastOutputSeq: 3 })
+      .where(eq(heartbeatRuns.id, runId));
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reapOrphanedRuns();
+    expect(result).toEqual({ reaped: 1, runIds: [runId] });
+
+    const runs = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, agentId));
+    expect(runs.find((row) => row.id === runId)?.status).toBe("failed");
+    expect(
+      runs.filter(
+        (row) => (row.contextSnapshot as Record<string, unknown> | null)?.wakeReason === "process_lost_retry",
+      ),
+    ).toHaveLength(0);
+  });
+
+  it("still retries a pid-less local-adapter run whose only output was the pre-dispatch preamble", async () => {
+    // The other half of the watermark, and the reason the guard is not simply
+    // `lastOutputAt == null`. The server logs its own lines before calling the
+    // adapter -- run-scoped skill notices, runtime workspace warnings -- and
+    // they advance lastOutputAt and lastOutputSeq exactly as harness output
+    // does. Gating on the raw timestamp would therefore deny the retry to
+    // precisely the killed-between-claim-and-spawn runs the arm was added for.
+    const { agentId, runId } = await seedRunFixture({
+      adapterType: "codex_local",
+      agentStatus: "idle",
+      processPid: null,
+      processGroupId: null,
+      lastOutputAt: new Date("2026-03-19T00:00:00.000Z"),
+    });
+    // Dispatch happened, and nothing was written after it.
+    await db
+      .update(heartbeatRuns)
+      .set({ resultJson: { preDispatchOutputSeq: 2 }, lastOutputSeq: 2 })
+      .where(eq(heartbeatRuns.id, runId));
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reapOrphanedRuns();
+    expect(result).toEqual({ reaped: 1, runIds: [runId] });
+
+    const runs = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, agentId));
+    expect(
+      runs.filter(
+        (row) => (row.contextSnapshot as Record<string, unknown> | null)?.wakeReason === "process_lost_retry",
+      ),
+    ).toHaveLength(1);
+  });
+
+  it("retries a pid-less local-adapter run with preamble output but no watermark at all", async () => {
+    // No watermark means the run was killed before the adapter was ever
+    // called, so its output cannot be a harness's however late it looks. The
+    // absence has to read as "never dispatched" rather than "unknown", or the
+    // guard fails closed on the one shape it is supposed to let through.
+    const { agentId, runId } = await seedRunFixture({
+      adapterType: "codex_local",
+      agentStatus: "idle",
+      processPid: null,
+      processGroupId: null,
+      lastOutputAt: new Date("2026-03-19T00:00:00.000Z"),
+    });
+    await db
+      .update(heartbeatRuns)
+      .set({ lastOutputSeq: 2 })
+      .where(eq(heartbeatRuns.id, runId));
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reapOrphanedRuns();
+    expect(result).toEqual({ reaped: 1, runIds: [runId] });
+
+    const runs = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, agentId));
+    expect(
+      runs.filter(
+        (row) => (row.contextSnapshot as Record<string, unknown> | null)?.wakeReason === "process_lost_retry",
+      ),
+    ).toHaveLength(1);
   });
 
   it("restores one lost monitor dispatch before escalating a second process loss", async () => {

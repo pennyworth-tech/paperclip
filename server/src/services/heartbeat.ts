@@ -650,31 +650,38 @@ export interface SharedWorkspaceHolder {
   issueIdentifier: string | null;
 }
 
-// Pre-dispatch gate outcome: another running run currently holds the issue's
-// shared project workspace. Not a failure — the run is parked as a bounded
-// scheduled retry and re-attempted once the holder finishes, so two agents
-// never mutate the same working tree concurrently.
+// Pre-dispatch gate outcome: another running run currently holds the working
+// tree this run needs — the issue's shared project workspace, or the isolated
+// execution workspace an inheriting issue was handed. Not a failure — the run
+// is parked as a bounded scheduled retry and re-attempted once the holder
+// finishes, so two agents never mutate the same working tree concurrently.
+// Exactly one of the two keys is set; `executionWorkspaceId` is the isolated
+// key and carries no project workspace, so `projectWorkspaceId` is nullable
+// rather than duplicated.
 export class WorkspaceBusyDeferral extends Error {
   code = WORKSPACE_BUSY_ERROR_CODE;
   holder: SharedWorkspaceHolder;
-  projectWorkspaceId: string;
+  projectWorkspaceId: string | null;
+  executionWorkspaceId: string | null;
   deferralAttempt: number;
   wasIssueAssignee: boolean;
 
   constructor(input: {
     holder: SharedWorkspaceHolder;
-    projectWorkspaceId: string;
+    projectWorkspaceId?: string | null;
+    executionWorkspaceId?: string | null;
     deferralAttempt: number;
     wasIssueAssignee: boolean;
   }) {
     super(
-      `Shared project workspace is busy: run ${input.holder.runId} (issue ${
-        input.holder.issueIdentifier ?? input.holder.issueId
-      }) is still running`,
+      `${input.executionWorkspaceId ? "Isolated execution workspace" : "Shared project workspace"} is busy: run ${
+        input.holder.runId
+      } (issue ${input.holder.issueIdentifier ?? input.holder.issueId}) is still running`,
     );
     this.name = "WorkspaceBusyDeferral";
     this.holder = input.holder;
-    this.projectWorkspaceId = input.projectWorkspaceId;
+    this.projectWorkspaceId = input.projectWorkspaceId ?? null;
+    this.executionWorkspaceId = input.executionWorkspaceId ?? null;
     this.deferralAttempt = input.deferralAttempt;
     this.wasIssueAssignee = input.wasIssueAssignee;
   }
@@ -6523,6 +6530,23 @@ function buildProcessLossMessage(run: {
   return "Process lost -- server may have restarted";
 }
 
+// Where heartbeatRuns.lastOutputSeq stood when the adapter was called, stashed
+// on the run's resultJson. Its absence means the run never reached dispatch.
+const PRE_DISPATCH_OUTPUT_WATERMARK_KEY = "preDispatchOutputSeq";
+
+// True only when output landed on the row AFTER the adapter was dispatched —
+// i.e. output a harness produced, not the server's own pre-dispatch preamble.
+// Undispatched runs report false rather than "unknown": no adapter was called,
+// so no harness can have written anything.
+function producedPostDispatchOutput(run: {
+  resultJson: unknown;
+  lastOutputSeq: number | null;
+}) {
+  const watermark = parseObject(run.resultJson)[PRE_DISPATCH_OUTPUT_WATERMARK_KEY];
+  if (typeof watermark !== "number" || !Number.isFinite(watermark)) return false;
+  return Number(run.lastOutputSeq ?? 0) > watermark;
+}
+
 function readHotRestartAdoptionMetadata(resultJson: Record<string, unknown> | null | undefined) {
   const result = parseObject(resultJson);
   const hotRestart = parseObject(result.hotRestart);
@@ -10023,6 +10047,26 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       .then((rows) => rows[0] ?? null);
   }
 
+  // Read-modify-write rather than a dedicated column: every other mid-run
+  // writer of resultJson already merges over the row it read, so the watermark
+  // survives them, and finalization replaces the blob wholesale on a run that
+  // is by then terminal and no longer reapable.
+  async function persistPreDispatchOutputWatermark(runId: string, outputSeq: number) {
+    const current = await getRun(runId);
+    return db
+      .update(heartbeatRuns)
+      .set({
+        resultJson: {
+          ...parseObject(current?.resultJson),
+          [PRE_DISPATCH_OUTPUT_WATERMARK_KEY]: outputSeq,
+        },
+        updatedAt: new Date(),
+      })
+      .where(eq(heartbeatRuns.id, runId))
+      .returning()
+      .then((rows) => rows[0] ?? null);
+  }
+
   async function clearDetachedRunWarning(runId: string) {
     const updated = await db
       .update(heartbeatRuns)
@@ -12109,14 +12153,27 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   // shared tree and counts as a holder (over-serializing is the safe
   // direction). When the isolated-workspaces experiment is off, every run
   // resolves to the shared tree, so no holder is excluded.
+  //
+  // The `execution_workspace` key answers the same question for an isolated
+  // worktree: issues that inherited a workspace carry the same
+  // issues.executionWorkspaceId — it is copied onto the child row at issue
+  // creation together with an executionWorkspacePreference of
+  // "reuse_existing", so the column is already populated by the time this gate
+  // runs — and two such issues running at once are two agents in one worktree.
+  // That key deliberately carries no isolated-mode exclusion: the clause above
+  // exists to drop holders that will NOT touch the shared tree, and applied
+  // here it would drop precisely the isolated holders being looked for. Every
+  // other clause — running status, the liveness window, the exclusions, the
+  // ordering — is shared verbatim between the two keys.
   async function findSharedWorkspaceHolder(input: {
     companyId: string;
-    projectWorkspaceId: string;
     excludeIssueId: string;
     excludeRunId: string;
-    honorIsolatedWorkspaceModes: boolean;
     now?: Date;
-  }): Promise<SharedWorkspaceHolder | null> {
+  } & (
+    | { key: "project_workspace"; projectWorkspaceId: string; honorIsolatedWorkspaceModes: boolean }
+    | { key: "execution_workspace"; executionWorkspaceId: string }
+  )): Promise<SharedWorkspaceHolder | null> {
     const staleCutoff = new Date(
       (input.now ?? new Date()).getTime() - WORKSPACE_BUSY_HOLDER_STALE_AFTER_MS,
     );
@@ -12143,9 +12200,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           // Last observed activity: output beats start beats creation. A run
           // that started recently but has not written output yet is live.
           sql`coalesce(${heartbeatRuns.lastOutputAt}, ${heartbeatRuns.startedAt}, ${heartbeatRuns.createdAt}) >= ${staleCutoff.toISOString()}::timestamptz`,
-          eq(issues.projectWorkspaceId, input.projectWorkspaceId),
+          input.key === "project_workspace"
+            ? eq(issues.projectWorkspaceId, input.projectWorkspaceId)
+            : eq(issues.executionWorkspaceId, input.executionWorkspaceId),
           ne(sql`${issues.id}::text`, input.excludeIssueId),
-          ...(input.honorIsolatedWorkspaceModes
+          ...(input.key === "project_workspace" && input.honorIsolatedWorkspaceModes
             ? [
                 or(
                   // Covers both a NULL settings blob and a blob without a mode
@@ -12187,6 +12246,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       resultJson: {
         workspaceBusy: {
           projectWorkspaceId: deferral.projectWorkspaceId,
+          executionWorkspaceId: deferral.executionWorkspaceId,
           holderRunId: deferral.holder.runId,
           holderIssueId: deferral.holder.issueId,
           deferralAttempt: deferral.deferralAttempt,
@@ -12245,6 +12305,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             : `Deferred: ${deferral.message}. No retry could be scheduled; releasing the issue for other runs.`,
         payload: {
           projectWorkspaceId: deferral.projectWorkspaceId,
+          executionWorkspaceId: deferral.executionWorkspaceId,
           holderRunId: deferral.holder.runId,
           holderIssueId: deferral.holder.issueId,
           deferralAttempt: deferral.deferralAttempt,
@@ -13953,17 +14014,63 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         readNonEmptyString(runContext.wakeReason) === "issue_monitor_due" &&
         Boolean(monitorNextCheckAt && monitorNextCheckAt.getTime() > now.getTime());
       const remoteExecutionLost = !tracksLocalChild && !monitorWakeCoveredByFutureCheck;
-      // No never-started arm here, deliberately. A pid-less run on an adapter
-      // with no local child already earns the retry via remoteExecutionLost
-      // above, and a local-child run whose accepted-interaction continuation
-      // never started is retried by the dedicated interaction-continuation
-      // infra path below (3 attempts, interaction context preserved) — a
-      // generic process-loss retry here would pre-empt it with a worse-shaped
-      // one. The never-started verdict itself is carried by lostErrorCode.
+      // The never-started arm. A local-child run that never recorded a pid or a
+      // process group is the shape an interrupted server leaves behind: the
+      // child was claimed and then lost before the spawn callback wrote its
+      // process metadata, so arm (a) — which gates on that very metadata —
+      // never fires and the run used to terminalize unretried. It earns the
+      // same single enqueueProcessLossRetry as every other lost execution, and
+      // the retry resumes the harness session recorded on the task session row.
+      // Both negations are load-bearing, not defensive:
+      //   * an accepted-interaction continuation is retried by the dedicated
+      //     interaction-continuation infra path below (3 attempts, interaction
+      //     context preserved); a generic single process-loss retry here would
+      //     pre-empt it with a strictly worse-shaped one, so the carve-out
+      //     hands those runs to `scheduleInteractionContinuationInfrastructureRetryIfEligible`
+      //     exactly as before;
+      //   * a monitor dispatch whose issue already has a future monitor wake
+      //     scheduled is covered by that wake, mirroring remoteExecutionLost's
+      //     own exclusion above — retrying it would duplicate the dispatch.
+      // Kept as its own disjunct rather than by relaxing arm (a): relaxing (a)
+      // would also change behaviour for pid-BEARING local-child continuation
+      // runs, which is not what this arm is for. The never-started verdict
+      // itself is still carried by lostErrorCode.
+      //
+      // The silence conjuncts are the workspace guard, and they are the reason
+      // this arm is narrower than "no pid". Arm (a) can redispatch safely
+      // because it NAMES the process it lost: the branches above either skip
+      // the run while that pid or group is alive, or terminate the group
+      // before falling through. This arm has no name to check, so it needs
+      // positive evidence that no harness entered the worktree instead, and
+      // post-dispatch output is that evidence — output lands on the row after
+      // the watermark only from a spawned child. A run with harness output and
+      // no pid is a harness that started and whose handle was lost, and
+      // redispatching into its worktree puts two writers on one branch and one
+      // index, which is the corruption this whole change exists to prevent.
+      // The watermark, not lastOutputAt, is what is consulted: the server's own
+      // pre-dispatch preamble advances lastOutputAt too, and gating on the raw
+      // timestamp would deny the retry to exactly the killed-between-claim-and-
+      // spawn runs this arm was added for. processStartedAt is asserted
+      // alongside the pid columns it is written with, matching the all-four
+      // shape NEVER_STARTED_RUN_STARTUP_DEADLINE_MS is documented in.
+      // What this does NOT close: a SIGKILL landing between spawn() returning
+      // and onSpawn committing the pid leaves a live child that has not yet
+      // written output, and no server-side column can distinguish it. Closing
+      // that window needs the pid committed durably before the harness starts,
+      // which is the adapter's side of the spawn, not the reaper's.
+      const neverRecordedAnyProcessActivity =
+        !run.processPid &&
+        !run.processGroupId &&
+        run.processStartedAt == null &&
+        !producedPostDispatchOutput(run);
       const shouldRetry = (run.processLossRetryCount ?? 0) < 1 && (
         (tracksLocalChild && (!!run.processPid || !!run.processGroupId)) ||
         monitorDispatchLostWithoutFutureWake ||
-        remoteExecutionLost
+        remoteExecutionLost ||
+        (tracksLocalChild &&
+          neverRecordedAnyProcessActivity &&
+          !isResolvedInteractionContinuationWakeContext(run.contextSnapshot) &&
+          !monitorWakeCoveredByFutureCheck)
       );
       const neverStartedMessage = `Run never started -- no process metadata and no output within ${NEVER_STARTED_RUN_STARTUP_DEADLINE_MS / 60_000} minutes of claim`;
       const baseMessage = neverStartedPastStartupDeadline
@@ -14907,6 +15014,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // path that serializes.
     if (issueRef?.projectWorkspaceId && effectiveExecutionWorkspaceMode === "shared_workspace") {
       const workspaceHolder = await findSharedWorkspaceHolder({
+        key: "project_workspace",
         companyId: agent.companyId,
         projectWorkspaceId: issueRef.projectWorkspaceId,
         excludeIssueId: issueRef.id,
@@ -14963,6 +15071,53 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           },
           "Dispatching alongside a live shared-workspace holder",
         );
+      }
+    }
+    // The same gate, keyed on the isolated execution workspace instead of the
+    // project workspace. An issue that inherited its parent's workspace carries
+    // the parent's executionWorkspaceId, so "two runs, one worktree" is exactly
+    // as real here as it is on a shared checkout — it just was not being asked
+    // about, because the arm above only ever looks at projectWorkspaceId.
+    //
+    // This arm serializes unconditionally and does NOT consult
+    // sharedWorkspaceConcurrency. "allow" is a coherent policy for a shared
+    // checkout, where the agents are told to coordinate via commits and the
+    // tree is the project's; it is corruption for an inherited worktree, which
+    // has one branch and one index and no such protocol. The concurrent-dispatch
+    // note above is therefore unreachable from here by construction.
+    //
+    // Keyed on the workspace id alone, with no mode clause. The id and the
+    // reuse preference are read off the issue row above without consulting
+    // `effectiveExecutionWorkspaceMode`, and that row is written at issue
+    // creation by the inheritance path — so the id binds the worktree whether
+    // or not the run's mode is one of ISOLATED_EXECUTION_WORKSPACE_MODES.
+    // Gating on the mode would key the gate on how the workspace was
+    // REQUESTED rather than on what it BINDS, and with
+    // `enableIsolatedWorkspaces` off — the current state — every mode resolves
+    // away from isolated while the inherited ids stay exactly where they were,
+    // so two issues on one worktree would walk past the gate entirely.
+    if (issueRef && requestedExecutionWorkspaceId) {
+      const isolatedWorkspaceHolder = await findSharedWorkspaceHolder({
+        key: "execution_workspace",
+        companyId: agent.companyId,
+        executionWorkspaceId: requestedExecutionWorkspaceId,
+        excludeIssueId: issueRef.id,
+        excludeRunId: run.id,
+      });
+      if (isolatedWorkspaceHolder) {
+        // Same ladder, same staleness semantics, same attempt derivation as the
+        // shared arm: the deferral has no ceiling, and holder liveness
+        // (WORKSPACE_BUSY_HOLDER_STALE_AFTER_MS) is what stops a zombie holder
+        // from parking this run forever.
+        throw new WorkspaceBusyDeferral({
+          holder: isolatedWorkspaceHolder,
+          executionWorkspaceId: requestedExecutionWorkspaceId,
+          deferralAttempt:
+            run.scheduledRetryReason === WORKSPACE_BUSY_RETRY_REASON
+              ? (run.scheduledRetryAttempt ?? 0)
+              : 0,
+          wasIssueAssignee: issueContext?.assigneeAgentId === agent.id,
+        });
       }
     }
     const workspaceManagedConfig = buildExecutionWorkspaceAdapterConfig({
@@ -15928,6 +16083,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
     let seq = 1;
     let handle: RunLogHandle | null = null;
+    // The last session state the running harness checkpointed to us, if any.
+    // Declared out here rather than beside onAdapterEvent because the
+    // adapter-threw catch below reads it: there `previousSessionParams` is the
+    // pre-dispatch snapshot and would otherwise overwrite a session id that
+    // exists only because this run minted it mid-flight. Held in a cell rather
+    // than a bare `let` because the only writer is the event callback, and
+    // control-flow analysis does not follow assignments made inside a nested
+    // function — a plain `let` would narrow to `never` at the read below.
+    const checkpointedSession: {
+      current: { params: Record<string, unknown> | null; displayId: string | null } | null;
+    } = { current: null };
     let stdoutExcerpt = "";
     let stderrExcerpt = "";
     let outputSeq = Number(run.lastOutputSeq ?? 0);
@@ -16235,6 +16401,68 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           message: event.message,
           payload: event.payload,
         });
+        // Mid-run session checkpoint. A harness that mints or rotates its
+        // session id tells us here rather than waiting for the run to finish,
+        // and persisting it now is the entire point: a run killed by a server
+        // restart never reaches the finalization upsert, so this row is the
+        // only evidence of the session it was holding. The process-loss retry
+        // picks it up because enqueueProcessLossRetry resolves its session
+        // through resolveSessionBeforeForWakeup, which reads agentTaskSessions
+        // first whenever a taskKey exists — no runtime-state write is needed
+        // alongside it. The event is still appended above; the sink observes,
+        // it does not swallow.
+        //
+        // The event name is a literal on purpose: it is the wire contract
+        // between the harness and this sink, and importing an adapter-side
+        // constant across that boundary for one string would couple the server
+        // to an adapter module.
+        if (eventType !== "session.checkpoint" || !taskKey) return;
+        try {
+          const payload = parseObject(event.payload);
+          const checkpointSessionId = readNonEmptyString(payload.sessionId);
+          const candidateParams =
+            normalizeSessionParams(parseObject(payload.sessionParams)) ??
+            (checkpointSessionId ? { sessionId: checkpointSessionId } : null);
+          if (!candidateParams) return;
+          // Round-trip through the codec exactly as resolveNextSessionState
+          // does, so a checkpointed row and a finalized row are byte-identical
+          // for the same session and the resume path cannot tell them apart.
+          const serialized = normalizeSessionParams(sessionCodec.serialize(candidateParams));
+          const deserialized = normalizeSessionParams(sessionCodec.deserialize(serialized));
+          const displayId = truncateDisplayId(
+            (sessionCodec.getDisplayId ? sessionCodec.getDisplayId(deserialized) : null) ??
+              readNonEmptyString(deserialized?.sessionId) ??
+              checkpointSessionId,
+          );
+          checkpointedSession.current = { params: serialized, displayId };
+          await upsertTaskSession({
+            companyId: agent.companyId,
+            agentId: agent.id,
+            adapterType: agent.adapterType,
+            taskKey,
+            // The metadata attach mirrors the finalization upsert and is not
+            // optional: resolveTaskSessionConfigFreshness treats a row with no
+            // stored config fingerprint as "fingerprint metadata is missing"
+            // and resets the session — which would discard precisely the
+            // session this checkpoint exists to preserve.
+            sessionParamsJson: attachPaperclipSessionMetadataToSessionParams(
+              serialized,
+              configuredModel,
+              sessionConfigMetadata,
+            ),
+            sessionDisplayId: displayId,
+            lastRunId: currentRun.id,
+            lastError: null,
+          });
+        } catch (err) {
+          // Best effort by design. The checkpoint is a resumability
+          // optimisation; failing it must not abort the adapter's event loop
+          // and take the live run down with it.
+          logger.warn(
+            { err, runId: currentRun.id, taskKey },
+            "failed to persist mid-run session checkpoint",
+          );
+        }
       };
 
       const runtimeResolution = resolveHeartbeatRuntimeMode({
@@ -16452,6 +16680,21 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         // finalize=failed from the catch path below.
         adapterFinalizeOutcome = status;
       };
+
+      // The pre-dispatch output watermark, and the last thing written before
+      // the adapter is handed the run. Everything the server itself logs
+      // beforehand — the run-scoped skill notice, runtime workspace warnings, a
+      // failed workspace-ready comment — advances lastOutputAt and
+      // lastOutputSeq exactly as harness output does, so afterwards the orphan
+      // reaper cannot tell "a harness wrote here" from "Paperclip printed a
+      // preamble" by either column alone. Recording where the sequence stood at
+      // dispatch makes that distinction durable, and the never-started retry
+      // arm gates on it: that arm redispatches INTO the workspace, so it must
+      // fire only where nothing can be writing there. A run killed before this
+      // write leaves no watermark, which the reaper reads as "never reached
+      // dispatch" — the correct answer, since no adapter was called.
+      await flushOutputProgress({ force: true });
+      await persistPreDispatchOutputWatermark(run.id, outputSeq);
 
       let adapterResult: Awaited<ReturnType<typeof adapter.execute>>;
       try {
@@ -16689,13 +16932,24 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         outcome = "failed";
       }
 
+      // The same substitution the adapter-threw catch below makes, for the
+      // adapter-RETURNED path. `previousSessionParams` is the pre-dispatch
+      // snapshot and is strictly staler than anything the run checkpointed
+      // mid-flight, so it is the checkpoint that stands in as "previous" here.
+      // It matters for every result that names no session of its own —
+      // `timedOut`, a SIGTERM-interrupted adapter that returns rather than
+      // throws, an ordinary success the harness reported no id for — because
+      // that is exactly `resolveNextSessionState`'s `shouldUsePrevious`
+      // fallback, and with a null snapshot it resolves to nothing and the
+      // clear below fires on a session that is alive. A result that DOES name
+      // a session still wins, and `clearSession` still wins outright.
       const nextSessionState = resolveNextSessionState({
         adapterType: agent.adapterType,
         codec: sessionCodec,
         adapterResult,
         outcome,
-        previousParams: previousSessionParams,
-        previousDisplayId: runtimeForAdapter.sessionDisplayId,
+        previousParams: checkpointedSession.current?.params ?? previousSessionParams,
+        previousDisplayId: checkpointedSession.current?.displayId ?? runtimeForAdapter.sessionDisplayId,
         previousLegacySessionId: runtimeForAdapter.sessionId,
       });
       const rawUsage = normalizeUsageTotals(adapterResult.usage);
@@ -16984,7 +17238,20 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           legacySessionId: nextSessionState.legacySessionId,
         }, normalizedUsage);
         if (taskKey) {
-          if (adapterResult.clearSession || (!nextSessionState.params && !nextSessionState.displayId)) {
+          // The substitution above covers results that name no session at all.
+          // It does not cover a result that names one EXPLICITLY as null:
+          // `resolveNextSessionState` reads `sessionParams !== undefined` as
+          // "the adapter answered", so codex's output-inactivity monitor —
+          // which kills the child and returns `sessionParams: null` — still
+          // resolves to nothing and would delete a session the harness had
+          // already checkpointed. A checkpoint is durable evidence that this
+          // run held a session, and "the adapter named nothing" is not a
+          // decision to discard it. `clearSession` — the poison guard — still
+          // is, so it keeps winning outright.
+          const resolvedNoSession = !nextSessionState.params && !nextSessionState.displayId;
+          const preservedCheckpoint =
+            resolvedNoSession && !adapterResult.clearSession ? checkpointedSession.current : null;
+          if (adapterResult.clearSession || (resolvedNoSession && !preservedCheckpoint)) {
             await clearTaskSessions(agent.companyId, agent.id, {
               taskKey,
               adapterType: agent.adapterType,
@@ -16996,11 +17263,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               adapterType: agent.adapterType,
               taskKey,
               sessionParamsJson: attachPaperclipSessionMetadataToSessionParams(
-                nextSessionState.params,
+                preservedCheckpoint?.params ?? nextSessionState.params,
                 configuredModel,
                 sessionConfigMetadata,
               ),
-              sessionDisplayId: nextSessionState.displayId,
+              sessionDisplayId: preservedCheckpoint?.displayId ?? nextSessionState.displayId,
               lastRunId: finalizedRun.id,
               lastError: runErrorMessage,
             });
@@ -17134,18 +17401,28 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           legacySessionId: runtimeForAdapter.sessionId,
         });
 
-        if (taskKey && (previousSessionParams || previousSessionDisplayId || taskSession)) {
+        // Prefer whatever the run checkpointed mid-flight over the pre-dispatch
+        // snapshot. `previousSessionParams` was read before the adapter ran, so
+        // for an interrupted run that minted a NEW harness session id it is
+        // strictly stale — writing it back here strands that session and the
+        // next wake starts cold, which is exactly the defect this path had. The
+        // checkpoint is unconditionally the newer of the two, and the adapter
+        // threw rather than returning a result, so there is no clearSession
+        // signal to honour: the finalization upsert above stays the only place
+        // a session is deliberately cleared or overwritten (including when
+        // claude's poison guard drops the id).
+        if (taskKey && (previousSessionParams || previousSessionDisplayId || taskSession || checkpointedSession.current)) {
           await upsertTaskSession({
             companyId: agent.companyId,
             agentId: agent.id,
             adapterType: agent.adapterType,
             taskKey,
             sessionParamsJson: attachPaperclipSessionMetadataToSessionParams(
-              previousSessionParams,
+              checkpointedSession.current?.params ?? previousSessionParams,
               configuredModel,
               sessionConfigMetadata,
             ),
-            sessionDisplayId: previousSessionDisplayId,
+            sessionDisplayId: checkpointedSession.current?.displayId ?? previousSessionDisplayId,
             lastRunId: failedRun.id,
             lastError: message,
           });

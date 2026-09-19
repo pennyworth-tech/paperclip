@@ -48,6 +48,13 @@ import {
   readPaperclipIssueWorkModeFromContext,
   resolveLegacyPaperclipDesiredSkillNames,
 } from "@paperclipai/adapter-utils/server-utils";
+import {
+  SESSION_CHECKPOINT_EVENT_TYPE,
+  SESSION_RECOVERY_EVENT_TYPE,
+  createStreamSessionIdLatch,
+  type SessionCheckpointPayload,
+  type SessionRecoveryPayload,
+} from "@paperclipai/adapter-utils/session-checkpoint";
 import { isOpenCodeUnknownSessionError, parseOpenCodeJsonl } from "./parse.js";
 import {
   ensureOpenCodeModelConfiguredAndAvailable,
@@ -219,7 +226,7 @@ async function buildOpenCodeSkillsDir(config: Record<string, unknown>): Promise<
 }
 
 export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExecutionResult> {
-  const { runId, agent, runtime, config, context, onLog, onMeta, onSpawn, authToken } = ctx;
+  const { runId, agent, runtime, config, context, onLog, onMeta, onEvent, onSpawn, authToken } = ctx;
   const executionTarget = readAdapterExecutionTarget({
     executionTarget: ctx.executionTarget,
     legacyRemoteExecution: ctx.executionTransport?.remoteExecution,
@@ -596,7 +603,90 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       return args;
     };
 
-    const runAttempt = async (resumeSessionId: string | null) => {
+    // Why the recorded session is not being resumed, in the same words the logs
+    // above already use. This is the `reason` on the `session.recovery` event.
+    const freshSessionReason = sessionId
+      ? null
+      : !runtimeSessionId
+      ? "No OpenCode session was recorded for this task"
+      : `Recorded OpenCode session "${runtimeSessionId}" was saved for cwd "${runtimeSessionCwd}" or a different execution target, not "${effectiveExecutionCwd}"`;
+
+    // Hoisted out of the finalization path so the provisional checkpoint and the
+    // final AdapterExecutionResult persist one shape.
+    const buildSessionParams = (sessionIdForParams: string): Record<string, unknown> => ({
+      sessionId: sessionIdForParams,
+      cwd: effectiveExecutionCwd,
+      ...(workspaceId ? { workspaceId } : {}),
+      ...(workspaceRepoUrl ? { repoUrl: workspaceRepoUrl } : {}),
+      ...(workspaceRepoRef ? { repoRef: workspaceRepoRef } : {}),
+      ...(executionTargetIsRemote
+        ? {
+            remoteExecution: adapterExecutionTargetSessionIdentity(runtimeExecutionTarget),
+          }
+        : {}),
+    });
+
+    // Fire-and-forget by design. The checkpoint is emitted from inside the
+    // stdout path, and awaiting it would apply backpressure to the child: the
+    // process runner pauses the readable and serializes every onLog call
+    // through its logChain before resuming. The `.catch` is not optional — an
+    // unhandled rejection from the host sink would take the whole process down.
+    const emitSessionCheckpoint = (payload: SessionCheckpointPayload) => {
+      void onEvent?.({
+        eventType: SESSION_CHECKPOINT_EVENT_TYPE,
+        stream: "system",
+        payload: { ...payload },
+      })?.catch(() => {
+        // The checkpoint is provisional; losing one costs a resume, not the run.
+      });
+    };
+
+    // Recovery events are emitted once per run, off the stdout hot path, so
+    // they are awaited normally.
+    const emitSessionRecovery = async (payload: SessionRecoveryPayload) => {
+      if (!onEvent) return;
+      await onEvent({
+        eventType: SESSION_RECOVERY_EVENT_TYPE,
+        stream: "system",
+        payload: { ...payload },
+      });
+    };
+
+    const runAttempt = async (
+      resumeSessionId: string | null,
+      attempt: number,
+      freshReason: string | null,
+    ) => {
+      // OpenCode never lets the caller name the session, and unlike Codex it has
+      // no named session-start event either: parseOpenCodeJsonl takes
+      // `event.sessionID` off whichever event happens to carry it first. That is
+      // precisely why the latch re-parses the whole accumulated buffer instead
+      // of watching for an event type — there is no type to watch for.
+      //
+      // Scoped to the attempt, never outside it. The retry below runs attempt 1
+      // with the recorded id and attempt 2 with a fresh session; a latch that
+      // outlived the attempt boundary would checkpoint the dead session over the
+      // live one.
+      const latch = createStreamSessionIdLatch({
+        parse: parseOpenCodeJsonl,
+        onSessionId: (streamSessionId) => {
+          emitSessionCheckpoint({
+            attempt,
+            sessionId: streamSessionId,
+            sessionParams: buildSessionParams(streamSessionId),
+            // Harness-confirmed: OpenCode named this session in its own stream,
+            // so it demonstrably exists and a later absence is outcome 3.
+            source: "stream",
+          });
+        },
+      });
+      if (!resumeSessionId) {
+        await emitSessionRecovery({
+          outcome: runtimeSessionId ? "fresh_missing" : "fresh_none",
+          sessionId: runtimeSessionId || null,
+          reason: freshReason ?? "No OpenCode session was recorded for this task",
+        });
+      }
       const args = buildArgs(resumeSessionId);
       if (onMeta) {
         await onMeta({
@@ -620,7 +710,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         graceSec,
         onSpawn,
         onRuntimeProgress: ctx.onRuntimeProgress,
-        onLog,
+        onLog: async (stream, chunk) => {
+          if (stream === "stdout") latch.push(chunk);
+          await onLog(stream, chunk);
+        },
         runLogTail: paperclipBridge?.runLogTail,
         settleRunDisposition: paperclipBridge?.settleRunDisposition,
       });
@@ -628,6 +721,12 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         proc,
         rawStderr: proc.stderr,
         parsed: parseOpenCodeJsonl(proc.stdout),
+        // The session id as the latch saw it, carried out to finalization.
+        // `proc.stdout` is only the last MAX_CAPTURE_BYTES of the stream, so on
+        // any run long enough to matter the first id-carrying event has
+        // scrolled off it and `parsed.sessionId` is null — including when the
+        // run succeeds. The latch read it from the first chunk.
+        streamSessionId: latch.sessionId,
       };
     };
 
@@ -636,36 +735,49 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         proc: { exitCode: number | null; signal: string | null; timedOut: boolean; stdout: string; stderr: string; errorCode?: string | null };
         rawStderr: string;
         parsed: ReturnType<typeof parseOpenCodeJsonl>;
+        streamSessionId: string | null;
       },
       clearSessionOnMissingSession = false,
     ): AdapterExecutionResult => {
       if (attempt.proc.timedOut) {
+        // Name the session the attempt ran under. A result that names neither a
+        // sessionId nor sessionParams is not neutral: resolveNextSessionState
+        // falls back to the pre-dispatch snapshot and writes it over the
+        // checkpoint this run persisted mid-stream, so a timeout — the common
+        // case this mechanism exists for — would delete its own session and the
+        // retry would start cold. A null id means the harness never named a
+        // session, and then there is nothing to keep and today's shape stands.
+        const timedOutSessionId = attempt.streamSessionId;
         return {
           exitCode: attempt.proc.exitCode,
           signal: attempt.proc.signal,
           timedOut: true,
           errorMessage: `Timed out after ${timeoutSec}s`,
-          clearSession: clearSessionOnMissingSession,
+          ...(timedOutSessionId
+            ? {
+                sessionId: timedOutSessionId,
+                sessionParams: buildSessionParams(timedOutSessionId),
+                sessionDisplayId: timedOutSessionId,
+              }
+            : {}),
+          clearSession: Boolean(clearSessionOnMissingSession && !timedOutSessionId),
         };
       }
 
+      // `attempt.parsed` reads the captured stdout TAIL; the latch read the
+      // stream from its first byte. Preferring the parse keeps the existing
+      // precedence, and the latch is what still holds the id once the first
+      // id-carrying event has scrolled out of the 4 MB capture window.
       const resolvedSessionId =
         attempt.parsed.sessionId ??
+        attempt.streamSessionId ??
         (clearSessionOnMissingSession ? null : runtimeSessionId ?? runtime.sessionId ?? null);
-      const resolvedSessionParams = resolvedSessionId
-        ? ({
-            sessionId: resolvedSessionId,
-            cwd: effectiveExecutionCwd,
-            ...(workspaceId ? { workspaceId } : {}),
-            ...(workspaceRepoUrl ? { repoUrl: workspaceRepoUrl } : {}),
-            ...(workspaceRepoRef ? { repoRef: workspaceRepoRef } : {}),
-            ...(executionTargetIsRemote
-              ? {
-                  remoteExecution: adapterExecutionTargetSessionIdentity(runtimeExecutionTarget),
-                }
-              : {}),
-          } as Record<string, unknown>)
-        : null;
+      // The checkpoint above is PROVISIONAL: it fires the moment the session id
+      // appears in the stream, before anything is known about how the run ends.
+      // This result stays authoritative — when it resolves to a null session id
+      // it must still carry `clearSession` so the host drops a checkpoint the
+      // run later invalidated.
+      const resolvedSessionParams = resolvedSessionId ? buildSessionParams(resolvedSessionId) : null;
 
       const parsedError = typeof attempt.parsed.errorMessage === "string" ? attempt.parsed.errorMessage.trim() : "";
       const stderrLine = firstNonEmptyLine(attempt.proc.stderr);
@@ -704,12 +816,16 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           stderr: attempt.proc.stderr,
         },
         summary: attempt.parsed.summary,
-        clearSession: Boolean(clearSessionOnMissingSession && !attempt.parsed.sessionId),
+        // `resolvedSessionId`, not `parsed.sessionId`: on the retry path the
+        // fresh session's id can reach us through the latch alone, and clearing
+        // it because the captured tail no longer names it is the same deletion
+        // the timeout branch above exists to stop.
+        clearSession: Boolean(clearSessionOnMissingSession && !resolvedSessionId),
       };
     };
 
     try {
-      const initial = await runAttempt(sessionId);
+      const initial = await runAttempt(sessionId, 1, freshSessionReason);
       const initialFailed =
         !initial.proc.timedOut && ((initial.proc.exitCode ?? 0) !== 0 || Boolean(initial.parsed.errorMessage));
       if (
@@ -721,8 +837,27 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           "stdout",
           `[paperclip] OpenCode session "${sessionId}" is unavailable; retrying with a fresh session.\n`,
         );
-        const retry = await runAttempt(null);
+        // The resume itself failed, so this run's outcome is fresh_missing and
+        // attempt 2 emits it — which is why attempt 1 emitted no recovery event
+        // when it resumed. One recovery event per run, naming the lost session.
+        const retry = await runAttempt(
+          null,
+          2,
+          `Recorded OpenCode session "${sessionId}" is unavailable to the harness`,
+        );
         return toResult(retry, true);
+      }
+
+      if (sessionId) {
+        // The resume attempt ran and the harness did not report the session as
+        // unknown: outcome 2, the conversation survived. Emitted here rather
+        // than at spawn because "resumed" is only knowable once the harness has
+        // accepted the id.
+        await emitSessionRecovery({
+          outcome: "resumed",
+          sessionId,
+          reason: `Resumed OpenCode session "${sessionId}" in "${effectiveExecutionCwd}"`,
+        });
       }
 
       return toResult(initial);

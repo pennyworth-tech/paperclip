@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -51,6 +52,14 @@ import {
   stringifyPaperclipWakePayload,
   DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
 } from "@paperclipai/adapter-utils/server-utils";
+import {
+  SESSION_CHECKPOINT_EVENT_TYPE,
+  SESSION_RECOVERY_EVENT_TYPE,
+  buildClaudeTranscriptProbePath,
+  createStreamSessionIdLatch,
+  type SessionCheckpointPayload,
+  type SessionRecoveryPayload,
+} from "@paperclipai/adapter-utils/session-checkpoint";
 import { buildSkillLibraryManifestMarkdown } from "@paperclipai/adapter-utils/skill-library-manifest";
 import {
   parseLocalProcessFilesystemScope,
@@ -413,7 +422,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     await ctx.onLog("stderr", formatClaudeAcpFallbackMessage(engineSelection.fallbackReason));
   }
 
-  const { runId, agent, runtime, config, context, onLog, onMeta, onSpawn, authToken } = ctx;
+  const { runId, agent, runtime, config, context, onLog, onMeta, onEvent, onSpawn, authToken } = ctx;
   const executionTarget = readAdapterExecutionTarget({
     executionTarget: ctx.executionTarget,
     legacyRemoteExecution: ctx.executionTransport?.remoteExecution,
@@ -766,11 +775,76 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       ? runtimeMcpServers.length === 0
       : runtimeMcpServerIdentity === runtimeMcpIdentity;
   const isValidUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(runtimeSessionId);
+  // The cwd the recorded session actually belongs to. Sessions saved before the
+  // adapter recorded a cwd carry an empty string; fall back to the execution cwd
+  // so the legacy shape keeps behaving as it did.
+  const recordedSessionCwd = runtimeSessionCwd || effectiveExecutionCwd;
+  // The CLI encodes the child's own `process.cwd()`, which the OS has already
+  // resolved through any symlink on the way in — a macOS `/var/folders/...`
+  // workspace is filed under `-private-var-folders-...`, and the same is true
+  // of a symlinked worktree root or a `/tmp` that points elsewhere. Resolving
+  // the recorded cwd the same way is what keeps the probe looking in the
+  // directory that actually exists. A cwd that no longer resolves falls back to
+  // the raw string; the probe then misses, which is the right answer anyway.
+  //
+  // Only an errno that actually means "not there" may be read as absence.
+  // PAPERCLIP_HOME is a gcsfuse mount, where a stat can answer EIO or stall
+  // while the transcript is perfectly intact; treating that as absence
+  // discards a live 40-turn session and mints a fresh one. ENOTDIR is included
+  // because a missing parent directory surfaces that way rather than as ENOENT.
+  const isAbsentErrno = (err: unknown) => {
+    const code = (err as NodeJS.ErrnoException | null)?.code;
+    return code === "ENOENT" || code === "ENOTDIR";
+  };
+  const describeProbeErrno = (err: unknown) =>
+    (err as NodeJS.ErrnoException | null)?.code ?? (err instanceof Error ? err.message : String(err));
+  // Set when the filesystem declined to answer rather than answering "absent".
+  // An inconclusive probe must not discard anything: the resume proceeds and
+  // the CLI's own unknown-session error stays the backstop, which costs one
+  // attempt instead of a conversation.
+  let transcriptProbeInconclusive: string | null = null;
+  let transcriptProbeCwd = recordedSessionCwd;
+  try {
+    transcriptProbeCwd = await fs.realpath(recordedSessionCwd);
+  } catch (err) {
+    // A cwd that is simply gone leaves the raw string as the slug to probe,
+    // which is the pre-existing behaviour and the right one. Any other errno
+    // means the filesystem did not answer, so the slug may be the wrong one
+    // and the probe below cannot be trusted to mean anything.
+    if (!isAbsentErrno(err)) {
+      transcriptProbeInconclusive = `recorded cwd "${recordedSessionCwd}" did not resolve (${describeProbeErrno(err)})`;
+    }
+  }
+  // Transcript-existence gate. The Claude CLI answers `--resume <id>` from an
+  // on-disk JSONL under its projects directory; when that file is gone (the
+  // worktree was rebuilt, the config dir was cleared, or the session was only
+  // ever a server-side record), passing --resume burns a whole attempt on an
+  // unknown-session error before the retry starts fresh. Probe first and start
+  // fresh directly, recording why. Local execution only: a recorded remote cwd
+  // stat'd against the host filesystem means nothing.
+  let transcriptMissingReason: string | null = null;
+  if (!executionTargetIsRemote && runtimeSessionId.length > 0 && isValidUuid && !transcriptProbeInconclusive) {
+    const transcriptProbePath = buildClaudeTranscriptProbePath({
+      claudeConfigDir: resolveSharedClaudeConfigDir(effectiveEnv),
+      recordedCwd: transcriptProbeCwd,
+      sessionId: runtimeSessionId,
+    });
+    try {
+      await fs.stat(transcriptProbePath);
+    } catch (err) {
+      if (isAbsentErrno(err)) {
+        transcriptMissingReason = `Claude session transcript "${transcriptProbePath}" does not exist`;
+      } else {
+        transcriptProbeInconclusive = `probing "${transcriptProbePath}" failed (${describeProbeErrno(err)})`;
+      }
+    }
+  }
   const canResumeSession =
     runtimeSessionId.length > 0 &&
     isValidUuid &&
     hasMatchingPromptBundle &&
     hasMatchingMcpServers &&
+    transcriptMissingReason === null &&
     claudeSessionCwdMatchesExecutionTarget({
       runtimeSessionCwd,
       effectiveExecutionCwd,
@@ -778,6 +852,18 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     }) &&
     adapterExecutionTargetSessionMatches(runtimeRemoteExecution, runtimeExecutionTarget);
   const sessionId = canResumeSession ? runtimeSessionId : null;
+  if (transcriptMissingReason) {
+    await onLog(
+      "stdout",
+      `[paperclip] ${transcriptMissingReason}; starting a fresh session.\n`,
+    );
+  }
+  if (transcriptProbeInconclusive) {
+    await onLog(
+      "stdout",
+      `[paperclip] Claude session transcript probe was inconclusive: ${transcriptProbeInconclusive}; resuming anyway.\n`,
+    );
+  }
   if (runtimeSessionId && !isValidUuid) {
     await onLog(
       "stdout",
@@ -822,6 +908,22 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       `[paperclip] Claude session "${runtimeSessionId}" was saved with a different runtime MCP server set and will not be resumed.\n`,
     );
   }
+  // Why the recorded session is not being resumed, in the same words the logs
+  // above already use. This is the `reason` on the `session.recovery` event, so
+  // a lost conversation names its cause instead of looking like a first run.
+  const freshSessionReason = canResumeSession
+    ? null
+    : !runtimeSessionId
+    ? "No Claude session was recorded for this task"
+    : !isValidUuid
+    ? `Recorded Claude session "${runtimeSessionId}" is not a valid UUID`
+    : transcriptMissingReason
+    ? transcriptMissingReason
+    : !hasMatchingPromptBundle
+    ? `Recorded Claude session "${runtimeSessionId}" was saved for prompt bundle "${runtimePromptBundleKey}", not "${promptBundle.bundleKey}"`
+    : !hasMatchingMcpServers
+    ? `Recorded Claude session "${runtimeSessionId}" was saved with a different runtime MCP server set`
+    : `Recorded Claude session "${runtimeSessionId}" was saved for cwd "${runtimeSessionCwd}" or a different execution target, not "${effectiveExecutionCwd}"`;
   const bootstrapPromptTemplate = asString(config.bootstrapPromptTemplate, "");
   const templateData = {
     agentId: agent.id,
@@ -864,12 +966,78 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     heartbeatPromptChars: renderedPrompt.length,
   };
 
+  // Claude is the one harness where the caller can name the session up front:
+  // `claude --session-id <uuid>` (verified against the installed CLI, which
+  // documents it as "Use a specific session ID for the..."). Minting it here
+  // means the run's session id exists before the child does, so a run killed
+  // after spawn but before the first structured event still has something to
+  // resume. Minted once per execute(): the retry below only fires when the
+  // first attempt passed --resume, so at most one fresh attempt ever runs.
+  const mintedFreshSessionId = randomUUID();
+
+  // Everything but the session id is known before the spawn, so the provisional
+  // checkpoint and the final AdapterExecutionResult can share one shape rather
+  // than drifting apart. Keeps `cwd` (not effectiveExecutionCwd) because that is
+  // what the resume gate above reads back out of runtimeSessionParams.
+  const buildSessionParams = (sessionIdForParams: string): Record<string, unknown> => ({
+    sessionId: sessionIdForParams,
+    cwd,
+    promptBundleKey: promptBundle.bundleKey,
+    mcpServerIdentity: runtimeMcpIdentity,
+    ...(executionTargetIsRemote
+      ? {
+          remoteExecution: adapterExecutionTargetSessionIdentity(runtimeExecutionTarget),
+        }
+      : {}),
+    ...(workspaceId ? { workspaceId } : {}),
+    ...(workspaceRepoUrl ? { repoUrl: workspaceRepoUrl } : {}),
+    ...(workspaceRepoRef ? { repoRef: workspaceRepoRef } : {}),
+  });
+
+  // The awaited form, used from onSpawn. That call site runs once per attempt
+  // and is not the stdout hot path, so it can afford to wait — and it has to:
+  // the checkpoint must land BEFORE onSpawn records the pid, or a run can have
+  // a pid and no checkpoint, which is the exact window minting exists to close.
+  // A rejecting sink still must not fail the run; the checkpoint is provisional.
+  const persistSessionCheckpoint = async (payload: SessionCheckpointPayload) => {
+    if (!onEvent) return;
+    await onEvent({
+      eventType: SESSION_CHECKPOINT_EVENT_TYPE,
+      stream: "system",
+      payload: { ...payload },
+    }).catch(() => {
+      // The checkpoint is provisional; losing one costs a resume, not the run.
+    });
+  };
+
+  // Fire-and-forget by design, and only from the stdout path: awaiting there
+  // would apply backpressure to the child, because the process runner pauses
+  // the readable and serializes every onLog call through its logChain before
+  // resuming.
+  const emitSessionCheckpoint = (payload: SessionCheckpointPayload) => {
+    void persistSessionCheckpoint(payload);
+  };
+
+  // Recovery events are emitted once per run, off the stdout hot path, so they
+  // are awaited normally.
+  const emitSessionRecovery = async (payload: SessionRecoveryPayload) => {
+    if (!onEvent) return;
+    await onEvent({
+      eventType: SESSION_RECOVERY_EVENT_TYPE,
+      stream: "system",
+      payload: { ...payload },
+    });
+  };
+
   const buildClaudeArgs = (
     resumeSessionId: string | null,
     attemptInstructionsFilePath: string | undefined,
   ) => {
     const args = ["--print", "--output-format", "stream-json", "--verbose"];
+    // --session-id and --resume are mutually exclusive: resuming already names
+    // the session, and passing both asks the CLI to adopt two identities.
     if (resumeSessionId) args.push("--resume", resumeSessionId);
+    else args.push("--session-id", mintedFreshSessionId);
     args.push(...buildClaudeExecutionPermissionArgs({
       dangerouslySkipPermissions,
       targetIsRemote: executionTargetIsRemote,
@@ -914,7 +1082,40 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       : `Claude exited with code ${proc.exitCode ?? -1}`;
   };
 
-  const runAttempt = async (resumeSessionId: string | null) => {
+  const runAttempt = async (
+    resumeSessionId: string | null,
+    attempt: number,
+    freshReason: string | null,
+  ) => {
+    // The session this attempt runs under, known before the spawn on both
+    // paths: the resumed id, or the id we minted for it.
+    const attemptSessionId = resumeSessionId ?? mintedFreshSessionId;
+    // Scoped to the attempt, never outside it. The retry below runs attempt 1
+    // with `--resume X` and attempt 2 with the freshly minted Y; a latch that
+    // outlived the attempt boundary would still be holding X and would
+    // checkpoint it over Y, pointing the next run at the wrong session.
+    const latch = createStreamSessionIdLatch({
+      parse: parseClaudeStreamJson,
+      onSessionId: (streamSessionId) => {
+        // The pre-spawn checkpoint below already carries `attemptSessionId`, so
+        // the stream is a divergence check, not the primary path: re-checkpoint
+        // only if the CLI named a session other than the one it was handed.
+        if (streamSessionId === attemptSessionId) return;
+        emitSessionCheckpoint({
+          attempt,
+          sessionId: streamSessionId,
+          sessionParams: buildSessionParams(streamSessionId),
+          source: "stream",
+        });
+      },
+    });
+    if (!resumeSessionId) {
+      await emitSessionRecovery({
+        outcome: runtimeSessionId ? "fresh_missing" : "fresh_none",
+        sessionId: runtimeSessionId || null,
+        reason: freshReason ?? "No Claude session was recorded for this task",
+      });
+    }
     const attemptInstructionsFilePath = resumeSessionId ? undefined : effectiveInstructionsFilePath;
     const args = buildClaudeArgs(resumeSessionId, attemptInstructionsFilePath);
     const commandNotes: string[] = [];
@@ -956,9 +1157,28 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       stdin: prompt,
       timeoutSec,
       graceSec,
-      onSpawn,
+      onSpawn: async (meta) => {
+        // Checkpoint the moment the child has a pid, rather than waiting for
+        // stdout: a run killed between spawn and the first structured event is
+        // exactly the case minting exists to cover. Awaited, and ordered ahead
+        // of the onSpawn that records the pid, so "this run has a pid" implies
+        // "this run has a checkpoint" rather than merely making it likely.
+        await persistSessionCheckpoint({
+          attempt,
+          sessionId: attemptSessionId,
+          sessionParams: buildSessionParams(attemptSessionId),
+          // Caller-supplied: we handed this id to the CLI (as --session-id or
+          // as --resume) and it has not confirmed it yet, so an id that never
+          // grows a transcript is outcome 1, not a lost conversation.
+          source: "minted",
+        });
+        if (onSpawn) await onSpawn(meta);
+      },
       onRuntimeProgress: ctx.onRuntimeProgress,
-      onLog,
+      onLog: async (stream, chunk) => {
+        if (stream === "stdout") latch.push(chunk);
+        await onLog(stream, chunk);
+      },
       runLogTail: paperclipBridge?.runLogTail,
       settleRunDisposition: paperclipBridge?.settleRunDisposition,
       terminalResultCleanup: {
@@ -970,7 +1190,17 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
     const parsedStream = parseClaudeStreamJson(proc.stdout);
     const parsed = parsedStream.resultJson ?? parseJson(proc.stdout);
-    return { proc, parsedStream, parsed };
+    // What the attempt actually ran under, carried out to finalization. The
+    // latch saw the stream from its first byte; `proc.stdout` is only the last
+    // MAX_CAPTURE_BYTES of it, so on a long run the latch is the one that still
+    // knows the id. `attemptSessionId` backstops both: Claude was handed it.
+    return {
+      proc,
+      parsedStream,
+      parsed,
+      attemptSessionId,
+      streamSessionId: latch.sessionId,
+    };
   };
 
   const toAdapterResult = (
@@ -978,6 +1208,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       proc: RunProcessResult;
       parsedStream: ReturnType<typeof parseClaudeStreamJson>;
       parsed: Record<string, unknown> | null;
+      attemptSessionId: string;
+      streamSessionId: string | null;
     },
     opts: { fallbackSessionId: string | null; clearSessionOnMissingSession?: boolean },
   ): AdapterExecutionResult => {
@@ -995,6 +1227,13 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         : undefined;
 
     if (proc.timedOut) {
+      // Name the session the attempt ran under. A result that names neither a
+      // sessionId nor sessionParams is not neutral: resolveNextSessionState
+      // falls back to the pre-dispatch snapshot and writes it over the
+      // checkpoint this run persisted at spawn, so a timeout — the common case
+      // this whole mechanism exists for — would delete its own session and the
+      // retry would start cold.
+      const timedOutSessionId = attempt.streamSessionId ?? attempt.attemptSessionId;
       return {
         exitCode: proc.exitCode,
         signal: proc.signal,
@@ -1002,7 +1241,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         errorMessage: `Timed out after ${timeoutSec}s`,
         errorCode: "timeout",
         errorMeta,
-        clearSession: Boolean(opts.clearSessionOnMissingSession),
+        sessionId: timedOutSessionId,
+        sessionParams: buildSessionParams(timedOutSessionId),
+        sessionDisplayId: timedOutSessionId,
+        clearSession: Boolean(opts.clearSessionOnMissingSession && !timedOutSessionId),
       };
     }
 
@@ -1056,6 +1298,15 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         ? "claude_transient_upstream"
         : null;
       const errorFamily = providerQuota ? "provider_quota" : transientUpstream ? "transient_upstream" : null;
+      // Same deletion as the timeout branch above: naming nothing here lets the
+      // pre-dispatch snapshot overwrite the spawn checkpoint, so a child that
+      // died on a transient upstream error after thirty turns loses the
+      // conversation it left on disk. Only a STREAM-confirmed id is named:
+      // there is no result JSON to prove the CLI ever accepted the minted one,
+      // and persisting an unconfirmed id would make the next run's failed probe
+      // look like outcome 3 (a session was lost) when it is outcome 1 (none was
+      // ever created). No confirmed id means the existing behaviour stands.
+      const unparsedSessionId = parsedStream.sessionId ?? attempt.streamSessionId;
       return {
         exitCode: proc.exitCode,
         signal: proc.signal,
@@ -1065,6 +1316,13 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         errorFamily,
         retryNotBefore: transientRetryNotBefore ? transientRetryNotBefore.toISOString() : null,
         errorMeta,
+        ...(unparsedSessionId
+          ? {
+              sessionId: unparsedSessionId,
+              sessionParams: buildSessionParams(unparsedSessionId),
+              sessionDisplayId: unparsedSessionId,
+            }
+          : {}),
         resultJson: {
           stdout: proc.stdout,
           stderr: proc.stderr,
@@ -1080,7 +1338,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
             : {}),
           ...(proc.terminalResultCleanup ? { unmanagedBackgroundTask: proc.terminalResultCleanup } : {}),
         },
-        clearSession: Boolean(opts.clearSessionOnMissingSession),
+        clearSession: Boolean(opts.clearSessionOnMissingSession && !unparsedSessionId),
       };
     }
 
@@ -1122,24 +1380,17 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     // /v1/messages and the issue is permanently unrecoverable until the
     // sessionId is dropped server-side. Drop here so resolveNextSessionState
     // calls clearTaskSessions on the next heartbeat. See RED-978 / RED-976.
+    //
+    // This guard is also why the session.checkpoint event is only ever
+    // PROVISIONAL. The checkpoint fires at spawn, before anything is known
+    // about the transcript; this guard runs after the child exits and may
+    // reject the very id that was checkpointed. The final result below must
+    // therefore keep carrying a null `sessionId` plus `clearSession`, so the
+    // host clears the checkpoint it already persisted rather than leaving a
+    // known-poisoned id behind for the next run to resume.
     const shouldDropSessionForPoison = poisonedPreviousMessageId;
     const resolvedSessionId = shouldDropSessionForPoison ? null : rawResolvedSessionId;
-    const resolvedSessionParams = resolvedSessionId
-      ? ({
-        sessionId: resolvedSessionId,
-        cwd,
-        promptBundleKey: promptBundle.bundleKey,
-        mcpServerIdentity: runtimeMcpIdentity,
-        ...(executionTargetIsRemote
-          ? {
-              remoteExecution: adapterExecutionTargetSessionIdentity(runtimeExecutionTarget),
-            }
-          : {}),
-        ...(workspaceId ? { workspaceId } : {}),
-        ...(workspaceRepoUrl ? { repoUrl: workspaceRepoUrl } : {}),
-        ...(workspaceRepoRef ? { repoRef: workspaceRepoRef } : {}),
-      } as Record<string, unknown>)
-      : null;
+    const resolvedSessionParams = resolvedSessionId ? buildSessionParams(resolvedSessionId) : null;
     const errorMessage = failed
       ? describeClaudeFailure(parsed) ?? `Claude exited with code ${proc.exitCode ?? -1}`
       : null;
@@ -1250,7 +1501,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   };
 
   try {
-    const initial = await runAttempt(sessionId ?? null);
+    const initial = await runAttempt(sessionId ?? null, 1, freshSessionReason);
     const sessionErrorKind =
       sessionId &&
       !initial.proc.timedOut &&
@@ -1276,11 +1527,17 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         "stdout",
         `[paperclip] Claude resume session "${sessionId}" ${reason}; retrying with a fresh session.\n`,
       );
-      if (sessionErrorKind === "poisoned" && !executionTargetIsRemote) {
-        const claudeConfigDir = resolveSharedClaudeConfigDir(effectiveEnv);
-        // Mirrors Claude Code's project-dir encoding: non-alphanumeric chars become "-"; existing hyphens pass through.
-        const encodedCwd = effectiveExecutionCwd.replace(/[^a-zA-Z0-9-]/g, "-");
-        const poisonedJsonlPath = path.join(claudeConfigDir, "projects", encodedCwd, `${sessionId}.jsonl`);
+      if (sessionErrorKind === "poisoned" && sessionId && !executionTargetIsRemote) {
+        // Derive the transcript path from the cwd the session was RECORDED
+        // under, not the cwd this run happens to execute in. Deriving it from
+        // the current cwd made the unlink a no-op for any session that moved
+        // worktrees, so the poisoned transcript survived and every later
+        // --resume against it failed the same way.
+        const poisonedJsonlPath = buildClaudeTranscriptProbePath({
+          claudeConfigDir: resolveSharedClaudeConfigDir(effectiveEnv),
+          recordedCwd: transcriptProbeCwd,
+          sessionId,
+        });
         let unlinked = false;
         try {
           await fs.unlink(poisonedJsonlPath);
@@ -1296,8 +1553,28 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           }
         }
       }
-      const retry = await runAttempt(null);
+      // The resume itself failed, so this run's outcome is fresh_missing and
+      // attempt 2 emits it — which is why attempt 1 emitted no recovery event
+      // when it passed --resume. One recovery event per run, naming the
+      // session that was lost and why.
+      const retry = await runAttempt(
+        null,
+        2,
+        `Recorded Claude session "${sessionId}" ${reason}`,
+      );
       return toAdapterResult(retry, { fallbackSessionId: null, clearSessionOnMissingSession: true });
+    }
+
+    if (sessionId) {
+      // The resume attempt ran and the child did not report the session as
+      // unknown, poisoned or unprocessable: outcome 2, the conversation
+      // survived. Emitted here rather than at spawn because "resumed" is only
+      // knowable once the harness has accepted the id.
+      await emitSessionRecovery({
+        outcome: "resumed",
+        sessionId,
+        reason: `Resumed Claude session "${sessionId}" in "${effectiveExecutionCwd}"`,
+      });
     }
 
     return toAdapterResult(initial, { fallbackSessionId: runtimeSessionId || runtime.sessionId });

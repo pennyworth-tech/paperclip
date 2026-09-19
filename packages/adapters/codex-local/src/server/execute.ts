@@ -86,6 +86,13 @@ import {
   CODEX_SANDBOX_AUTH_PRECEDENCE_WARNING_LOG_LINE,
   resolveCodexAuthPrecedence,
 } from "./auth-precedence.js";
+import {
+  SESSION_CHECKPOINT_EVENT_TYPE,
+  SESSION_RECOVERY_EVENT_TYPE,
+  createStreamSessionIdLatch,
+  type SessionCheckpointPayload,
+  type SessionRecoveryPayload,
+} from "@paperclipai/adapter-utils/session-checkpoint";
 import { prepareCodexRuntimeConfig } from "./runtime-config.js";
 import { resolveCodexDesiredSkillNames } from "./skills.js";
 import { buildCodexExecArgs } from "./codex-args.js";
@@ -1200,7 +1207,93 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       heartbeatPromptChars: renderedPrompt.length,
     };
 
-    const runAttempt = async (resumeSessionId: string | null) => {
+    // Why the recorded session is not being resumed, in the same words the logs
+    // above already use. This is the `reason` on the `session.recovery` event.
+    const freshSessionReason = sessionId
+      ? null
+      : !runtimeSessionId
+      ? "No Codex session was recorded for this task"
+      : forceFreshSession
+      ? `Codex transient fallback forced a fresh session away from "${runtimeSessionId}"`
+      : `Recorded Codex session "${runtimeSessionId}" was saved for cwd "${runtimeSessionCwd}" or a different execution target, not "${effectiveExecutionCwd}"`;
+
+    // Hoisted out of the finalization path so the provisional checkpoint and the
+    // final AdapterExecutionResult persist one shape. Codex records
+    // `effectiveExecutionCwd` (not `cwd`); that is pre-existing and left alone.
+    const buildSessionParams = (sessionIdForParams: string): Record<string, unknown> => ({
+      sessionId: sessionIdForParams,
+      cwd: effectiveExecutionCwd,
+      ...(executionTargetIsRemote
+        ? {
+            remoteExecution: adapterExecutionTargetSessionIdentity(runtimeExecutionTarget),
+          }
+        : {}),
+      ...(workspaceId ? { workspaceId } : {}),
+      ...(workspaceRepoUrl ? { repoUrl: workspaceRepoUrl } : {}),
+      ...(workspaceRepoRef ? { repoRef: workspaceRepoRef } : {}),
+    });
+
+    // Fire-and-forget by design. The checkpoint is emitted from inside the
+    // stdout path, and awaiting it would apply backpressure to the child: the
+    // process runner pauses the readable and serializes every onLog call
+    // through its logChain before resuming. The `.catch` is not optional — an
+    // unhandled rejection from the host sink would take the whole process down.
+    const emitSessionCheckpoint = (payload: SessionCheckpointPayload) => {
+      void onEvent?.({
+        eventType: SESSION_CHECKPOINT_EVENT_TYPE,
+        stream: "system",
+        payload: { ...payload },
+      })?.catch(() => {
+        // The checkpoint is provisional; losing one costs a resume, not the run.
+      });
+    };
+
+    // Recovery events are emitted once per run, off the stdout hot path, so
+    // they are awaited normally.
+    const emitSessionRecovery = async (payload: SessionRecoveryPayload) => {
+      if (!onEvent) return;
+      await onEvent({
+        eventType: SESSION_RECOVERY_EVENT_TYPE,
+        stream: "system",
+        payload: { ...payload },
+      });
+    };
+
+    const runAttempt = async (
+      resumeSessionId: string | null,
+      attempt: number,
+      freshReason: string | null,
+    ) => {
+      // Codex never lets the caller name the session — `codex exec --json`
+      // assigns a thread id and announces it in a `thread.started` event. The
+      // earliest moment the id exists is therefore the first stdout chunk, and
+      // that is where it gets checkpointed: waiting for the child to exit
+      // loses hours of real conversation whenever the process is killed.
+      //
+      // Scoped to the attempt, never outside it. The retry below runs attempt 1
+      // with the recorded id and attempt 2 with a fresh thread; a latch that
+      // outlived the attempt boundary would checkpoint the dead thread over the
+      // live one.
+      const latch = createStreamSessionIdLatch({
+        parse: parseCodexJsonl,
+        onSessionId: (streamSessionId) => {
+          emitSessionCheckpoint({
+            attempt,
+            sessionId: streamSessionId,
+            sessionParams: buildSessionParams(streamSessionId),
+            // Harness-confirmed: codex named this thread in its own stream, so
+            // the thread demonstrably exists and a later absence is outcome 3.
+            source: "stream",
+          });
+        },
+      });
+      if (!resumeSessionId) {
+        await emitSessionRecovery({
+          outcome: runtimeSessionId ? "fresh_missing" : "fresh_none",
+          sessionId: runtimeSessionId || null,
+          reason: freshReason ?? "No Codex session was recorded for this task",
+        });
+      }
       const execArgs = buildCodexExecArgs(
         forceSaferInvocation ? { ...config, fastMode: false } : config,
         {
@@ -1311,6 +1404,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           onLog: async (stream, chunk) => {
             monitor?.noteOutputChunk(stream, chunk);
             if (stream === "stdout") {
+              latch.push(chunk);
               await onLog(stream, chunk);
               return;
             }
@@ -1330,6 +1424,12 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           },
           rawStderr: proc.stderr,
           parsed: parseCodexJsonl(proc.stdout),
+          // The thread id as the latch saw it, carried out to finalization.
+          // `proc.stdout` is only the last MAX_CAPTURE_BYTES of the stream, so
+          // on any run long enough to matter the `thread.started` line has
+          // scrolled off it and `parsed.sessionId` is null — including when the
+          // run succeeds. The latch read it from the first chunk.
+          streamSessionId: latch.sessionId,
           monitor: monitorFired
             ? {
                 fired: true as const,
@@ -1358,6 +1458,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         proc: { exitCode: number | null; signal: string | null; timedOut: boolean; stdout: string; stderr: string; errorCode?: string | null };
         rawStderr: string;
         parsed: ReturnType<typeof parseCodexJsonl>;
+        streamSessionId: string | null;
         monitor?:
           | { fired: false }
           | { fired: true; terminationSignal: NodeJS.Signals | null; elapsedMsSinceLastEvent: number; timeoutMs: number };
@@ -1399,33 +1500,45 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         };
       }
       if (attempt.proc.timedOut) {
+        // Name the thread the attempt ran under. A result that names neither a
+        // sessionId nor sessionParams is not neutral: resolveNextSessionState
+        // falls back to the pre-dispatch snapshot and writes it over the
+        // checkpoint this run persisted mid-stream, so a timeout — the common
+        // case this mechanism exists for — would delete its own thread and the
+        // retry would start cold. A null id means the harness never named a
+        // thread, and then there is nothing to keep and today's shape stands.
+        const timedOutSessionId = attempt.streamSessionId;
         return {
           exitCode: attempt.proc.exitCode,
           signal: attempt.proc.signal,
           timedOut: true,
           errorMessage: `Timed out after ${timeoutSec}s`,
-          clearSession: clearSessionOnMissingSession,
+          ...(timedOutSessionId
+            ? {
+                sessionId: timedOutSessionId,
+                sessionParams: buildSessionParams(timedOutSessionId),
+                sessionDisplayId: timedOutSessionId,
+              }
+            : {}),
+          clearSession: Boolean(clearSessionOnMissingSession && !timedOutSessionId),
         };
       }
 
       const canFallbackToRuntimeSession = !isRetry && !forceFreshSession;
+      // `attempt.parsed` reads the captured stdout TAIL; the latch read the
+      // stream from its first byte. Preferring the parse keeps the existing
+      // precedence, and the latch is what still holds the id once the
+      // `thread.started` line has scrolled out of the 4 MB capture window.
       const resolvedSessionId =
         attempt.parsed.sessionId ??
+        attempt.streamSessionId ??
         (canFallbackToRuntimeSession ? (runtimeSessionId ?? runtime.sessionId ?? null) : null);
-      const resolvedSessionParams = resolvedSessionId
-        ? ({
-          sessionId: resolvedSessionId,
-          cwd: effectiveExecutionCwd,
-          ...(executionTargetIsRemote
-            ? {
-                remoteExecution: adapterExecutionTargetSessionIdentity(runtimeExecutionTarget),
-              }
-            : {}),
-          ...(workspaceId ? { workspaceId } : {}),
-          ...(workspaceRepoUrl ? { repoUrl: workspaceRepoUrl } : {}),
-          ...(workspaceRepoRef ? { repoRef: workspaceRepoRef } : {}),
-        } as Record<string, unknown>)
-        : null;
+      // The checkpoint above is PROVISIONAL: it fires the moment the thread id
+      // appears in the stream, before anything is known about how the run ends.
+      // This result stays authoritative — when it resolves to a null session id
+      // it must still carry `clearSession` so the host drops a checkpoint the
+      // run later invalidated.
+      const resolvedSessionParams = resolvedSessionId ? buildSessionParams(resolvedSessionId) : null;
       const parsedError = typeof attempt.parsed.errorMessage === "string" ? attempt.parsed.errorMessage.trim() : "";
       const stderrLine = firstMeaningfulStderrLine(attempt.proc.stderr);
       const fallbackErrorMessage =
@@ -1527,7 +1640,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     };
 
     try {
-      const initial = await runAttempt(sessionId);
+      const initial = await runAttempt(sessionId, 1, freshSessionReason);
       if (
         sessionId &&
         !initial.proc.timedOut &&
@@ -1538,8 +1651,27 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           "stdout",
           `[paperclip] Codex resume session "${sessionId}" is unavailable; retrying with a fresh session.\n`,
         );
-        const retry = await runAttempt(null);
+        // The resume itself failed, so this run's outcome is fresh_missing and
+        // attempt 2 emits it — which is why attempt 1 emitted no recovery event
+        // when it resumed. One recovery event per run, naming the lost thread.
+        const retry = await runAttempt(
+          null,
+          2,
+          `Recorded Codex session "${sessionId}" is unavailable to the harness`,
+        );
         return toResult(retry, true, true);
+      }
+
+      if (sessionId) {
+        // The resume attempt ran and the harness did not report the thread as
+        // unknown: outcome 2, the conversation survived. Emitted here rather
+        // than at spawn because "resumed" is only knowable once the harness has
+        // accepted the id.
+        await emitSessionRecovery({
+          outcome: "resumed",
+          sessionId,
+          reason: `Resumed Codex session "${sessionId}" in "${effectiveExecutionCwd}"`,
+        });
       }
 
       return toResult(initial, false, false);

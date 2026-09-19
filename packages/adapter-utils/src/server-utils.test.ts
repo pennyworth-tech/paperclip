@@ -3,7 +3,8 @@ import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+import type { LocalProcessSandboxOptions } from "./local-process-sandbox.js";
 import {
   applyPaperclipWorkspaceEnv,
   appendWithByteCap,
@@ -748,6 +749,282 @@ describe("runChildProcess", () => {
         }
       }
     }
+  });
+});
+
+// BAC-4671 G4: a harness child must receive an explicitly allowlisted
+// environment, not the server's own process env minus a few known-bad keys.
+// Spec: openspec/changes/bac-4671-retire-herdr-combined-container-vm/
+// specs/agent-execution-plane/spec.md:206-241 ("A harness child SHALL receive
+// an allowlisted environment, and SHALL NOT inherit the server's own
+// credentials" / "A harness child inspects its environment" / "The boundary
+// is exercised, not asserted" — the test must assert absence of the server
+// credential from inside a running harness, not merely inspect the spawn
+// call). Tasks: openspec/.../bac-4671-retire-herdr-combined-container-vm/
+// tasks.md:55 (4.5).
+//
+// Every test in this block spawns a REAL child through the REAL
+// `runChildProcess` — no `applyChildEnvAllowlist` unit calls, no spy on
+// `spawn` — and reads the boundary back out of that child's own
+// `process.env`, exactly as the spec's second scenario requires.
+describe("runChildProcess — child env allowlist boundary", () => {
+  const agent = { id: "agent-1", companyId: "company-1" };
+
+  async function withProcessEnv<T>(
+    overrides: Record<string, string>,
+    run: () => Promise<T>,
+  ): Promise<T> {
+    const previous: Record<string, string | undefined> = {};
+    for (const key of Object.keys(overrides)) {
+      previous[key] = process.env[key];
+      process.env[key] = overrides[key];
+    }
+    try {
+      return await run();
+    } finally {
+      for (const [key, value] of Object.entries(previous)) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+    }
+  }
+
+  // Spawns `node -e "…"` for real via `runChildProcess` and parses back what
+  // that child's own `process.env` actually contained — the same technique
+  // `runChildProcess` itself is already tested with elsewhere in this file.
+  async function readChildEnv(
+    env: Record<string, string>,
+    extra: { localProcessSandbox?: LocalProcessSandboxOptions } = {},
+  ): Promise<Record<string, string>> {
+    const result = await runChildProcess(
+      randomUUID(),
+      process.execPath,
+      ["-e", "process.stdout.write(JSON.stringify(process.env))"],
+      {
+        cwd: process.cwd(),
+        env,
+        timeoutSec: 10,
+        graceSec: 1,
+        onLog: async () => {},
+        ...extra,
+      },
+    );
+    return JSON.parse(result.stdout) as Record<string, string>;
+  }
+
+  it.each([
+    {
+      label: "claude-local execute.ts:212 (env = { ...buildPaperclipEnv(agent) }, spawned at :955)",
+    },
+    {
+      label: "opencode-local execute.ts:280 (env = { ...buildPaperclipEnv(agent) }, spawned via preparedRuntimeConfig.env at :704)",
+    },
+    {
+      label: "codex-local execute.ts:935 (same curated shape, spawned at :1395)",
+    },
+  ])(
+    "never lets the server's DATABASE_URL, or a same-named host secret, reach the child — $label",
+    async ({ label }) => {
+      await withProcessEnv(
+        {
+          // The server's own production credential. The sanitizer this PR's
+          // header comment describes as "not the security boundary" only
+          // deletes PAPERCLIP_*-prefixed keys, so a plain-named alias like
+          // this previously reached every spawned harness.
+          DATABASE_URL: "postgres://paperclip:prod-secret@127.0.0.1:5432/paperclip",
+          // A same-named host var, simulating the server process's own
+          // PAPERCLIP_API_KEY (if it has one) rather than the per-run token
+          // the adapter mints. It must never win over the adapter's value.
+          PAPERCLIP_API_KEY: "host-leaked-key-should-never-reach-a-child",
+          STRIPE_SECRET_KEY: "sk_live_hostonly",
+          GITHUB_TOKEN: "ghp_hostonly",
+        },
+        async () => {
+          const curated: Record<string, string> = { ...buildPaperclipEnv(agent) };
+          curated.PAPERCLIP_RUN_ID = "run-1";
+          curated.PAPERCLIP_API_KEY = "run-scoped-token";
+
+          const childEnv = await readChildEnv(curated);
+
+          expect(childEnv.DATABASE_URL, label).toBeUndefined();
+          expect(childEnv.STRIPE_SECRET_KEY, label).toBeUndefined();
+          expect(childEnv.GITHUB_TOKEN, label).toBeUndefined();
+          // The adapter's own per-run token wins over whatever the server's
+          // process happened to hold under the identical name.
+          expect(childEnv.PAPERCLIP_API_KEY, label).toBe("run-scoped-token");
+        },
+      );
+    },
+  );
+
+  // The 1.9 correction: `opts.env` for claude-local/opencode-local/codex-local
+  // is curated, never a copy of `process.env` — but three real callers build
+  // `opts.env` as `{ ...process.env, ...X }`, which defeated the OLD sanitizer
+  // (it only ran on the *inherited* half, before the merge). The allowlist
+  // must catch the secret regardless of which half of the merge carried it.
+  it.each([
+    {
+      label: "hermes execute.ts:486-490 (env = { ...process.env, ...userEnv, ...buildPaperclipEnv(agent) }, spawned at :555)",
+      buildEnv: () => ({
+        ...(process.env as Record<string, string>),
+        ...buildPaperclipEnv(agent),
+        PAPERCLIP_RUN_ID: "hermes-run",
+      }),
+    },
+    {
+      label: "opencode-local models.ts:142 discovery probe (runtimeEnv = { ...process.env, ...env, … })",
+      buildEnv: () => ({
+        ...(process.env as Record<string, string>),
+        OPENCODE_DISABLE_PROJECT_CONFIG: "true",
+      }),
+    },
+    {
+      label: "pi-local models.ts:111 discovery probe / execute.ts:346 (runtimeEnv = { ...process.env, ...env })",
+      buildEnv: () => ({
+        ...(process.env as Record<string, string>),
+      }),
+    },
+  ])(
+    "strips the server's DATABASE_URL even when the caller's opts.env is ITSELF a full copy of process.env — $label",
+    async ({ buildEnv }) => {
+      await withProcessEnv(
+        {
+          DATABASE_URL: "postgres://paperclip:prod-secret@127.0.0.1:5432/paperclip",
+          STRIPE_SECRET_KEY: "sk_live_hostonly",
+        },
+        async () => {
+          // Built AFTER process.env is mutated, so the spread genuinely
+          // carries the secret into opts.env — the shape that defeats a
+          // sanitizer applied only to the inherited half.
+          const childEnv = await readChildEnv(buildEnv());
+          expect(childEnv.DATABASE_URL).toBeUndefined();
+          expect(childEnv.STRIPE_SECRET_KEY).toBeUndefined();
+        },
+      );
+    },
+  );
+
+  it("lets every allowlisted host variable that is actually set reach the child", async () => {
+    await withProcessEnv(
+      {
+        ANTHROPIC_API_KEY: "sk-ant-real",
+        CLAUDE_CONFIG_DIR: "/home/agent/.claude",
+        CODEX_HOME: "/home/agent/.codex",
+        LITELLM_TAGS: "agent:agent-1,issue:BAC-4671",
+        HTTPS_PROXY: "http://proxy.internal:8443",
+        NODE_EXTRA_CA_CERTS: "/etc/ssl/private-ca.pem",
+      },
+      async () => {
+        const childEnv = await readChildEnv({});
+        expect(childEnv.PATH).toBe(process.env.PATH);
+        expect(childEnv.HOME).toBe(process.env.HOME);
+        expect(childEnv.ANTHROPIC_API_KEY).toBe("sk-ant-real");
+        expect(childEnv.CLAUDE_CONFIG_DIR).toBe("/home/agent/.claude");
+        expect(childEnv.CODEX_HOME).toBe("/home/agent/.codex");
+        expect(childEnv.LITELLM_TAGS).toBe("agent:agent-1,issue:BAC-4671");
+        expect(childEnv.HTTPS_PROXY).toBe("http://proxy.internal:8443");
+        expect(childEnv.NODE_EXTRA_CA_CERTS).toBe("/etc/ssl/private-ca.pem");
+      },
+    );
+  });
+
+  it.skipIf(process.platform !== "linux")(
+    "runs the allowlist before the sandbox's target.env is merged in, so a sandbox-owned var is never filtered",
+    async () => {
+      // server-utils.ts: the localProcessSandbox HOME override is applied to
+      // `pathedEnv` (the object the allowlist filters) BEFORE
+      // `applyChildEnvAllowlist` runs; `target.env` from
+      // `buildLocalProcessSandboxSpawnTarget` is only merged in AFTER, and is
+      // deliberately never filtered. Requires bwrap + Linux
+      // (local-process-sandbox.ts:347-348), so it only runs in that CI leg.
+      const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "child-env-allowlist-sandbox-"));
+      try {
+        const childEnv = await readChildEnv(
+          {},
+          {
+            localProcessSandbox: {
+              workspaceDir: workspace,
+              filesystemScope: "workspace",
+              homeDir: "/sandbox-home",
+            },
+          },
+        );
+        expect(childEnv.HOME).toBe("/sandbox-home");
+      } finally {
+        await fs.rm(workspace, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it("carries a config-bound secret_ref (e.g. GH_TOKEN) into the real child, and drops an unrelated stray host var of the same shape", async () => {
+    const curated: Record<string, string> = { ...buildPaperclipEnv(agent) };
+    refreshPaperclipWorkspaceEnvForExecution({
+      env: curated,
+      envConfig: { GH_TOKEN: "ghp_config_secret_ref" },
+      workspaceCwd: process.cwd(),
+    });
+    expect(curated.PAPERCLIP_CHILD_ENV_CONFIG_KEYS).toBe("GH_TOKEN");
+
+    await withProcessEnv(
+      { SOME_UNRELATED_HOST_SECRET: "should-not-reach-child" },
+      async () => {
+        const childEnv = await readChildEnv(curated);
+        expect(childEnv.GH_TOKEN).toBe("ghp_config_secret_ref");
+        expect(childEnv.SOME_UNRELATED_HOST_SECRET).toBeUndefined();
+        // The marker is Paperclip's own bookkeeping and must never reach the child.
+        expect(childEnv.PAPERCLIP_CHILD_ENV_CONFIG_KEYS).toBeUndefined();
+      },
+    );
+  });
+
+  it("logs dropped key names only, never values, in the same object-first shape as the existing onLogError default", async () => {
+    const debugSpy = vi.spyOn(console, "debug").mockImplementation(() => undefined);
+    try {
+      await withProcessEnv(
+        { DATABASE_URL: "postgres://paperclip:prod-secret@127.0.0.1:5432/paperclip" },
+        async () => {
+          await readChildEnv({});
+        },
+      );
+
+      const dropCall = debugSpy.mock.calls.find(
+        (call) =>
+          typeof call[0] === "object" &&
+          call[0] !== null &&
+          Array.isArray((call[0] as { droppedKeys?: unknown }).droppedKeys),
+      );
+      expect(dropCall).toBeDefined();
+      const [payload, message] = dropCall!;
+      expect((payload as { droppedKeys: string[] }).droppedKeys).toContain("DATABASE_URL");
+      expect(typeof message).toBe("string");
+
+      const serializedCalls = JSON.stringify(debugSpy.mock.calls);
+      expect(serializedCalls).not.toContain("prod-secret");
+    } finally {
+      debugSpy.mockRestore();
+    }
+  });
+
+  it("still strips the Claude Code nesting-guard vars even though CLAUDE_ is an allowed prefix", async () => {
+    await withProcessEnv(
+      {
+        CLAUDECODE: "1",
+        CLAUDE_CODE_ENTRYPOINT: "cli",
+        CLAUDE_CODE_SESSION: "session-abc",
+        CLAUDE_CODE_PARENT_SESSION: "parent-abc",
+        CLAUDE_CONFIG_DIR: "/home/agent/.claude",
+      },
+      async () => {
+        const childEnv = await readChildEnv({});
+        expect(childEnv.CLAUDECODE).toBeUndefined();
+        expect(childEnv.CLAUDE_CODE_ENTRYPOINT).toBeUndefined();
+        expect(childEnv.CLAUDE_CODE_SESSION).toBeUndefined();
+        expect(childEnv.CLAUDE_CODE_PARENT_SESSION).toBeUndefined();
+        // Confirms the CLAUDE_ prefix itself is genuinely allowed elsewhere —
+        // this isn't passing because CLAUDE_ is blanket-dropped.
+        expect(childEnv.CLAUDE_CONFIG_DIR).toBe("/home/agent/.claude");
+      },
+    );
   });
 });
 
