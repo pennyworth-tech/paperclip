@@ -1,3 +1,4 @@
+import { createSessionCheckpointQueue } from "./session-checkpoint-queue.js";
 import { legacyStartupDeadlineExpired } from "./heartbeat-startup-deadline.js";
 import { AGENT_CHAT_DIRECTIVE, conversationReplay, isConversation, isConversationExecutionWake, isWaitingConversation, prepareConversationTurn, settleConversationTurn } from "./agent-conversations.js";
 import { PROCESS_IDENTITY_RECORDED, recordNativeLocalProcessStop } from "./native-local-process-stop.js";
@@ -1000,31 +1001,38 @@ export interface SharedWorkspaceHolder {
   issueIdentifier: string | null;
 }
 
-// Pre-dispatch gate outcome: another running run currently holds the issue's
-// shared project workspace. Not a failure — the run is parked as a bounded
-// scheduled retry and re-attempted once the holder finishes, so two agents
-// never mutate the same working tree concurrently.
+// Pre-dispatch gate outcome: another running run currently holds the working
+// tree this run needs — the issue's shared project workspace, or the isolated
+// execution workspace an inheriting issue was handed. Not a failure — the run
+// is parked as a bounded scheduled retry and re-attempted once the holder
+// finishes, so two agents never mutate the same working tree concurrently.
+// Exactly one of the two keys is set; `executionWorkspaceId` is the isolated
+// key and carries no project workspace, so `projectWorkspaceId` is nullable
+// rather than duplicated.
 export class WorkspaceBusyDeferral extends Error {
   code = WORKSPACE_BUSY_ERROR_CODE;
   holder: SharedWorkspaceHolder;
-  projectWorkspaceId: string;
+  projectWorkspaceId: string | null;
+  executionWorkspaceId: string | null;
   deferralAttempt: number;
   wasIssueAssignee: boolean;
 
   constructor(input: {
     holder: SharedWorkspaceHolder;
-    projectWorkspaceId: string;
+    projectWorkspaceId?: string | null;
+    executionWorkspaceId?: string | null;
     deferralAttempt: number;
     wasIssueAssignee: boolean;
   }) {
     super(
-      `Shared project workspace is busy: run ${input.holder.runId} (issue ${
-        input.holder.issueIdentifier ?? input.holder.issueId
-      }) is still running`,
+      `${input.executionWorkspaceId ? "Isolated execution workspace" : "Shared project workspace"} is busy: run ${
+        input.holder.runId
+      } (issue ${input.holder.issueIdentifier ?? input.holder.issueId}) is still running`,
     );
     this.name = "WorkspaceBusyDeferral";
     this.holder = input.holder;
-    this.projectWorkspaceId = input.projectWorkspaceId;
+    this.projectWorkspaceId = input.projectWorkspaceId ?? null;
+    this.executionWorkspaceId = input.executionWorkspaceId ?? null;
     this.deferralAttempt = input.deferralAttempt;
     this.wasIssueAssignee = input.wasIssueAssignee;
   }
@@ -16073,14 +16081,27 @@ export function heartbeatService(
   // shared tree and counts as a holder (over-serializing is the safe
   // direction). When the isolated-workspaces experiment is off, every run
   // resolves to the shared tree, so no holder is excluded.
+  //
+  // The `execution_workspace` key answers the same question for an isolated
+  // worktree: issues that inherited a workspace carry the same
+  // issues.executionWorkspaceId — it is copied onto the child row at issue
+  // creation together with an executionWorkspacePreference of
+  // "reuse_existing", so the column is already populated by the time this gate
+  // runs — and two such issues running at once are two agents in one worktree.
+  // That key deliberately carries no isolated-mode exclusion: the clause above
+  // exists to drop holders that will NOT touch the shared tree, and applied
+  // here it would drop precisely the isolated holders being looked for. Every
+  // other clause — running status, the liveness window, the exclusions, the
+  // ordering — is shared verbatim between the two keys.
   async function findSharedWorkspaceHolder(input: {
     companyId: string;
-    projectWorkspaceId: string;
     excludeIssueId: string;
     excludeRunId: string;
-    honorIsolatedWorkspaceModes: boolean;
     now?: Date;
-  }): Promise<SharedWorkspaceHolder | null> {
+  } & (
+    | { key: "project_workspace"; projectWorkspaceId: string; honorIsolatedWorkspaceModes: boolean }
+    | { key: "execution_workspace"; executionWorkspaceId: string }
+  )): Promise<SharedWorkspaceHolder | null> {
     const staleCutoff = new Date(
       (input.now ?? new Date()).getTime() -
         WORKSPACE_BUSY_HOLDER_STALE_AFTER_MS,
@@ -16108,9 +16129,11 @@ export function heartbeatService(
           // Last observed activity: output beats start beats creation. A run
           // that started recently but has not written output yet is live.
           sql`coalesce(${heartbeatRuns.lastOutputAt}, ${heartbeatRuns.startedAt}, ${heartbeatRuns.createdAt}) >= ${staleCutoff.toISOString()}::timestamptz`,
-          eq(issues.projectWorkspaceId, input.projectWorkspaceId),
+          input.key === "project_workspace"
+            ? eq(issues.projectWorkspaceId, input.projectWorkspaceId)
+            : eq(issues.executionWorkspaceId, input.executionWorkspaceId),
           ne(sql`${issues.id}::text`, input.excludeIssueId),
-          ...(input.honorIsolatedWorkspaceModes
+          ...(input.key === "project_workspace" && input.honorIsolatedWorkspaceModes
             ? [
                 or(
                   // Covers both a NULL settings blob and a blob without a mode
@@ -16201,6 +16224,7 @@ export function heartbeatService(
         },
         workspaceBusy: {
           projectWorkspaceId: deferral.projectWorkspaceId,
+          executionWorkspaceId: deferral.executionWorkspaceId,
           holderRunId: deferral.holder.runId,
           holderIssueId: deferral.holder.issueId,
           deferralAttempt: deferral.deferralAttempt,
@@ -16264,6 +16288,7 @@ export function heartbeatService(
             : `Deferred: ${deferral.message}. No retry could be scheduled; releasing the issue for other runs.`,
         payload: {
           projectWorkspaceId: deferral.projectWorkspaceId,
+          executionWorkspaceId: deferral.executionWorkspaceId,
           holderRunId: deferral.holder.runId,
           holderIssueId: deferral.holder.issueId,
           deferralAttempt: deferral.deferralAttempt,
@@ -20916,6 +20941,7 @@ export function heartbeatService(
         effectiveExecutionWorkspaceMode === "shared_workspace"
       ) {
         const workspaceHolder = await findSharedWorkspaceHolder({
+          key: "project_workspace",
           companyId: agent.companyId,
           projectWorkspaceId: issueRef.projectWorkspaceId,
           excludeIssueId: issueRef.id,
@@ -20978,6 +21004,21 @@ export function heartbeatService(
             "Dispatching alongside a live shared-workspace holder",
           );
         }
+      }
+      // Children inheriting one execution workspace share its branch/index,
+      // so consult that binding independently of the isolation feature flag.
+      if (issueRef && requestedExecutionWorkspaceId) {
+        const holder = await findSharedWorkspaceHolder({
+          key: "execution_workspace", companyId: agent.companyId,
+          executionWorkspaceId: requestedExecutionWorkspaceId,
+          excludeIssueId: issueRef.id, excludeRunId: run.id,
+        });
+        if (holder) throw new WorkspaceBusyDeferral({
+          holder, executionWorkspaceId: requestedExecutionWorkspaceId,
+          deferralAttempt: run.scheduledRetryReason === WORKSPACE_BUSY_RETRY_REASON
+            ? (run.scheduledRetryAttempt ?? 0) : 0,
+          wasIssueAssignee: issueContext?.assigneeAgentId === agent.id,
+        });
       }
       const workspaceManagedConfig = buildExecutionWorkspaceAdapterConfig({
         agentConfig: config,
@@ -22438,6 +22479,12 @@ export function heartbeatService(
       };
 
       let handle: RunLogHandle | null = null;
+      const checkpointedSession: {
+        current: { params: Record<string, unknown> | null; displayId: string | null } | null;
+      } = { current: null };
+      const checkpointQueue = createSessionCheckpointQueue();
+      const settleCheckpointEvents = () => checkpointQueue.settle();
+      let latestCheckpointAttempt = 0;
       const goalCheckpointSession: {
         current: {
           params: Record<string, unknown>;
@@ -22751,7 +22798,7 @@ export function heartbeatService(
           });
         };
 
-        const onAdapterEvent = async (event: AdapterRuntimeEvent) => {
+        const handleAdapterEvent = async (event: AdapterRuntimeEvent) => {
           const eventType = event.eventType.trim();
           if (!eventType) return;
           await appendRunEvent(currentRun, {
@@ -22762,7 +22809,40 @@ export function heartbeatService(
             message: event.message,
             payload: event.payload,
           });
+          // A CLI checkpoint is resumability metadata, never evidence that
+          // provider actions stopped or that a native runner may be replaced.
+          if (eventType !== "session.checkpoint" || !taskKey || run.runtimeMode === "native") return;
+          try {
+            const payload = parseObject(event.payload);
+            const attempt = payload.attempt;
+            if (typeof attempt !== "number" || !Number.isSafeInteger(attempt) ||
+                attempt < 1 || attempt < latestCheckpointAttempt) return;
+            const sessionId = readNonEmptyString(payload.sessionId);
+            const candidate = normalizeSessionParams(parseObject(payload.sessionParams)) ??
+              (sessionId ? { sessionId } : null);
+            if (!candidate) return;
+            const params = normalizeSessionParams(sessionCodec.serialize(candidate));
+            const decoded = normalizeSessionParams(sessionCodec.deserialize(params));
+            const displayId = truncateDisplayId(
+              (sessionCodec.getDisplayId ? sessionCodec.getDisplayId(decoded) : null) ??
+              readNonEmptyString(decoded?.sessionId) ?? sessionId,
+            );
+            latestCheckpointAttempt = attempt;
+            checkpointedSession.current = { params, displayId };
+            await upsertTaskSession({
+              companyId: agent.companyId, agentId: agent.id, adapterType: agent.adapterType, taskKey,
+              sessionParamsJson: attachPaperclipSessionMetadataToSessionParams(params, configuredModel, sessionConfigMetadata),
+              sessionDisplayId: displayId, lastRunId: currentRun.id, lastError: null,
+            });
+          } catch (err) {
+            logger.warn({ err, runId: currentRun.id, taskKey }, "failed to persist mid-run session checkpoint");
+          }
         };
+
+        const onAdapterEvent = (event: AdapterRuntimeEvent): Promise<void> =>
+          event.eventType.trim() === "session.checkpoint"
+            ? checkpointQueue.enqueue(() => handleAdapterEvent(event))
+            : handleAdapterEvent(event);
 
         const adapter = getServerAdapter(agent.adapterType);
         const durableGoalControlRun =
@@ -24430,6 +24510,7 @@ export function heartbeatService(
             }
           }
         }
+        await settleCheckpointEvents();
         const processCancellation =
           processRunCancellationSettlements.get(run.id) ??
           failedProcessRunCancellations.get(run.id);
@@ -24467,8 +24548,8 @@ export function heartbeatService(
           codec: sessionCodec,
           adapterResult,
           outcome,
-          previousParams: previousSessionParams,
-          previousDisplayId: runtimeForAdapter.sessionDisplayId,
+          previousParams: checkpointedSession.current?.params ?? previousSessionParams,
+          previousDisplayId: checkpointedSession.current?.displayId ?? runtimeForAdapter.sessionDisplayId,
           previousLegacySessionId: runtimeForAdapter.sessionId,
         });
         const rawUsage = normalizeUsageTotals(adapterResult.usage);
@@ -25010,9 +25091,12 @@ export function heartbeatService(
             normalizedUsage,
           );
           if (taskKey) {
+            const resolvedNoSession = !nextSessionState.params && !nextSessionState.displayId;
+            const preservedCheckpoint = resolvedNoSession && !adapterResult.clearSession
+              ? checkpointedSession.current : null;
             if (
               adapterResult.clearSession ||
-              (!nextSessionState.params && !nextSessionState.displayId)
+              (resolvedNoSession && !preservedCheckpoint)
             ) {
               await clearTaskSessions(agent.companyId, agent.id, {
                 taskKey,
@@ -25027,11 +25111,11 @@ export function heartbeatService(
                 taskKey,
                 sessionParamsJson:
                   attachPaperclipSessionMetadataToSessionParams(
-                    nextSessionState.params,
+                    preservedCheckpoint?.params ?? nextSessionState.params,
                     configuredModel,
                     sessionConfigMetadata,
                   ),
-                sessionDisplayId: nextSessionState.displayId,
+                sessionDisplayId: preservedCheckpoint?.displayId ?? nextSessionState.displayId,
                 lastRunId: finalizedRun.id,
                 lastError: runErrorMessage,
               });
@@ -25048,6 +25132,7 @@ export function heartbeatService(
           wasFirstHeartbeat: timerClaimWasFirstHeartbeat(run),
         });
       } catch (err) {
+        await settleCheckpointEvents();
         if (err instanceof NativeControllerDetachedForRestartError) {
           nativeSessionResumeScheduled = true;
           return;
@@ -25344,7 +25429,7 @@ export function heartbeatService(
 
           if (
             taskKey &&
-            (goalCheckpointSession.current ||
+            (goalCheckpointSession.current || checkpointedSession.current ||
               previousSessionParams ||
               previousSessionDisplayId ||
               taskSession)
@@ -25357,13 +25442,13 @@ export function heartbeatService(
               sessionParamsJson:
                 goalCheckpointSession.current?.params ??
                 attachPaperclipSessionMetadataToSessionParams(
-                  previousSessionParams,
+                  checkpointedSession.current?.params ?? previousSessionParams,
                   configuredModel,
                   sessionConfigMetadata,
                 ),
               sessionDisplayId:
                 goalCheckpointSession.current?.displayId ??
-                previousSessionDisplayId,
+                checkpointedSession.current?.displayId ?? previousSessionDisplayId,
               lastRunId: failedRun.id,
               lastError: message,
             });
