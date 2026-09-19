@@ -423,7 +423,7 @@ export interface ServerAdapterModule {
    * Human-readable name for the adapter listing. Adapters the user interface
    * has a compiled-in entry for leave this unset — that entry wins — so this
    * carries display metadata for adapters the interface cannot know about,
-   * such as one declared by configuration. Falls back to `type`.
+   * such as one installed as a plugin. Falls back to `type`.
    */
   displayName?: string;
   /** One-line description shown beside the label. */

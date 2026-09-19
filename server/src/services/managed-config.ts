@@ -17,9 +17,6 @@
  *           "relativePath": "acme/operations" }
  *       ]
  *     },
- *     "adapters": {
- *       "builtin": [ { "type": "my_adapter", "relativePath": "my-adapter" } ]
- *     },
  *     "environments": [
  *       { "name": "Daytona", "provider": "daytona", "config": { "target": "us" } }
  *     ]
@@ -68,32 +65,8 @@ export interface ManagedInstanceConfig {
      */
     readonly catalog: readonly ManagedBundledPluginSpec[];
   };
-  adapters: {
-    /**
-     * Adapter packages shipped in this image that register as built-ins
-     * (empty when the section is absent). Resolved fail-closed by
-     * `adapters/configured-builtin-adapters.ts`.
-     */
-    readonly builtin: readonly ManagedBuiltinAdapterSpec[];
-  };
   /** Sandbox environments the control plane provisions at boot (empty when the section is absent). */
   environments: readonly ManagedEnvironmentSpec[];
-}
-
-/**
- * One control-plane-declared built-in adapter.
- *
- * `relativePath` names a package under the built-in adapter root — a constant
- * of the image with no environment override, deliberately tighter than the
- * bundled-plugin catalog root. Declaring an entry does not by itself load
- * anything: the package must also declare `paperclip.adapter` with a matching
- * `type`, and the module it exports must return that same type.
- */
-export interface ManagedBuiltinAdapterSpec {
-  /** Adapter type id, unique in the document and never a core built-in. */
-  type: string;
-  /** Package location relative to the built-in adapter root. */
-  relativePath: string;
 }
 
 /**
@@ -197,8 +170,6 @@ function describeJsonValue(value: unknown): string {
 const BUNDLED_PLUGIN_KEY_PATTERN = /^[a-z0-9][a-z0-9-]{0,62}$/;
 /** Manifest-id shape (`vendor.plugin-name`). */
 const PLUGIN_MANIFEST_ID_PATTERN = /^[a-z0-9][a-z0-9.-]{0,127}$/;
-/** Adapter type shape, matching the ids the compiled-in registry uses. */
-const ADAPTER_TYPE_PATTERN = /^[a-z][a-z0-9_]{1,62}$/;
 
 /** A `relativePath` may name at most this many directory segments. */
 const RELATIVE_PATH_MAX_SEGMENTS = 3;
@@ -307,7 +278,6 @@ export function parseManagedConfigEnv(env: ManagedConfigEnv): ManagedInstanceCon
     "catalogVersion",
     "features",
     "plugins",
-    "adapters",
     "environments",
   ]);
   for (const key of Object.keys(doc)) {
@@ -454,53 +424,6 @@ export function parseManagedConfigEnv(env: ManagedConfigEnv): ManagedInstanceCon
     }
   }
 
-  // `adapters` is OPTIONAL for the same reason `environments` and
-  // `plugins.catalog` are: absence declares "no image-declared adapters",
-  // which drops no control.
-  //
-  // What this section can express is deliberately narrow. It elects a package
-  // by path; it cannot name a module, an entry point, or a type the build
-  // already ships. The rules a single document can be checked against live
-  // here; the rules that need the image (does the package exist, does it
-  // declare itself, is the type a core built-in) live in the resolver, which
-  // runs before the server listens.
-  const builtinAdapters: ManagedBuiltinAdapterSpec[] = [];
-  if (doc.adapters !== undefined) {
-    if (!isPlainObject(doc.adapters)) {
-      fail(`"adapters" must be an object (got ${describeJsonValue(doc.adapters)})`);
-    }
-    for (const key of Object.keys(doc.adapters)) {
-      if (key !== "builtin") {
-        fail(`"adapters" has unknown key "${key}" (allowed: builtin)`);
-      }
-    }
-    if (doc.adapters.builtin !== undefined) {
-      if (!Array.isArray(doc.adapters.builtin)) {
-        fail(
-          `"adapters.builtin" must be an array of adapter entries (got ${describeJsonValue(doc.adapters.builtin)})`,
-        );
-      }
-      for (const [index, entry] of doc.adapters.builtin.entries()) {
-        const pointer = `adapters.builtin[${index}]`;
-        if (!isPlainObject(entry)) {
-          fail(`"${pointer}" must be an object (got ${describeJsonValue(entry)})`);
-        }
-        assertExactKeys(entry, ["type", "relativePath"], pointer);
-        const type = readIdentifier(
-          entry.type,
-          `${pointer}.type`,
-          ADAPTER_TYPE_PATTERN,
-          "an adapter type of lowercase letters, digits and \"_\" starting with a letter",
-        );
-        const relativePath = readRelativePath(entry.relativePath, `${pointer}.relativePath`);
-        if (builtinAdapters.some((existing) => existing.type === type)) {
-          fail(`"adapters.builtin" has duplicate type "${type}"`);
-        }
-        builtinAdapters.push(Object.freeze({ type, relativePath }) as ManagedBuiltinAdapterSpec);
-      }
-    }
-  }
-
   // `environments` is OPTIONAL, unlike `features` and `plugins`: documents
   // delivered before the section existed must keep booting newer builds (a
   // fleet image roll cannot be lockstepped with a config re-delivery), and
@@ -590,7 +513,6 @@ export function parseManagedConfigEnv(env: ManagedConfigEnv): ManagedInstanceCon
       autoInstall: Object.freeze(autoInstall),
       catalog: Object.freeze(catalog),
     }),
-    adapters: Object.freeze({ builtin: Object.freeze(builtinAdapters) }),
     environments: Object.freeze(environmentSpecs),
   }) as ManagedInstanceConfig;
 }

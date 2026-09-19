@@ -28,7 +28,6 @@ import {
   resolveExternalAdapterRegistration,
   unregisterServerAdapter,
   isOverridePaused,
-  isConfiguredBuiltinAdapter,
   setOverridePaused,
 } from "../adapters/registry.js";
 import {
@@ -212,11 +211,7 @@ function buildAdapterInfo(adapter: ServerAdapterModule, externalRecord: AdapterP
   return {
     type: adapter.type,
     label: adapter.displayName ?? adapter.type,
-    source: externalRecord
-      ? "external"
-      : isConfiguredBuiltinAdapter(adapter.type)
-        ? "configured"
-        : "builtin",
+    source: externalRecord ? "external" : "builtin",
     ...(adapter.description !== undefined ? { description: adapter.description } : {}),
     ...(adapter.iconName !== undefined ? { iconName: adapter.iconName } : {}),
     modelsCount: (adapter.models ?? []).length,

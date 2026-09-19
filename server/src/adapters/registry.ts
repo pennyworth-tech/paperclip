@@ -138,13 +138,7 @@ import {
   agentConfigurationDoc as piAgentConfigurationDoc,
   modelProfiles as piModelProfiles,
 } from "@paperclipai/adapter-pi-local";
-import { BUILTIN_ADAPTER_TYPES, CORE_BUILTIN_ADAPTER_TYPES } from "./builtin-adapter-types.js";
-import {
-  defaultBuiltinAdapterRoot,
-  loadConfiguredBuiltinAdapters,
-  resolveConfiguredBuiltinAdapters,
-} from "./configured-builtin-adapters.js";
-import { getManagedInstanceConfig } from "../services/managed-config.js";
+import { BUILTIN_ADAPTER_TYPES } from "./builtin-adapter-types.js";
 import { buildExternalAdapters } from "./plugin-loader.js";
 import { getDisabledAdapterTypes } from "../services/adapter-plugin-store.js";
 import { processAdapter } from "./process/index.js";
@@ -565,16 +559,6 @@ const builtinFallbacks = new Map<string, ServerAdapterModule>();
 // external.  Persisted across reloads via the same disabled-adapters store.
 const pausedOverrides = new Set<string>();
 
-// Types registered from `adapters.builtin` rather than compiled in. Kept so
-// the adapter listing can report `source: "configured"` — the honest third
-// value between "shipped" and "installed at runtime".
-const configuredBuiltinTypes = new Set<string>();
-
-// Any failure resolving or loading a configured built-in, surfaced by
-// `assertConfiguredBuiltinAdaptersLoaded()` rather than thrown from the
-// unawaited load IIFE below.
-let configuredBuiltinLoadError: unknown = null;
-
 function registerBuiltInAdapters() {
   for (const adapter of [
     acpxLocalAdapter,
@@ -650,25 +634,6 @@ export function resolveExternalAdapterRegistration(
  * and avoid racing against the loading window.
  */
 const externalAdaptersReady: Promise<void> = (async () => {
-  // Configured built-ins load FIRST, ahead of the external pass, so the
-  // external override bookkeeping below sees them already registered and
-  // saves the right builtin fallback.
-  try {
-    const configured = resolveConfiguredBuiltinAdapters(
-      getManagedInstanceConfig(process.env)?.adapters.builtin ?? [],
-      { adapterRoot: defaultBuiltinAdapterRoot(), coreTypes: CORE_BUILTIN_ADAPTER_TYPES },
-    );
-    for (const adapter of await loadConfiguredBuiltinAdapters(configured)) {
-      adaptersByType.set(adapter.type, adapter);
-      configuredBuiltinTypes.add(adapter.type);
-    }
-  } catch (err) {
-    // Captured, not thrown: this IIFE's promise has no handler attached in the
-    // same turn, so throwing here would surface as an unhandledRejection
-    // rather than the clean fail-closed log. `assertConfiguredBuiltinAdaptersLoaded()`
-    // re-raises it at a point that is awaited, still before the server listens.
-    configuredBuiltinLoadError = err;
-  }
   try {
     const externalAdapters = await buildExternalAdapters();
     for (const externalAdapter of externalAdapters) {
@@ -701,25 +666,6 @@ const externalAdaptersReady: Promise<void> = (async () => {
  */
 export function waitForExternalAdapters(): Promise<void> {
   return externalAdaptersReady;
-}
-
-/**
- * Fail-closed gate for configured built-in adapters.
- *
- * Await this before anything can dispatch a run. `getServerAdapter()` falls
- * back to the process adapter for an unknown type, so an agent scheduled while
- * a configured built-in is still loading — or after it failed to load — would
- * be handed to the wrong executor and would appear to run. Awaiting before the
- * scheduler exists closes that window.
- */
-export async function assertConfiguredBuiltinAdaptersLoaded(): Promise<void> {
-  await externalAdaptersReady;
-  if (configuredBuiltinLoadError) throw configuredBuiltinLoadError;
-}
-
-/** Whether a type was registered from `adapters.builtin` rather than compiled in. */
-export function isConfiguredBuiltinAdapter(type: string): boolean {
-  return configuredBuiltinTypes.has(type);
 }
 
 export function registerServerAdapter(adapter: ServerAdapterModule): void {

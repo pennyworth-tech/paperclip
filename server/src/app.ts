@@ -88,8 +88,6 @@ import { readBrandedStaticIndexHtml } from "./static-index-html.js";
 import { staticUiCacheControl } from "./static-ui-cache.js";
 import { applyUiBranding } from "./ui-branding.js";
 import { logger } from "./middleware/logger.js";
-import { assertConfiguredBuiltinAdapterTypesValid } from "./adapters/builtin-adapter-types.js";
-import { assertConfiguredBuiltinAdaptersLoaded } from "./adapters/registry.js";
 import { DEFAULT_LOCAL_PLUGIN_DIR, pluginLoader, type PluginLoader } from "./services/plugin-loader.js";
 import {
   SELF_HOSTED_AUTO_INSTALL_KEYS,
@@ -384,14 +382,6 @@ export async function createApp(
   const managedAutoInstallKeys = opts.managedPluginAutoInstall ?? null;
   const bundledCatalogRoot =
     opts.bundledPluginCatalogRoot ?? resolveBundledCatalogRoot(process.env);
-  // Same fail-closed posture as the bundled-plugin resolution below, for the
-  // adapters half of the document. `index.ts` already gates on these before
-  // the scheduler exists; repeating it here covers entry points that build an
-  // app without going through `index.ts` (tests, embedders), so no caller can
-  // end up serving routes for an adapter type whose module never loaded.
-  assertConfiguredBuiltinAdapterTypesValid();
-  await assertConfiguredBuiltinAdaptersLoaded();
-
   const bundledPluginCatalog = buildBundledPluginCatalog(opts.managedPluginCatalog ?? []);
   const bundledPluginInstalls = resolveBundledPluginInstalls(
     managedAutoInstallKeys ?? SELF_HOSTED_AUTO_INSTALL_KEYS,
