@@ -234,10 +234,21 @@ using `managedMode: "external_reference"` plus a provider `externalRef`.
 Paperclip stores metadata and a non-sensitive fingerprint, never the value.
 Runtime resolution remains server-side and binding-enforced.
 
-The built-in AWS, GCP, and Vault provider IDs currently accept external
-reference metadata, but runtime resolution requires provider configuration in the
+The built-in AWS, GCP, and Vault provider IDs all accept external reference
+metadata, but runtime resolution requires provider configuration in the
 deployment. Their provider health check reports this as a warning until
 configured.
+
+A GCP external reference must resolve inside its own vault's project, named the
+same way the vault config names it. `projects/<project>/secrets/<secret>` and a
+bare `<secret>` are both accepted; a reference naming any other project is
+refused, at link time and at resolution time. That boundary is what separates one
+company's secrets from another's, because the credentials behind every GCP vault
+are the deployment's own. Import handles the two spellings Google uses for a
+project — vault config holds the project id, listing answers with the project
+number — by rewriting what it returns into the vault's spelling, so imported
+references need no attention. A reference typed by hand has to use the vault's
+spelling.
 
 For hosted Paperclip Cloud on AWS, see the AWS Secrets Manager operational
 contract — required env vars, IAM/KMS scoping, naming and tag conventions, and
@@ -296,11 +307,17 @@ Each vault carries a status that drives what the runtime can do with it:
 | `coming_soon` | Visible and editable as draft metadata, but locked out of all runtime operations.            |
 | `disabled`    | Soft-deleted. Hidden from the secret create/rotate flow.                                      |
 
-`gcp_secret_manager` and `vault` are pinned to `coming_soon` until their
-runtime modules ship. The settings UI lets you save draft configuration for
-those providers (and surfaces them on the vault list), but secret create,
-rotate, and resolve calls that target a coming-soon vault fail with a clear
-runtime-locked error.
+`vault` is pinned to `coming_soon` until its runtime module ships. The settings
+UI lets you save draft configuration for it (and surfaces it on the vault list),
+but secret create, rotate, and resolve calls that target a coming-soon vault fail
+with a clear runtime-locked error. `local_encrypted`, `aws_secrets_manager` and
+`gcp_secret_manager` all have runtime modules and their vaults are created
+`ready`.
+
+An operator can still park an implemented provider's vault at `coming_soon`
+deliberately — to hold a configuration that is not meant to serve traffic yet.
+That is a different thing from a provider with no runtime module, and it is the
+operator's choice to reverse.
 
 ### Default Vault Behavior
 
@@ -356,12 +373,33 @@ can override) the deployment-level `PAPERCLIP_SECRETS_AWS_*` env. Bootstrap
 credentials still come from the AWS SDK default credential chain — see
 `doc/SECRETS-AWS-PROVIDER.md` for the full IAM and KMS contract.
 
-**GCP Secret Manager** and **HashiCorp Vault** vaults are coming soon. You can
-save draft `projectId`, `location`, `namespace`, `address`, and `mountPath`
-metadata so the company is ready to flip them on when the provider modules
-ship. Vault `address` values must be origin-only `http(s)://host[:port]` URLs;
-addresses with embedded credentials, paths, query strings, or fragments are
-rejected.
+**GCP Secret Manager** vaults read a required `projectId` and an optional
+`location`, plus `namespace` and `secretNamePrefix` for naming. `projectId` is
+the project every secret reference in the vault must resolve inside, so it is
+required and it is not inherited from the deployment env: a company vault that
+silently fell back to the deployment's project would be reading another tenant's
+secrets. `location` selects the regional Secret Manager endpoint — `global` or
+unset is the multi-region service, and a region such as `us-west1` routes to
+`secretmanager.us-west1.rep.googleapis.com` and to resource names carrying a
+`locations/` segment. GCP secrets are always linked, never managed: Paperclip
+creates, rotates and deletes nothing in Secret Manager. Bootstrap credentials are
+Google application default credentials held by the server runtime; see
+[GCP Secret Manager](environment-variables.md#gcp-secret-manager).
+
+Vault-config discovery — the prefill that samples secret names to suggest a
+`namespace` and `secretNamePrefix` — will only sample the project the deployment
+itself declares in `PAPERCLIP_SECRETS_GCP_PROJECT_ID` (or
+`GOOGLE_CLOUD_PROJECT`/`GCLOUD_PROJECT`). It runs against an unsaved draft with
+the deployment's own credentials, so letting it sample an arbitrary project would
+make it an enumerator for every project that identity can see. A vault in any
+other project is configured by typing its project id; nothing else about the
+vault depends on discovery, and link and resolve need no listing permission.
+
+**HashiCorp Vault** vaults are coming soon. You can save draft `address`,
+`namespace`, `mountPath` and `secretPathPrefix` metadata so the company is ready
+to flip it on when the provider module ships. Vault `address` values must be
+origin-only `http(s)://host[:port]` URLs; addresses with embedded credentials,
+paths, query strings, or fragments are rejected.
 
 ### Remote Import From AWS Vaults
 
@@ -447,9 +485,15 @@ Each provider family has a different backup story:
   role still has `GetSecretValue` plus KMS decrypt for both managed and linked
   user-scoped values. The full restore checklist lives in
   `doc/SECRETS-AWS-PROVIDER.md`.
-- `gcp_secret_manager` and `vault`: while these are coming soon, only the
-  draft vault config exists in Paperclip. Database backups capture it. There
-  is nothing to restore on the provider side until runtime support lands.
+- `gcp_secret_manager`: Paperclip holds vault metadata and external references
+  only — it owns no values in Secret Manager and can destroy none. Database
+  backups capture the vault config, the references, and their bindings; restore
+  by pointing the same company at the same project and confirming the runtime
+  identity still has `secretmanager.versions.access` on the referenced secrets.
+  Back up the Google-managed secrets themselves through Google, separately.
+- `vault`: while this is coming soon, only the draft vault config exists in
+  Paperclip. Database backups capture it. There is nothing to restore on the
+  provider side until runtime support lands.
 
 ### AWS Provider Bootstrap Boundary
 

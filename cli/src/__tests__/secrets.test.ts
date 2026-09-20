@@ -142,6 +142,19 @@ describe("secrets CLI helpers", () => {
     delete process.env.AWS_ACCESS_KEY_ID;
     delete process.env.AWS_SECRET_ACCESS_KEY;
     delete process.env.AWS_SESSION_TOKEN;
+    // A developer machine with Google credentials already in its environment must see
+    // the same doctor result as a build agent that has none.
+    delete process.env.PAPERCLIP_SECRETS_GCP_PROJECT_ID;
+    delete process.env.PAPERCLIP_SECRETS_GCP_ACCESS_TOKEN;
+    delete process.env.GOOGLE_CLOUD_PROJECT;
+    delete process.env.GCLOUD_PROJECT;
+    delete process.env.GOOGLE_APPLICATION_CREDENTIALS;
+    delete process.env.GCE_METADATA_HOST;
+    delete process.env.GCE_METADATA_IP;
+    delete process.env.K_SERVICE;
+    delete process.env.CLOUD_RUN_JOB;
+    delete process.env.FUNCTION_TARGET;
+    delete process.env.GAE_ENV;
   });
 
   afterEach(() => {
@@ -261,6 +274,36 @@ describe("secrets CLI helpers", () => {
     expect(result.status).toBe("pass");
     expect(result.message).toContain("prod-us-1");
     expect(result.message).toContain("AWS_PROFILE/shared config");
+  });
+
+  it("reports the GCP bootstrap config required by doctor", () => {
+    const result = secretsCheck(configWithSecretsProvider("gcp_secret_manager"));
+
+    expect(result.status).toBe("fail");
+    expect(result.message).toContain("PAPERCLIP_SECRETS_GCP_PROJECT_ID");
+    expect(result.repairHint).toContain("Google application default credentials");
+  });
+
+  it("passes GCP doctor checks when the project and a hosted runtime are present", () => {
+    process.env.PAPERCLIP_SECRETS_GCP_PROJECT_ID = "example-project";
+    process.env.K_SERVICE = "paperclip-server";
+
+    const result = secretsCheck(configWithSecretsProvider("gcp_secret_manager"));
+
+    expect(result.status).toBe("pass");
+    expect(result.message).toContain("example-project");
+    expect(result.message).toContain("Google hosted runtime metadata server");
+  });
+
+  it("warns when a static GCP access token is visible to the process", () => {
+    process.env.PAPERCLIP_SECRETS_GCP_PROJECT_ID = "example-project";
+    process.env.PAPERCLIP_SECRETS_GCP_ACCESS_TOKEN = "ya29.test-token";
+
+    const result = secretsCheck(configWithSecretsProvider("gcp_secret_manager"));
+
+    expect(result.status).toBe("warn");
+    expect(result.repairHint).toContain("static GCP access token");
+    expect(JSON.stringify(result)).not.toContain("ya29.test-token");
   });
 });
 

@@ -711,6 +711,18 @@ export const SECRET_PROVIDERS = [
 ] as const;
 export type SecretProvider = (typeof SECRET_PROVIDERS)[number];
 
+// Google's own project id rule: 6-30 characters, lowercase letter first, letters,
+// digits and hyphens only, and no trailing hyphen. Shared so the API schema and the
+// provider runtime cannot drift apart and accept a value the other rejects.
+export const GCP_PROJECT_ID_RE = /^[a-z][a-z0-9-]{4,28}[a-z0-9]$/;
+// The Secret Manager API accepts a project number wherever it accepts a project id,
+// and listing responses return resource names carrying the number, so both spellings
+// have to be recognised. Bounded well above the ~12 digits Google issues today.
+export const GCP_PROJECT_NUMBER_RE = /^[1-9][0-9]{0,19}$/;
+// "global" is the multi-region service; anything else is a regional endpoint whose
+// resource paths carry a locations/ segment. Matches Google's region naming.
+export const GCP_LOCATION_RE = /^(?:global|[a-z]+-[a-z]+[0-9]+)$/;
+
 export const SECRET_PROVIDER_CONFIG_STATUSES = [
   "ready",
   "warning",

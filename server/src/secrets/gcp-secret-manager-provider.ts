@@ -2,6 +2,7 @@ import { createHash, createSign } from "node:crypto";
 import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import type { DeploymentMode, SecretProviderConfigDiscoveryPreviewResult } from "@paperclipai/shared";
+import { GCP_LOCATION_RE, GCP_PROJECT_ID_RE, GCP_PROJECT_NUMBER_RE } from "@paperclipai/shared";
 import { unprocessable } from "../errors.js";
 import type {
   PreparedSecretVersion,
@@ -21,8 +22,14 @@ const GCP_SECRET_MANAGER_SCHEME = "gcp_secret_manager_v1";
 const LEGACY_EXTERNAL_REFERENCE_SCHEME = "external_reference_v1";
 const DEFAULT_SECRET_MANAGER_ENDPOINT = "https://secretmanager.googleapis.com";
 const DEFAULT_OAUTH_TOKEN_ENDPOINT = "https://oauth2.googleapis.com/token";
-const METADATA_SERVER_ORIGIN = "http://169.254.169.254";
+// The link-local address is the default rather than metadata.google.internal so that
+// off-GCE the probe fails on connect instead of waiting on a DNS lookup that cannot
+// resolve. Overridable below, like every other endpoint in this file.
+const DEFAULT_METADATA_SERVER_IP = "169.254.169.254";
 const METADATA_TOKEN_PATH = "/computeMetadata/v1/instance/service-accounts/default/token";
+// The multi-region service. Stored as null internally: a global resource name carries
+// no locations/ segment, so "global" and "unset" have to mean exactly the same thing.
+const GLOBAL_LOCATION = "global";
 const CLOUD_PLATFORM_SCOPE = "https://www.googleapis.com/auth/cloud-platform";
 const DEFAULT_VERSION_ALIAS = "latest";
 const GCP_REQUEST_TIMEOUT_MS = 30_000;
@@ -48,18 +55,35 @@ const GCP_CREDENTIAL_ACQUISITION_MESSAGE =
 const GCP_CREDENTIAL_CUSTODY_WARNING =
   "Do not store Google service-account keys in Paperclip company_secrets; the GCP provider bootstrap belongs in deployment infrastructure, the process environment, or the orchestrator secret store.";
 
-// A secret reference is interpolated into a request path, so both forms are matched
+function unanchored(pattern: RegExp): string {
+  return pattern.source.replace(/^\^/, "").replace(/\$$/, "");
+}
+
+// Composed out of the shared project patterns the API schema validates against, so a
+// project the board accepts and a project a resource name may name cannot drift apart.
+const PROJECT_SEGMENT = `(?:${unanchored(GCP_PROJECT_ID_RE)}|${unanchored(GCP_PROJECT_NUMBER_RE)})`;
+// Only a regional location appears in a resource name; "global" resources have no
+// locations/ segment at all, which is why GCP_LOCATION_RE is not reused verbatim here.
+const REGIONAL_LOCATION_SEGMENT = "[a-z]+-[a-z]+[0-9]+";
+// A secret reference is interpolated into a request path, so every form is matched
 // against an allowlist rather than scrubbed: traversal segments, schemes and hosts
 // cannot survive these character classes. Listing returns resource names carrying the
 // project number, so the numeric project form has to be accepted alongside the id.
-const FULL_SECRET_REF_RE =
-  /^projects\/((?:[a-z][a-z0-9-]{4,29})|(?:[0-9]{1,30}))\/secrets\/([A-Za-z0-9_-]{1,255})$/;
+const FULL_SECRET_REF_RE = new RegExp(
+  `^projects/(${PROJECT_SEGMENT})(?:/locations/(${REGIONAL_LOCATION_SEGMENT}))?` +
+    "/secrets/([A-Za-z0-9_-]{1,255})$",
+);
 const BARE_SECRET_ID_RE = /^[A-Za-z0-9_-]{1,255}$/;
 const VERSION_REF_RE = /^(?:latest|[1-9][0-9]{0,18})$/;
-const PROJECT_ID_RE = /^(?:[a-z][a-z0-9-]{4,29}|[0-9]{1,30})$/;
+
+function isProjectRef(value: string): boolean {
+  return GCP_PROJECT_ID_RE.test(value) || GCP_PROJECT_NUMBER_RE.test(value);
+}
 
 interface GcpSecretManagerConfig {
   projectId: string;
+  /** null means the global (multi-region) service; otherwise a regional endpoint. */
+  location: string | null;
   endpoint: string;
 }
 
@@ -72,6 +96,7 @@ interface GcpSecretManagerMaterial extends StoredSecretVersionMaterial {
 
 interface GcpSecretRef {
   projectId: string;
+  location: string | null;
   secretId: string;
 }
 
@@ -103,14 +128,25 @@ interface GcpSecretEntry {
   labels?: Record<string, string>;
 }
 
+/**
+ * The seam that keeps the Secret Manager REST surface out of the provider logic, so the
+ * reference parsing, tenancy and error-mapping rules can be tested without a transport.
+ * Requests are already validated and scoped when they arrive here: `projectId` and
+ * `location` are the vault's own, never a caller's. `listSecrets` is optional because a
+ * least-privilege deployment may hold versions.access without secrets.list, and
+ * resolution must keep working for it.
+ */
 export interface GcpSecretManagerGateway {
   accessSecretVersion(input: {
     projectId: string;
+    /** null for the global service; a region for a regional vault. */
+    location: string | null;
     secretId: string;
     version: string;
   }): Promise<{ payload?: { data?: string } }>;
   listSecrets?(input: {
     projectId: string;
+    location: string | null;
     pageSize?: number;
     pageToken?: string;
   }): Promise<{ secrets?: GcpSecretEntry[]; nextPageToken?: string }>;
@@ -136,11 +172,70 @@ function resolveEnvProjectId(): string | null {
   );
 }
 
-function resolveEndpoint(): string {
-  const configured =
-    asOptionalNonEmptyString(process.env.PAPERCLIP_SECRETS_GCP_ENDPOINT) ??
-    DEFAULT_SECRET_MANAGER_ENDPOINT;
-  return configured.replace(/\/+$/, "");
+/**
+ * Regional vaults must talk to the regional endpoint: a regional secret is simply not
+ * visible through the global one. An explicit endpoint override still wins, because it
+ * exists for proxies and emulators that front whichever service the deployment uses.
+ */
+function resolveEndpoint(location: string | null): string {
+  const override = asOptionalNonEmptyString(process.env.PAPERCLIP_SECRETS_GCP_ENDPOINT);
+  if (override) return override.replace(/\/+$/, "");
+  if (location) return `https://secretmanager.${location}.rep.googleapis.com`;
+  return DEFAULT_SECRET_MANAGER_ENDPOINT;
+}
+
+/**
+ * google-auth-library honours GCE_METADATA_HOST (a host, optionally with a port) and
+ * GCE_METADATA_IP, so a runtime behind an emulator or a non-default metadata address
+ * works without patching this file.
+ */
+function resolveMetadataOrigin(): string {
+  const host =
+    asOptionalNonEmptyString(process.env.GCE_METADATA_HOST) ??
+    asOptionalNonEmptyString(process.env.GCE_METADATA_IP) ??
+    DEFAULT_METADATA_SERVER_IP;
+  const origin = /^https?:\/\//i.test(host) ? host : `http://${host}`;
+  return origin.replace(/\/+$/, "");
+}
+
+// Environment markers that only Google's own hosted runtimes set. They are how a
+// metadata-only runtime is recognised without a network probe, which `descriptor()`
+// cannot make because it is synchronous.
+const HOSTED_GCP_RUNTIME_ENV_KEYS = [
+  "K_SERVICE",
+  "K_REVISION",
+  "CLOUD_RUN_JOB",
+  "FUNCTION_TARGET",
+  "GAE_ENV",
+  "GAE_SERVICE",
+  // Not Google-set markers, but an operator who points the runtime at a metadata
+  // server address has stated that one is reachable. Both, to match what
+  // google-auth-library reads and what `paperclipai doctor` counts as a credential source.
+  "GCE_METADATA_HOST",
+  "GCE_METADATA_IP",
+] as const;
+
+function hasHostedGcpRuntimeMarker(): boolean {
+  return HOSTED_GCP_RUNTIME_ENV_KEYS.some((key) =>
+    Boolean(asOptionalNonEmptyString(process.env[key])),
+  );
+}
+
+function normalizeLocation(value: string | null): string | null {
+  if (!value || value === GLOBAL_LOCATION) return null;
+  return value;
+}
+
+/**
+ * The canonical spelling of a reference inside a vault: the vault's own project and
+ * location, exactly as the vault config writes them. Every reference Paperclip emits or
+ * stores uses this form, which is what lets the tenancy check be a plain comparison.
+ */
+function canonicalSecretRef(config: GcpSecretManagerConfig, secretId: string): string {
+  const parent = config.location
+    ? `projects/${config.projectId}/locations/${config.location}`
+    : `projects/${config.projectId}`;
+  return `${parent}/secrets/${secretId}`;
 }
 
 function resolveStaticAccessToken(): string | null {
@@ -242,9 +337,35 @@ function credentialUnavailableError(operation: string, cause: unknown): SecretPr
   });
 }
 
+/**
+ * The vault's project is a tenancy boundary, not a default. Credentials here are the
+ * deployment's application default credentials, shared by every company on the
+ * deployment, so a reference that names someone else's project would be answered with
+ * that project's plaintext wherever the deployment identity happens to have access.
+ *
+ * The comparison is exact, against the spelling the vault config uses. It is not a
+ * project-identity lookup, because the Secret Manager API names a project two ways —
+ * the id in vault config, the number in listing responses — and the two cannot be
+ * reconciled without asking Google which number a given id has. That answer was
+ * rejected on two grounds: resolving it lazily would make a security boundary depend on
+ * whether a listing happened earlier in the process's life, and resolving it on the read
+ * path would require secretmanager.secrets.list, which healthCheck deliberately does not
+ * require of a least-privilege deployment. Instead listing rewrites every reference it
+ * emits into the vault's own spelling (see listRemoteSecrets), so imported references
+ * match by construction. The cost is stated plainly for the operator: a reference typed
+ * by hand must use the same project spelling the vault config does.
+ */
+function assertRefWithinVault(ref: GcpSecretRef, config: GcpSecretManagerConfig): void {
+  if (ref.projectId === config.projectId && ref.location === config.location) return;
+  // The rejected reference is caller input and is deliberately not echoed back.
+  throw unprocessable(
+    "GCP Secret Manager external references must name this provider vault's own project and location",
+  );
+}
+
 function parseSecretRef(
   externalRef: string | null | undefined,
-  projectId: string | null,
+  config: GcpSecretManagerConfig,
 ): GcpSecretRef {
   const trimmed = externalRef?.trim() ?? "";
   if (!trimmed) {
@@ -252,19 +373,21 @@ function parseSecretRef(
   }
   const full = FULL_SECRET_REF_RE.exec(trimmed);
   if (full) {
-    return { projectId: full[1] as string, secretId: full[2] as string };
+    const ref: GcpSecretRef = {
+      projectId: full[1] as string,
+      location: (full[2] as string | undefined) ?? null,
+      secretId: full[3] as string,
+    };
+    assertRefWithinVault(ref, config);
+    return ref;
   }
   if (BARE_SECRET_ID_RE.test(trimmed)) {
-    if (!projectId) {
-      throw unprocessable(
-        "GCP Secret Manager needs a configured project id to expand a bare secret id",
-      );
-    }
-    return { projectId, secretId: trimmed };
+    return { projectId: config.projectId, location: config.location, secretId: trimmed };
   }
   // The rejected reference is caller input and is deliberately not echoed back.
   throw unprocessable(
-    "GCP Secret Manager external references must be projects/<project>/secrets/<secret> or a bare secret id",
+    "GCP Secret Manager external references must be " +
+      "projects/<project>[/locations/<location>]/secrets/<secret> or a bare secret id",
   );
 }
 
@@ -460,7 +583,13 @@ class ApplicationDefaultCredentials implements GcpTokenSource {
   hasDetectedCredentials(): boolean {
     if (resolveStaticAccessToken()) return true;
     const keyPath = resolveServiceAccountKeyPath();
-    return Boolean(keyPath && existsSync(keyPath));
+    if (keyPath && existsSync(keyPath)) return true;
+    // The most common production shape has neither: credentials come from the metadata
+    // server. Cloud Run, Cloud Run functions and App Engine say so in the environment,
+    // so those are reported configured without a probe. GKE workload identity and bare
+    // Compute Engine advertise nothing, so they report configured only once a token has
+    // actually been acquired — CachedTokenSource answers true from its live token.
+    return hasHostedGcpRuntimeMarker();
   }
 
   describe(): string {
@@ -525,7 +654,7 @@ class ApplicationDefaultCredentials implements GcpTokenSource {
     }
     let response: Response;
     try {
-      response = await fetch(`${METADATA_SERVER_ORIGIN}${path}`, {
+      response = await fetch(`${resolveMetadataOrigin()}${path}`, {
         headers: { "Metadata-Flavor": "Google" },
         signal: AbortSignal.timeout(METADATA_PROBE_TIMEOUT_MS),
       });
@@ -586,26 +715,42 @@ class CachedTokenSource {
   }
 }
 
+// A regional resource carries a locations/ segment; a global one does not. The endpoint
+// and the path have to agree, which is why both derive from the same config.location.
+function resourceParentPath(input: { projectId: string; location: string | null }): string {
+  const project = `/v1/projects/${encodeURIComponent(input.projectId)}`;
+  return input.location ? `${project}/locations/${encodeURIComponent(input.location)}` : project;
+}
+
 class GcpSecretManagerRestGateway implements GcpSecretManagerGateway {
   constructor(
     private readonly config: GcpSecretManagerConfig,
     private readonly tokens: CachedTokenSource,
   ) {}
 
-  async accessSecretVersion(input: { projectId: string; secretId: string; version: string }) {
+  async accessSecretVersion(input: {
+    projectId: string;
+    location: string | null;
+    secretId: string;
+    version: string;
+  }) {
     const path =
-      `/v1/projects/${encodeURIComponent(input.projectId)}` +
-      `/secrets/${encodeURIComponent(input.secretId)}` +
+      `${resourceParentPath(input)}/secrets/${encodeURIComponent(input.secretId)}` +
       `/versions/${encodeURIComponent(input.version)}:access`;
     return (await this.call("accessSecretVersion", path)) as { payload?: { data?: string } };
   }
 
-  async listSecrets(input: { projectId: string; pageSize?: number; pageToken?: string }) {
+  async listSecrets(input: {
+    projectId: string;
+    location: string | null;
+    pageSize?: number;
+    pageToken?: string;
+  }) {
     const query = new URLSearchParams();
     if (input.pageSize) query.set("pageSize", String(input.pageSize));
     if (input.pageToken) query.set("pageToken", input.pageToken);
     const suffix = query.toString();
-    const path = `/v1/projects/${encodeURIComponent(input.projectId)}/secrets${suffix ? `?${suffix}` : ""}`;
+    const path = `${resourceParentPath(input)}/secrets${suffix ? `?${suffix}` : ""}`;
     return (await this.call("listSecrets", path)) as {
       secrets?: GcpSecretEntry[];
       nextPageToken?: string;
@@ -626,10 +771,17 @@ class GcpSecretManagerRestGateway implements GcpSecretManagerGateway {
   }
 }
 
+// Parses a resource name Google returned. Unlike parseSecretRef this applies no tenancy
+// check: the caller asked Google for one project's secrets, so the answer is that
+// project by construction, spelled with whichever project form the API chose.
 function secretIdFromResourceName(name: string | undefined): GcpSecretRef | null {
   const match = FULL_SECRET_REF_RE.exec(name?.trim() ?? "");
   if (!match) return null;
-  return { projectId: match[1] as string, secretId: match[2] as string };
+  return {
+    projectId: match[1] as string,
+    location: (match[2] as string | undefined) ?? null,
+    secretId: match[3] as string,
+  };
 }
 
 function createRemoteSecretMetadata(entry: GcpSecretEntry): Record<string, unknown> {
@@ -729,7 +881,7 @@ function discoverGcpProviderConfigCandidates(input: {
         displayName: `GCP ${environmentTag ?? namespace ?? prefix ?? ownerTag ?? "discovered"}`,
         config: {
           projectId: draftProjectId ?? input.config.projectId,
-          location: draftLocation,
+          location: draftLocation ?? input.config.location,
           namespace,
           secretNamePrefix: prefix,
         },
@@ -782,6 +934,9 @@ function readProviderVaultConfig(input: SecretProviderVaultRuntimeConfig): GcpSe
   if (input.status === "disabled") {
     throw unprocessable("GCP Secret Manager provider vault is disabled");
   }
+  // A vault an operator deliberately parked, not a provider without a runtime module.
+  // The status is theirs to set and theirs to clear, and the AWS provider honours it the
+  // same way; the provider-level coming-soon gates are gone.
   if (input.status === "coming_soon") {
     throw unprocessable("GCP Secret Manager provider vault runtime is locked while coming soon");
   }
@@ -791,10 +946,19 @@ function readProviderVaultConfig(input: SecretProviderVaultRuntimeConfig): GcpSe
   if (!projectId) {
     throw unprocessable("GCP Secret Manager provider vault requires non-secret config: projectId");
   }
-  if (!PROJECT_ID_RE.test(projectId)) {
+  if (!isProjectRef(projectId)) {
     throw unprocessable("GCP Secret Manager provider vault projectId is malformed");
   }
-  return { projectId, endpoint: resolveEndpoint() };
+  const location = asOptionalNonEmptyString(input.config.location);
+  if (location && !GCP_LOCATION_RE.test(location)) {
+    throw unprocessable("GCP Secret Manager provider vault location is malformed");
+  }
+  const normalizedLocation = normalizeLocation(location);
+  return {
+    projectId,
+    location: normalizedLocation,
+    endpoint: resolveEndpoint(normalizedLocation),
+  };
 }
 
 export function createGcpSecretManagerProvider(options?: {
@@ -828,14 +992,45 @@ export function createGcpSecretManagerProvider(options?: {
         "GCP Secret Manager provider requires PAPERCLIP_SECRETS_GCP_PROJECT_ID or GOOGLE_CLOUD_PROJECT",
       );
     }
-    if (!PROJECT_ID_RE.test(projectId)) {
+    if (!isProjectRef(projectId)) {
       throw unprocessable("GCP Secret Manager project id is malformed");
     }
-    return { projectId, endpoint: resolveEndpoint() };
+    // The deployment-level config is global: a region is a per-vault choice, so there is
+    // no deployment env var that could put the default provider on a regional endpoint.
+    return { projectId, location: null, endpoint: resolveEndpoint(null) };
   }
 
   function resolveGateway(config: GcpSecretManagerConfig): GcpSecretManagerGateway {
     return options?.gateway ?? new GcpSecretManagerRestGateway(config, tokens);
+  }
+
+  /**
+   * Discovery lists a project using the deployment's own credentials, from a draft vault
+   * config the caller supplied and nobody has saved, reviewed or authorized. Unconstrained
+   * that is a project enumerator: anyone who can open the new-vault dialog could read back
+   * the secret names and labels of any project this deployment's identity can see.
+   *
+   * So discovery is confined to the one project the deployment itself declares. It is a
+   * convenience — it prefills a vault form — and nothing else depends on it: a vault in
+   * another project is configured by typing its project id, and then link and resolve work
+   * with no listing permission at all.
+   */
+  async function assertDiscoverableProject(config: GcpSecretManagerConfig): Promise<void> {
+    let deploymentConfig: GcpSecretManagerConfig;
+    try {
+      deploymentConfig = await resolveConfig();
+    } catch {
+      // Reported as the discovery rule rather than as the generic missing-project error,
+      // so an operator is told why the deployment has to declare a project for this call.
+      throw unprocessable(
+        "GCP Secret Manager provider vault discovery requires the deployment to declare its own project id",
+      );
+    }
+    if (deploymentConfig.projectId !== config.projectId) {
+      throw unprocessable(
+        "GCP Secret Manager provider vault discovery is limited to the project this deployment is configured for",
+      );
+    }
   }
 
   async function validateConfig(input?: {
@@ -891,10 +1086,13 @@ export function createGcpSecretManagerProvider(options?: {
           requiredProviderConfig: input?.providerConfig
             ? ["projectId"]
             : ["PAPERCLIP_SECRETS_GCP_PROJECT_ID or GOOGLE_CLOUD_PROJECT/GCLOUD_PROJECT"],
-          optionalProviderConfig: [
-            "GOOGLE_APPLICATION_CREDENTIALS",
-            "PAPERCLIP_SECRETS_GCP_ENDPOINT",
-          ],
+          optionalProviderConfig: input?.providerConfig
+            ? ["location"]
+            : [
+                "GOOGLE_APPLICATION_CREDENTIALS",
+                "PAPERCLIP_SECRETS_GCP_ENDPOINT",
+                "PAPERCLIP_SECRETS_GCP_ACCESS_TOKEN",
+              ],
           credentialSource: "Google application default credentials",
         },
       };
@@ -931,6 +1129,7 @@ export function createGcpSecretManagerProvider(options?: {
       warnings: validation.warnings,
       details: {
         projectId: config.projectId,
+        location: config.location ?? GLOBAL_LOCATION,
         endpoint: config.endpoint,
         credentialSource: tokens.describe(),
       },
@@ -969,19 +1168,20 @@ export function createGcpSecretManagerProvider(options?: {
       );
     },
     async linkExternalSecret(input) {
-      // A full resource reference names its own project, so linking one does not require
-      // the deployment to have been pointed at a project yet; a bare id does.
-      const config = input.providerConfig
-        ? readProviderVaultConfig(input.providerConfig)
-        : FULL_SECRET_REF_RE.test(input.externalRef.trim())
-          ? null
-          : await resolveConfig();
-      // Validated at link time as well as at resolve time so a malformed reference is
-      // rejected at the boundary instead of being persisted and failing later.
-      parseSecretRef(input.externalRef, config?.projectId ?? null);
+      // Always resolved, including for a full resource reference: the vault's project is
+      // what a reference has to be checked against, so there is no reference shape that
+      // can be linked without knowing it.
+      const config = await resolveConfig(input.providerConfig);
+      // Checked at link time as well as at resolve time so a reference that is malformed
+      // or outside the vault is refused at the boundary instead of being persisted and
+      // failing — or worse, resolving — later.
+      parseSecretRef(input.externalRef, config);
       const providerVersionRef = input.providerVersionRef?.trim()
         ? normalizeVersionRef(input.providerVersionRef)
         : null;
+      // Stored as the operator wrote it. A full reference that got this far is already
+      // the vault's own canonical spelling, and a bare id expands against the vault it
+      // resolves under, so there is nothing left to normalise.
       return createExternalReferenceMaterial(input.externalRef, providerVersionRef);
     },
     async listRemoteSecrets(input): Promise<RemoteSecretListResult> {
@@ -999,6 +1199,7 @@ export function createGcpSecretManagerProvider(options?: {
         }
         const listed = await gateway.listSecrets({
           projectId: config.projectId,
+          location: config.location,
           pageSize,
           pageToken: input.nextToken?.trim() || undefined,
         });
@@ -1013,7 +1214,12 @@ export function createGcpSecretManagerProvider(options?: {
               (!query || candidate.ref.secretId.toLowerCase().includes(query)),
           )
           .map(({ entry, ref }) => ({
-            externalRef: `projects/${ref.projectId}/secrets/${ref.secretId}`,
+            // Rewritten into the vault's own spelling rather than echoed back. Listing
+            // answers with the project NUMBER while vault config holds the project ID,
+            // and the two are the same project here by construction — we asked Google for
+            // this vault's project. Emitting the vault's spelling is what lets an
+            // imported reference pass the tenancy check in assertRefWithinVault.
+            externalRef: canonicalSecretRef(config, ref.secretId),
             name: ref.secretId,
             providerVersionRef: null,
             metadata: createRemoteSecretMetadata(entry),
@@ -1025,6 +1231,7 @@ export function createGcpSecretManagerProvider(options?: {
     },
     async discoverProviderConfigs(input): Promise<SecretProviderConfigDiscoveryPreviewResult> {
       const config = await resolveConfig(input.providerConfig);
+      await assertDiscoverableProject(config);
       const gateway = resolveGateway(config);
       const pageSize =
         input.pageSize && Number.isFinite(input.pageSize)
@@ -1037,6 +1244,7 @@ export function createGcpSecretManagerProvider(options?: {
         }
         const listed = await gateway.listSecrets({
           projectId: config.projectId,
+          location: config.location,
           pageSize,
           pageToken: input.nextToken?.trim() || undefined,
         });
@@ -1055,20 +1263,28 @@ export function createGcpSecretManagerProvider(options?: {
       const gateway = resolveGateway(config);
       const material = asGcpSecretManagerMaterial(input.material);
       // The stored reference is the fallback; the secret row's own reference wins so an
-      // operator can repoint a link without rewriting version material.
-      const ref = parseSecretRef(input.externalRef ?? material.externalRef, config.projectId);
+      // operator can repoint a link without rewriting version material. Either way the
+      // reference is re-checked against the vault: a row written before this boundary
+      // existed, or repointed since, does not get to bypass it.
+      const ref = parseSecretRef(input.externalRef ?? material.externalRef, config);
       const version = normalizeVersionRef(input.providerVersionRef ?? material.providerVersionRef);
 
       try {
         const resolved = await gateway.accessSecretVersion({
           projectId: ref.projectId,
+          location: ref.location,
           secretId: ref.secretId,
           version,
         });
-        const data = resolved.payload?.data;
-        // An empty secret is a legitimate value, so the check is on the type, not truthiness.
-        if (typeof data !== "string") {
+        const payload = resolved.payload;
+        if (!payload) {
           throw new Error("The secret version payload was missing");
+        }
+        // proto3 JSON omits default values, so an empty secret comes back with no `data`
+        // field at all rather than an empty string. An empty secret is a legitimate value.
+        const data = payload.data ?? "";
+        if (typeof data !== "string") {
+          throw new Error("The secret version payload was malformed");
         }
         return Buffer.from(data, "base64").toString("utf8");
       } catch (error) {

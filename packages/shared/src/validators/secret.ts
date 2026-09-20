@@ -1,5 +1,8 @@
 import { z } from "zod";
 import {
+  GCP_LOCATION_RE,
+  GCP_PROJECT_ID_RE,
+  GCP_PROJECT_NUMBER_RE,
   SECRET_BINDING_TARGET_TYPES,
   SECRET_MANAGED_MODES,
   SECRET_PROJECTION_CLASSES,
@@ -257,8 +260,17 @@ export const awsSecretsManagerProviderConfigSchema = z.object({
 }).strict();
 
 export const gcpSecretManagerProviderConfigSchema = z.object({
-  projectId: z.string().trim().min(1).max(128).regex(/^[a-z][a-z0-9-]{4,127}$/).optional().nullable(),
-  location: optionalSafeShortText,
+  // Both spellings Google accepts for a project, and only those: the runtime rejects
+  // anything else, so accepting more here would just defer the failure to resolve time.
+  projectId: z.string().trim()
+    .refine(
+      (value) => GCP_PROJECT_ID_RE.test(value) || GCP_PROJECT_NUMBER_RE.test(value),
+      "Invalid GCP project id or project number",
+    )
+    .optional().nullable(),
+  // Selects the regional Secret Manager endpoint; "global" (or unset) is the
+  // multi-region service. Free text here would silently produce an unroutable host.
+  location: z.string().trim().regex(GCP_LOCATION_RE, "Invalid GCP location").optional().nullable(),
   namespace: optionalSafeShortText,
   secretNamePrefix: optionalSafeShortText,
 }).strict();
@@ -335,8 +347,8 @@ export const createSecretProviderConfigSchema = z.object({
       });
     }
   }
-  const status = value.status ?? (["gcp_secret_manager", "vault"].includes(value.provider) ? "coming_soon" : "ready");
-  if ((value.provider === "gcp_secret_manager" || value.provider === "vault") && status !== "coming_soon" && status !== "disabled") {
+  const status = value.status ?? (value.provider === "vault" ? "coming_soon" : "ready");
+  if (value.provider === "vault" && status !== "coming_soon" && status !== "disabled") {
     ctx.addIssue({
       code: z.ZodIssueCode.custom,
       path: ["status"],

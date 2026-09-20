@@ -7,6 +7,8 @@ import { resolveRuntimeLikePath } from "./path-resolver.js";
 
 const AWS_CREDENTIAL_SOURCE_HINT =
   "Provide AWS runtime credentials through the AWS SDK default credential chain: IAM role/workload identity, AWS_PROFILE/SSO/shared credentials, web identity, container/instance metadata, or short-lived shell credentials";
+const GCP_CREDENTIAL_SOURCE_HINT =
+  "Provide Google application default credentials to the server runtime: workload identity, a GOOGLE_APPLICATION_CREDENTIALS service-account key file, or the Compute Engine metadata server";
 
 function decodeMasterKey(raw: string): Buffer | null {
   const trimmed = raw.trim();
@@ -53,13 +55,17 @@ export function secretsCheck(config: PaperclipConfig, configPath?: string): Chec
   if (provider === "aws_secrets_manager") {
     return withStrictModeNote(awsSecretsManagerCheck(), config);
   }
+  if (provider === "gcp_secret_manager") {
+    return withStrictModeNote(gcpSecretManagerCheck(), config);
+  }
   if (provider !== "local_encrypted") {
     return {
       name: "Secrets adapter",
       status: "fail",
-      message: `${provider} is configured, but this build only supports local_encrypted and aws_secrets_manager`,
+      message: `${provider} is configured, but this build has no runtime module for it`,
       canRepair: false,
-      repairHint: "Run `paperclipai configure --section secrets` and choose local_encrypted or aws_secrets_manager",
+      repairHint:
+        "Run `paperclipai configure --section secrets` and choose local_encrypted, aws_secrets_manager, or gcp_secret_manager",
     };
   }
 
@@ -196,6 +202,69 @@ function awsSecretsManagerCheck(): CheckResult {
     status: "pass",
     message,
   };
+}
+
+function gcpSecretManagerCheck(): CheckResult {
+  const projectId = (
+    process.env.PAPERCLIP_SECRETS_GCP_PROJECT_ID ??
+    process.env.GOOGLE_CLOUD_PROJECT ??
+    process.env.GCLOUD_PROJECT
+  )?.trim();
+
+  if (!projectId) {
+    return {
+      name: "Secrets adapter",
+      status: "fail",
+      message:
+        "GCP Secret Manager provider is missing non-secret config: PAPERCLIP_SECRETS_GCP_PROJECT_ID or GOOGLE_CLOUD_PROJECT/GCLOUD_PROJECT",
+      canRepair: false,
+      repairHint: `Set PAPERCLIP_SECRETS_GCP_PROJECT_ID in the Paperclip server runtime. ${GCP_CREDENTIAL_SOURCE_HINT}`,
+    };
+  }
+
+  const credentialSource = detectedGcpCredentialSources().join(", ");
+  const message =
+    `GCP Secret Manager provider configured for project ${projectId}; ` +
+    `runtime credentials source: ${credentialSource || "Google application default credentials"}`;
+
+  // A token pasted into the environment cannot be rotated by the platform and outlives
+  // nothing: it is a local break-glass, not a deployment credential.
+  if (process.env.PAPERCLIP_SECRETS_GCP_ACCESS_TOKEN?.trim()) {
+    return {
+      name: "Secrets adapter",
+      status: "warn",
+      message,
+      canRepair: false,
+      repairHint:
+        "A static GCP access token is visible to this process. Use it only as a local break-glass; prefer workload identity or the Compute Engine metadata server for hosted deployments, and never store Google service-account keys in Paperclip company secrets.",
+    };
+  }
+
+  return { name: "Secrets adapter", status: "pass", message };
+}
+
+function detectedGcpCredentialSources(): string[] {
+  const sources: string[] = [];
+  if (process.env.PAPERCLIP_SECRETS_GCP_ACCESS_TOKEN?.trim()) {
+    sources.push("static PAPERCLIP_SECRETS_GCP_ACCESS_TOKEN environment credential");
+  }
+  if (process.env.GOOGLE_APPLICATION_CREDENTIALS?.trim()) {
+    sources.push("GOOGLE_APPLICATION_CREDENTIALS service-account key file");
+  }
+  // The hosted runtimes that advertise themselves; elsewhere the metadata server is
+  // only discoverable by asking it, which doctor does not do.
+  if (
+    process.env.K_SERVICE?.trim() ||
+    process.env.CLOUD_RUN_JOB?.trim() ||
+    process.env.FUNCTION_TARGET?.trim() ||
+    process.env.GAE_ENV?.trim()
+  ) {
+    sources.push("Google hosted runtime metadata server");
+  }
+  if (process.env.GCE_METADATA_HOST?.trim() || process.env.GCE_METADATA_IP?.trim()) {
+    sources.push("configured metadata server address");
+  }
+  return sources;
 }
 
 function missingAwsSecretsManagerConfig(): string[] {
