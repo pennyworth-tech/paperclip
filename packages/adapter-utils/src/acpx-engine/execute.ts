@@ -47,6 +47,7 @@ import {
   applyPaperclipWorkspaceEnv,
   asNumber,
   asString,
+  buildAllowlistedChildEnv,
   buildInvocationEnvForLogs,
   buildPaperclipEnv,
   ensureAbsoluteDirectory,
@@ -400,6 +401,14 @@ interface AcpxPreparedRuntime {
   workspaceRepoRef: string;
   env: Record<string, string>;
   loggedEnv: Record<string, string>;
+  /**
+   * The deny-by-default env the ACP agent child is spawned with, replacing the
+   * host `process.env` acpx would otherwise copy (BAC-4671). `undefined` on the
+   * remote process-session lane, where acpx host-spawns Paperclip's OWN relay
+   * proxy (`writeProcessSessionProxyScript`) rather than a harness, and the
+   * harness itself runs inside the sandbox off an env the sandbox builds.
+   */
+  spawnEnvBase: Record<string, string> | undefined;
   stateDir: string;
   permissionMode: "approve-all" | "approve-reads" | "deny-all";
   nonInteractivePermissions: "deny" | "fail";
@@ -1871,9 +1880,12 @@ async function buildRuntime(input: {
   let agentCommand = configuredCommand || builtInCommand?.command || null;
   let agentCommandShell = configuredCommand || builtInCommand?.shellCommand || "";
   if (acpxAgent === "gemini" && agentCommandShell) {
+    // The version probe execs the gemini binary itself, so it is a harness
+    // child like any other and goes through the same allowlist rather than
+    // inheriting the server env (BAC-4671).
     const normalized = await normalizeGeminiAcpCommandShell(
       agentCommandShell,
-      ensurePathInEnv({ ...process.env, ...env }),
+      buildAllowlistedChildEnv({ overlay: env }).env,
     );
     if (normalized !== agentCommandShell) {
       agentCommandShell = normalized;
@@ -2234,6 +2246,42 @@ async function buildRuntime(input: {
     resolvedCommand: agentCommand ?? acpxAgent,
   });
 
+  // The deny-by-default child-env boundary for this lane (BAC-4671). acpx's
+  // `buildAgentEnvironment` copies the host `process.env` wholesale; the
+  // patched `spawnEnvBase` option replaces that copy, so both execution lanes
+  // now filter through the SAME `buildAllowlistedChildEnv` helper instead of
+  // only `runChildProcess` doing it. `engine` defaults to "auto" (ACP
+  // preferred), so before this the allowlist was inert on a default-configured
+  // agent and the harness received DATABASE_URL and every injected secret.
+  //
+  // `additionalAllowed` carries the config-bound keys explicitly rather than
+  // through the `PAPERCLIP_CHILD_ENV_CONFIG_KEYS` marker the CLI lane uses:
+  // this lane builds `env` itself and never writes the marker, and passing the
+  // names directly keeps a bookkeeping variable out of the child env entirely.
+  // Those names are how agent credentials actually arrive (a `secret_ref`
+  // bound to GITHUB_TOKEN / CLAUDE_CODE_OAUTH_TOKEN / OPENAI_API_KEY), and no
+  // static list can anticipate them.
+  const spawnEnvBase = useRemoteProcessSession
+    ? undefined
+    : (() => {
+      const allowlisted = buildAllowlistedChildEnv({
+        overlay: env,
+        additionalAllowed: Object.keys(resolvedAdapterEnv),
+      });
+      if (allowlisted.droppedKeys.length > 0) {
+        // Names only, never values — same rule as the CLI lane: a silent drop
+        // turns a missing credential into an unexplainable harness failure,
+        // but the values are the host's secrets.
+        console.debug(
+          { runId, droppedCount: allowlisted.droppedKeys.length, droppedKeys: allowlisted.droppedKeys },
+          "dropped host environment variables that are not on the ACP child env allowlist",
+        );
+      }
+      return Object.fromEntries(
+        Object.entries(allowlisted.env).filter((entry): entry is [string, string] => typeof entry[1] === "string"),
+      );
+    })();
+
   return {
     acpxAgent,
     coalescePlaceholderToolUpdates,
@@ -2252,6 +2300,7 @@ async function buildRuntime(input: {
     workspaceRepoRef,
     env,
     loggedEnv,
+    spawnEnvBase,
     stateDir,
     permissionMode,
     nonInteractivePermissions,
@@ -3635,6 +3684,11 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
           // fingerprint / compat key are unaffected — this redirects ONLY the host
           // `spawn()` `chdir`, not the in-sandbox data path.
           spawnCwd: prepared.hostSpawnCwd,
+          // Replaces the host `process.env` acpx would otherwise copy into the
+          // agent child; see `AcpxPreparedRuntime.spawnEnvBase`. `sessionOptions.env`
+          // below still carries the run's own env — acpx re-overlays the same
+          // values onto this base, which is idempotent.
+          spawnEnvBase: prepared.spawnEnvBase,
           sessionStore: createRuntimeStore({ stateDir: prepared.stateDir }),
           agentRegistry: prepared.agentRegistry,
           permissionMode: prepared.permissionMode,

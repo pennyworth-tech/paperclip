@@ -1,13 +1,25 @@
 #!/usr/bin/env node
 import { randomUUID } from "node:crypto";
+import { writeFileSync } from "node:fs";
 import { createInterface } from "node:readline";
 
 function writeMessage(message) {
   process.stdout.write(`${JSON.stringify(message)}\n`);
 }
 
+// Names only, never values. The child-env allowlist test needs to prove a
+// server secret (DATABASE_URL) did not reach this process, and the value of a
+// leaked secret must not be the thing written to a temp file to prove it.
+// PAPERCLIP_-prefixed so the allowlist itself admits the request variable.
+function dumpEnvKeys() {
+  const target = process.env.PAPERCLIP_ACPX_ENV_DUMP;
+  if (!target) return;
+  writeFileSync(target, JSON.stringify(Object.keys(process.env).sort()));
+}
+
 async function handleRequest(request) {
   if (request.method === "initialize") {
+    dumpEnvKeys();
     process.stderr.write("Error handling request { method: 'nes/close' } { code: -32601 }\n");
     process.stderr.write("paperclip-acp-echo-agent started\n");
     return {
