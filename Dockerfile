@@ -75,22 +75,155 @@ ARG PAPERCLIP_BUILD_VERSION=""
 # falls back to PAPERCLIP_BUILD_COMMIT when git is unavailable, which feeds the
 # /api/health `commit` field that deploy tooling verifies. Empty locally.
 ARG PAPERCLIP_BUILD_COMMIT=""
-# Refreshes the tool layer below when it changes (CI stamps an ISO week, so
-# the @latest CLI tools advance weekly). Without it the cached layer would
-# freeze the tools until an unrelated cache bust.
+# Busts the tool layer below on demand. It no longer advances the tool
+# versions on its own — every specifier is pinned — so CI stamps it only to
+# force a deliberate rebuild of the layer.
 ARG CLI_TOOLS_CACHE_EPOCH=""
+# Harness versions, resolved on 2026-09-19 and frozen (BAC-4671 tasks 4.2/4.3).
+# Every specifier used to be `@latest`, which meant the versions in the serving
+# image were whatever the layer last resolved — unknown, and one cache-buster
+# edit upgraded all five at once. That is the shape of the 2026-08-11 incident,
+# where a claude CLI that auto-updated through a shim took the fleet down.
+# Bumping a harness is now a reviewable one-line diff.
+ARG CLAUDE_VERSION=2.1.278
+ARG CODEX_VERSION=0.155.1
+ARG OPENCODE_VERSION=1.18.31
+ARG GEMINI_VERSION=0.60.0
+ARG KIMI_VERSION=2.0.2
+# `@fission-ai/openspec` is the real package. The bare `openspec` name on npm
+# is an unrelated 0.0.0 squat — installing it gets you nothing and no error.
+ARG OPENSPEC_VERSION=1.2.0
+# The devcontainers CLI, which `devcontainer up` is. It spawns `docker` as a
+# subprocess, so it is useless without the docker client below.
+ARG DEVCONTAINERS_CLI_VERSION=0.89.0
+# entire ships GitHub release tarballs, not an npm package (it is a Homebrew
+# cask locally), so it installs by tarball with a checksum below.
+ARG ENTIRE_VERSION=0.10.6
+# The docker CLIENT only. The daemon runs in a separate privileged dind
+# sidecar and this container reaches it over DOCKER_HOST, so this image stays
+# unprivileged. Installed from Docker's static tarball rather than
+# `docker-ce-cli` so no third-party apt repo and keyring enter the image, and
+# so the one binary we want is the only one extracted: the tarball also carries
+# dockerd/containerd/runc, and none of them belong here.
+ARG DOCKER_CLI_VERSION=29.8.1
 WORKDIR /app
 # Tool and OS layer BEFORE the app copy: it references nothing from /app, and
 # the app copy changes on every commit — ordered the other way around, this
 # (the single most expensive layer: four CLI toolchains + apt, per arch) can
 # never hit the layer cache and rebuilds on every build.
+#
+# `python3-venv`: arborist is a Python tool, and trixie-slim splits venv out of
+# `python3`, so `python3 -m venv` fails with a bare `python3` install.
+# `openssh-client`: the repo contract uses git@github.com: remotes and agents
+# now push from inside this container. It was originally installed for herdr's
+# `ssh -NT -L` tunnel; herdr is gone, the transport is not (task 4.4).
 RUN echo "cli-tools-epoch: ${CLI_TOOLS_CACHE_EPOCH}" \
-  && npm install --global --omit=dev @anthropic-ai/claude-code@latest @openai/codex@latest opencode-ai @google/gemini-cli@latest @moonshot-ai/kimi-code@latest \
+  && npm install --global --omit=dev \
+       "@anthropic-ai/claude-code@${CLAUDE_VERSION}" \
+       "@openai/codex@${CODEX_VERSION}" \
+       "opencode-ai@${OPENCODE_VERSION}" \
+       "@google/gemini-cli@${GEMINI_VERSION}" \
+       "@moonshot-ai/kimi-code@${KIMI_VERSION}" \
+       "@fission-ai/openspec@${OPENSPEC_VERSION}" \
+       "@devcontainers/cli@${DEVCONTAINERS_CLI_VERSION}" \
   && apt-get update \
-  && apt-get install -y --no-install-recommends openssh-client jq \
+  && apt-get install -y --no-install-recommends openssh-client jq python3-venv \
   && rm -rf /var/lib/apt/lists/* \
   && mkdir -p /paperclip \
   && chown node:node /paperclip
+
+# `curl -O`, not `-o`: `sha256sum -c` reads the filename out of checksums.txt
+# and looks for it on disk, so the downloaded name must be preserved verbatim.
+RUN set -eu; arch="$(dpkg --print-architecture)"; \
+    case "$arch" in amd64) A=amd64 ;; arm64) A=arm64 ;; *) echo "unsupported $arch"; exit 1 ;; esac; \
+    f="entire_linux_${A}.tar.gz"; cd /tmp; \
+    curl -fsSL -O "https://github.com/entireio/cli/releases/download/v${ENTIRE_VERSION}/${f}"; \
+    curl -fsSL -O "https://github.com/entireio/cli/releases/download/v${ENTIRE_VERSION}/checksums.txt"; \
+    grep " ${f}\$" checksums.txt | sha256sum -c -; \
+    tar -xzf "$f" -C /usr/local/bin entire; chmod +x /usr/local/bin/entire; rm -f "$f" checksums.txt
+
+# Docker's static tarball is published under the kernel arch name, not the
+# Debian one. Only `docker/docker` (the client) is extracted; extracting
+# `dockerd` here would invite someone to run a daemon in this container, which
+# is exactly what the unprivileged-container + dind-sidecar split avoids.
+RUN set -eu; arch="$(dpkg --print-architecture)"; \
+    case "$arch" in amd64) A=x86_64 ;; arm64) A=aarch64 ;; *) echo "unsupported $arch"; exit 1 ;; esac; \
+    cd /tmp; \
+    curl -fsSL -o docker.tgz "https://download.docker.com/linux/static/stable/${A}/docker-${DOCKER_CLI_VERSION}.tgz"; \
+    tar -xzf docker.tgz --strip-components=1 -C /usr/local/bin docker/docker; \
+    chmod +x /usr/local/bin/docker; rm -f docker.tgz; \
+    docker --version | grep -qF "${DOCKER_CLI_VERSION}"
+
+# Freeze what ACTUALLY resolved into the image, not what was asked for. A
+# build-time pin does not stop a harness self-updating at runtime — that is the
+# failure already on record — so the spawn path asserts against this file. It
+# has to be a file: an ARG is out of scope the moment the build ends, and a
+# runtime check against a value the image no longer carries proves nothing.
+# The versions are read back from npm rather than echoed from the ARGs, so a
+# specifier that silently resolved to something else fails the build here.
+RUN set -eu; \
+    mkdir -p /etc/paperclip; \
+    npm ls -g --depth=0 --json > /tmp/npm-globals.json || true; \
+    node -e ' \
+      const fs = require("fs"); \
+      const deps = (JSON.parse(fs.readFileSync("/tmp/npm-globals.json", "utf8")).dependencies) || {}; \
+      const want = { \
+        claude: ["@anthropic-ai/claude-code", process.env.CLAUDE_VERSION], \
+        codex: ["@openai/codex", process.env.CODEX_VERSION], \
+        opencode: ["opencode-ai", process.env.OPENCODE_VERSION], \
+        gemini: ["@google/gemini-cli", process.env.GEMINI_VERSION], \
+        kimi: ["@moonshot-ai/kimi-code", process.env.KIMI_VERSION], \
+        openspec: ["@fission-ai/openspec", process.env.OPENSPEC_VERSION], \
+        devcontainer: ["@devcontainers/cli", process.env.DEVCONTAINERS_CLI_VERSION], \
+      }; \
+      const out = {}; \
+      for (const [key, [pkg, expected]] of Object.entries(want)) { \
+        const got = deps[pkg] && deps[pkg].version; \
+        if (got !== expected) { \
+          console.error(`ERROR: ${pkg} resolved to ${got} but the build pinned ${expected}`); \
+          process.exit(1); \
+        } \
+        out[key] = got; \
+      } \
+      out.entire = process.env.ENTIRE_VERSION; \
+      out.docker = process.env.DOCKER_CLI_VERSION; \
+      fs.writeFileSync("/etc/paperclip/harness-versions.json", JSON.stringify(out) + "\n"); \
+    '; \
+    rm -f /tmp/npm-globals.json; \
+    cat /etc/paperclip/harness-versions.json
+
+# A bare GITHUB_TOKEN in the environment does nothing for `git push` — git never
+# reads it. The server's own helper (server/src/services/git-credentials.ts) is
+# per-invocation: it passes `-c credential.…helper=…` on each git command it
+# runs itself, and nothing of it persists into a workspace's .git/config, so a
+# harness child running plain `git push` has no credential at all.
+#
+# This installs the same helper system-wide. It goes in /etc/gitconfig, NOT
+# ~/.gitconfig: HOME is /paperclip, which is a mounted volume, so a home-dir
+# config is whatever the volume happens to carry and is not part of the image.
+#
+# The helper follows git-credentials.ts exactly on the two things that matter:
+# the token is read from the environment, so it never appears in argv, in a URL,
+# or on disk; and the request is re-validated from the helper's own stdin so a
+# repository-local `url.<base>.insteadOf` rewrite cannot steer it at another
+# host. The URL-scoped install below is the second, independent gate.
+#
+# Token precedence: PAPERCLIP_GIT_TOKEN is what the server's per-invocation
+# helper sets, and `sanitizeInheritedPaperclipEnv` strips host PAPERCLIP_* values
+# from harness children — so GITHUB_TOKEN/GH_TOKEN, which reach a child through a
+# config `secret_ref` binding, are the names that actually work in an agent run.
+#
+# The file must be named `git-credential-paperclip` and the config value must be
+# the bare `paperclip`: git resolves a helper name by prefixing it with
+# `git-credential-`, so configuring the full filename makes git look for
+# `git-credential-git-credential-paperclip` and fail.
+COPY scripts/git-credential-paperclip.sh /usr/local/bin/git-credential-paperclip
+RUN set -eu; \
+    chmod 0755 /usr/local/bin/git-credential-paperclip; \
+    git config --system credential.helper ""; \
+    git config --system "credential.https://github.com.helper" paperclip; \
+    git config --system "credential.https://www.github.com.helper" paperclip; \
+    test -r /etc/gitconfig
 
 COPY scripts/docker-entrypoint.sh /usr/local/bin/
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh
@@ -125,6 +258,27 @@ EXPOSE 3100
 # graceful shutdown are unchanged. Mirrors docker/agent-runtime/Dockerfile.base.
 ENTRYPOINT ["/usr/bin/tini", "--", "docker-entrypoint.sh"]
 CMD ["node", "--import", "./server/node_modules/tsx/dist/loader.mjs", "server/dist/index.js"]
+
+# Local development variant (build with `--target local`), used by
+# docker/docker-compose.local.yml. Same Dockerfile as production on purpose: a
+# second Dockerfile would stop a local run from being evidence about the
+# production image. Until this stage existed the local compose file could not
+# build at all — it named a target that was not here.
+#
+# It declares nothing of its own. Everything that differs between local and
+# production is a mount or an environment variable, and those belong in the
+# compose file where a developer can see them: the developer's own ~/.claude,
+# ~/.codex and ~/.local/share/opencode bound in WRITABLE (the session stores
+# live there, and a read-only mount boots fine and silently breaks every
+# resume), the worktree root on a bind mount so worktrees are inspectable from
+# the host, and a local Postgres instead of Cloud SQL.
+#
+# It must stay BEFORE `cloud-plugins` below. Appended after `cloud` it would
+# become the last stage in the file, which is what an untargeted
+# `docker build` produces — silently changing what docker/docker-compose.yml
+# builds. It also deliberately adds no ENTRYPOINT: tini stays PID 1 (see
+# server/src/__tests__/container-init-reaping.test.ts).
+FROM production AS local
 
 # Cloud image variant (build with `--target cloud`): the production image
 # plus built bundled plugins. Managed instances receive a

@@ -1,0 +1,90 @@
+# The local development profile (BAC-4671).
+#
+# "Suitable for local running" is a requirement here, not a footnote: this is
+# the only place worktree placement and session-resume behaviour can be
+# exercised outside production. Built from the SAME Dockerfile as production,
+# target `local` — a second Dockerfile would stop a local run from being
+# evidence about the production image.
+#
+#   docker compose -f docker/docker-compose.local.yml up --build
+
+services:
+  paperclip:
+    build:
+      context: ..
+      target: local
+    ports:
+      - "3100:3100"
+    environment:
+      PAPERCLIP_HOME: /paperclip
+      PAPERCLIP_INSTANCE_ID: local
+      PAPERCLIP_DEPLOYMENT_MODE: authenticated
+      PAPERCLIP_DEPLOYMENT_EXPOSURE: private
+      DATABASE_URL: postgres://paperclip:paperclip@postgres:5432/paperclip
+      # This container holds no docker daemon and stays unprivileged; the
+      # daemon lives in the `dind` sidecar below. `devcontainer up` spawns the
+      # `docker` client, which reads this.
+      DOCKER_HOST: tcp://dind:2375
+      # The gateway credential, from the developer's own environment. Never a
+      # literal here and never a dotfile on a host nobody manages in code.
+      LITELLM_API_KEY: ${LITELLM_API_KEY:?set LITELLM_API_KEY}
+    volumes:
+      # --- credential + session stores -----------------------------------
+      # WRITABLE on purpose. The claude transcript store, the codex rollout
+      # files and auth.json, and the opencode session database all live under
+      # these paths, so a read-only mount boots fine and silently breaks every
+      # resume.
+      - ${HOME}/.claude:/paperclip/.claude
+      - ${HOME}/.codex:/paperclip/.codex
+      - ${HOME}/.local/share/opencode:/paperclip/.local/share/opencode
+
+      # --- the execution-workspace root ----------------------------------
+      # Bind-mounted so worktrees are inspectable from the host: this is how a
+      # developer sees what `realizeExecutionWorkspace` actually did.
+      - ./.local/workspaces:/paperclip/workspaces
+
+      # --- instance state -------------------------------------------------
+      - ./.local/paperclip-home:/paperclip/instances
+    depends_on:
+      postgres:
+        condition: service_healthy
+    # Same reason as the other compose files: a future pid leak should die
+    # visibly here rather than starving the host.
+    pids_limit: 4096
+    # The image runs tini as PID 1 for a measured reason — agent runs spawn
+    # git/claude/esbuild/sh descendants that outlive their leader (~79
+    # zombies/hour) until the cgroup pid limit exhausts every fork(). Setting
+    # `init: true` would nest docker-init around tini and make it warn on every
+    # boot, so the image keeps ownership of PID 1.
+    init: false
+
+  # The ONLY privileged container in this profile. Keeping the daemon here
+  # rather than in the paperclip image is what lets the image that runs agent
+  # code stay unprivileged: a docker socket inside the agent container is root
+  # on the host by another name.
+  dind:
+    image: docker:29-dind
+    privileged: true
+    environment:
+      DOCKER_TLS_CERTDIR: ""
+    command: ["--host=tcp://0.0.0.0:2375", "--host=unix:///var/run/docker.sock"]
+
+  postgres:
+    image: postgres:18
+    environment:
+      POSTGRES_USER: paperclip
+      POSTGRES_PASSWORD: paperclip
+      POSTGRES_DB: paperclip
+    volumes:
+      - ./.local/pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U paperclip"]
+      interval: 5s
+      retries: 20
+
+# NOT here, deliberately:
+#   * no herdr, no ssh, no tunnel. That is the point.
+#   * no litellm-gateway container. Local runs talk to the deployed gateway
+#     with the developer's own key, so a local run exercises the real routing.
+#   * no bundled agent fixtures. Agents are configured through the UI, the same
+#     way they are in production, so the local profile tests the real path.
