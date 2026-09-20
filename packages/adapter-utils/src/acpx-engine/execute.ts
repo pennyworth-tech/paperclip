@@ -539,6 +539,8 @@ export function buildSessionKey(identity: SessionKeyIdentity, fingerprint: strin
 // at all. In particular, native-runner bootstrap and MCP credentials are host
 // authority, not provider credentials.
 const ACPX_INHERITED_HOST_ENV_KEYS = new Set([
+  // Docker clients may connect to a separately managed daemon endpoint.
+  "DOCKER_HOST",
   "PATH",
   "PATHEXT",
   "SYSTEMROOT",

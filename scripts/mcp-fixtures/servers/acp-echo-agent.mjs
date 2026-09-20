@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { writeFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { createInterface } from "node:readline";
 
@@ -10,6 +11,10 @@ let supportsTypedSessionFailure = false;
 
 async function handleRequest(request) {
   if (request.method === "initialize") {
+    // Names only: the environment test must not write secret values to disk.
+    if (process.env.PAPERCLIP_ACPX_ENV_DUMP) {
+      writeFileSync(process.env.PAPERCLIP_ACPX_ENV_DUMP, JSON.stringify(Object.keys(process.env).sort()));
+    }
     const air = request.params?.clientCapabilities?._meta?.jetbrains?.air;
     supportsTypedSessionFailure =
       Number.isInteger(air?.version) &&

@@ -3510,6 +3510,8 @@ const CHILD_ENV_ALLOWED_KEYS = new Set<string>([
   // Git transport the agent uses to fetch and push its own work.
   "GIT_SSH_COMMAND",
   "SSH_AUTH_SOCK",
+  // Docker clients may connect to a separately managed daemon endpoint.
+  "DOCKER_HOST",
 ]);
 
 /**
@@ -3552,6 +3554,15 @@ const CHILD_ENV_ALLOWED_PREFIXES = [
   "OPENROUTER_",
   "ZAI_",
   "LITELLM_",
+  // acpx's own credential namespace, and ONLY that namespace — not `ACPX_`.
+  // `promotePrefixedAuthEnvironment` (acpx dist, live-checkpoint chunk) reads
+  // `ACPX_AUTH_<METHOD>` off the env it is about to spawn the ACP agent with
+  // and promotes each one to its bare token name. Severing it would turn a
+  // configured ACP auth method into an unexplainable "auth required" at
+  // handshake. The member names derive from arbitrary ACP method ids, so they
+  // cannot be enumerated; the prefix is narrow enough that nothing but an acpx
+  // credential matches it.
+  "ACPX_AUTH_",
 ] as const;
 
 /**
@@ -3624,6 +3635,55 @@ export function applyChildEnvAllowlist(
   }
   droppedKeys.sort();
   return { env: next, droppedKeys };
+}
+
+/**
+ * Claude Code's nesting guards. A spawned `claude` refuses to start with
+ * "cannot be launched inside another session" when it sees these, and they leak
+ * in whenever the Paperclip server is itself started from within a Claude Code
+ * session (`npx paperclipai run` in a Claude-Code-owned terminal) or when cron
+ * inherits a contaminated shell env. They are deleted BEFORE the allowlist runs,
+ * so admitting the `CLAUDE_` namespace there does not undo the strip.
+ */
+const CLAUDE_CODE_NESTING_VARS = [
+  "CLAUDECODE",
+  "CLAUDE_CODE_ENTRYPOINT",
+  "CLAUDE_CODE_SESSION",
+  "CLAUDE_CODE_PARENT_SESSION",
+] as const;
+
+/**
+ * Build the environment a locally spawned harness child receives.
+ *
+ * CLI subprocesses share this filtering path. ACP uses its own closed,
+ * provider-specific host projection and disables ACPX process-env inheritance.
+ *
+ * The order matters and is the CLI lane's historical one: strip the host's own
+ * PAPERCLIP_* values, overlay the run's env, delete the Claude Code nesting
+ * guards, guarantee a PATH, apply the sandbox HOME override, then filter. PATH
+ * is ensured BEFORE the filter so a command is resolved against the same env
+ * the child will get.
+ */
+export function buildAllowlistedChildEnv(input: {
+  /** The run's own env, overlaid on the inherited half. */
+  overlay?: NodeJS.ProcessEnv;
+  /** Defaults to the server's `process.env`; injectable for tests. */
+  inherited?: NodeJS.ProcessEnv;
+  /** Local-process-sandbox HOME override, applied before the filter. */
+  homeDir?: string | null;
+  /** Extra key names this spawn may forward; see {@link ChildEnvAllowlistPolicy}. */
+  additionalAllowed?: readonly string[];
+}): { env: NodeJS.ProcessEnv; droppedKeys: string[] } {
+  const merged: NodeJS.ProcessEnv = {
+    ...sanitizeInheritedPaperclipEnv(input.inherited ?? process.env),
+    ...input.overlay,
+  };
+  for (const key of CLAUDE_CODE_NESTING_VARS) {
+    delete merged[key];
+  }
+  const pathed = ensurePathInEnv(merged);
+  if (input.homeDir) pathed.HOME = input.homeDir;
+  return applyChildEnvAllowlist(pathed, { additionalAllowed: input.additionalAllowed });
 }
 
 export function defaultPathForPlatform() {
@@ -4806,38 +4866,17 @@ export async function runChildProcess(
     opts.onLogError ??
     ((err, id, msg) => console.warn({ err, runId: id }, msg));
   return new Promise<RunProcessResult>((resolve, reject) => {
-    const rawMerged: NodeJS.ProcessEnv = {
-      ...sanitizeInheritedPaperclipEnv(process.env),
-      ...opts.env,
-    };
-
-    // Strip Claude Code nesting-guard env vars so spawned `claude` processes
-    // don't refuse to start with "cannot be launched inside another session".
-    // These vars leak in when the Paperclip server itself is started from
-    // within a Claude Code session (e.g. `npx paperclipai run` in a terminal
-    // owned by Claude Code) or when cron inherits a contaminated shell env.
-    const CLAUDE_CODE_NESTING_VARS = [
-      "CLAUDECODE",
-      "CLAUDE_CODE_ENTRYPOINT",
-      "CLAUDE_CODE_SESSION",
-      "CLAUDE_CODE_PARENT_SESSION",
-    ] as const;
-    for (const key of CLAUDE_CODE_NESTING_VARS) {
-      delete rawMerged[key];
-    }
-
-    const pathedEnv = ensurePathInEnv(rawMerged);
-    if (opts.localProcessSandbox?.homeDir) {
-      pathedEnv.HOME = opts.localProcessSandbox.homeDir;
-    }
-
     // The deny-by-default boundary, applied at the single spawn site so no
-    // adapter has to remember it. It runs here — after PATH is ensured and the
-    // sandbox HOME override is applied, and before `resolveSpawnTarget` — so
-    // the command is resolved against the same env the child will get, and so
-    // the sandbox's own `target.env` (generated below, deliberately) is merged
-    // in afterwards and never filtered.
-    const allowlisted = applyChildEnvAllowlist(pathedEnv);
+    // adapter has to remember it. `buildAllowlistedChildEnv` runs the sanitize
+    // → nesting-strip → PATH → sandbox-HOME → filter sequence.
+    // It runs before `resolveSpawnTarget` so the command is
+    // resolved against the same env the child will get, and so the sandbox's
+    // own `target.env` (generated below, deliberately) is merged in afterwards
+    // and never filtered.
+    const allowlisted = buildAllowlistedChildEnv({
+      overlay: opts.env,
+      homeDir: opts.localProcessSandbox?.homeDir ?? null,
+    });
     if (allowlisted.droppedKeys.length > 0) {
       // Names only, never values: a silent drop turns a missing credential
       // into an unexplainable harness failure, but the values are the host's
