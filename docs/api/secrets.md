@@ -221,16 +221,23 @@ Per-provider `config` shapes:
 - `local_encrypted`: optional `backupReminderAcknowledged: boolean`.
 - `aws_secrets_manager`: required `region`; optional `namespace`,
   `secretNamePrefix`, `kmsKeyId`, `ownerTag`, `environmentTag`.
-- `gcp_secret_manager` (coming soon): optional `projectId`, `location`,
-  `namespace`, `secretNamePrefix`.
+- `gcp_secret_manager`: optional `projectId` — a project id or a project number,
+  and the project every secret reference in the vault must resolve inside;
+  optional `location` (`global`, or a region such as `us-west1`, which selects
+  the regional endpoint), `namespace`, `secretNamePrefix`. `projectId` is
+  optional at this layer so a partly-filled vault can be saved, but the board
+  will not submit without it and the runtime refuses a vault that has none:
+  there is no deployment-env fallback, because a vault inheriting the
+  deployment's project would read another company's secrets.
 - `vault` (coming soon): optional origin-only HTTPS `address`, `namespace`,
   `mountPath`, `secretPathPrefix`. `address` values with embedded credentials,
   paths, query strings, or fragments are rejected.
 
-`status` defaults to `ready` for `local_encrypted` and `aws_secrets_manager`,
-and to `coming_soon` for `gcp_secret_manager` and `vault`. Coming-soon and
-disabled vaults cannot be marked `isDefault`. Setting `isDefault: true` clears
-the previous default for the same provider in the same transaction.
+`status` defaults to `ready` for every provider with a runtime module
+(`local_encrypted`, `aws_secrets_manager`, `gcp_secret_manager`) and to
+`coming_soon` for `vault`. Coming-soon and disabled vaults cannot be marked
+`isDefault`. Setting `isDefault: true` clears the previous default for the same
+provider in the same transaction.
 
 ### Get Vault
 

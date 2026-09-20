@@ -75,10 +75,9 @@ export const SANDBOX_CLEANUP_CONSUMER_ID = "environment-sandbox-cleanup";
 const SENSITIVE_ENV_KEY_RE =
   /(api[-_]?key|access[-_]?token|auth(?:_?token)?|authorization|bearer|secret|passwd|password|credential|jwt|private[-_]?key|cookie|connectionstring)/i;
 const REDACTED_SENTINEL = "***REDACTED***";
-const COMING_SOON_SECRET_PROVIDERS: ReadonlySet<SecretProvider> = new Set([
-  "gcp_secret_manager",
-  "vault",
-]);
+// Providers whose runtime module is still a stub. A vault for one of these may hold
+// draft routing metadata, but every runtime operation against it is refused.
+const COMING_SOON_SECRET_PROVIDERS: ReadonlySet<SecretProvider> = new Set(["vault"]);
 const FALLBACK_ADAPTER_SCHEMA_SECRET_FIELDS: Readonly<Record<string, readonly string[]>> = {
   hermes_gateway: ["apiKey"],
 };
@@ -2271,13 +2270,25 @@ export function secretService(db: Db) {
     provider: SecretProvider,
     metadata: Record<string, unknown> | null | undefined,
   ): Record<string, unknown> | null {
-    if (!metadata || provider !== "aws_secrets_manager") return null;
+    if (!metadata) return null;
+    // An allowlist per provider rather than a pass-through: whatever a provider chooses
+    // to put in listing metadata, only these non-sensitive shapes reach a caller.
+    const allowed =
+      provider === "aws_secrets_manager"
+        ? {
+            strings: ["createdDate", "lastAccessedDate", "lastChangedDate", "deletedDate"],
+            scalars: ["hasDescription", "hasKmsKey", "tagCount"],
+          }
+        : provider === "gcp_secret_manager"
+          ? { strings: ["createTime"], scalars: ["hasExpiry", "labelCount"] }
+          : null;
+    if (!allowed) return null;
     const safe: Record<string, unknown> = {};
-    for (const key of ["createdDate", "lastAccessedDate", "lastChangedDate", "deletedDate"]) {
+    for (const key of allowed.strings) {
       const value = metadata[key];
       if (typeof value === "string" || value === null) safe[key] = value;
     }
-    for (const key of ["hasDescription", "hasKmsKey", "tagCount"]) {
+    for (const key of allowed.scalars) {
       const value = metadata[key];
       if (typeof value === "boolean" || typeof value === "number") safe[key] = value;
     }

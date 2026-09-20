@@ -264,6 +264,58 @@ describe("secret validators", () => {
     ).toThrow(/sensitive field/i);
   });
 
+  it("creates GCP Secret Manager vaults ready and vault vaults coming soon", () => {
+    const gcp = createSecretProviderConfigSchema.parse({
+      provider: "gcp_secret_manager",
+      displayName: "GCP production",
+      config: { projectId: "example-project" },
+    });
+    expect(gcp.status).toBeUndefined();
+    expect(() =>
+      createSecretProviderConfigSchema.parse({
+        provider: "gcp_secret_manager",
+        displayName: "GCP production",
+        status: "ready",
+        isDefault: true,
+        config: { projectId: "example-project" },
+      }),
+    ).not.toThrow();
+
+    // Vault still has no runtime module, so its vaults stay draft metadata.
+    expect(() =>
+      createSecretProviderConfigSchema.parse({
+        provider: "vault",
+        displayName: "Vault production",
+        status: "ready",
+        config: { address: "https://vault.example.com" },
+      }),
+    ).toThrow(/locked while coming soon/i);
+  });
+
+  it("accepts both spellings of a GCP project and rejects anything else", () => {
+    const parseGcp = (config: Record<string, unknown>) =>
+      secretProviderConfigPayloadSchema.parse({ provider: "gcp_secret_manager", config });
+
+    expect(() => parseGcp({ projectId: "example-project" })).not.toThrow();
+    // Listing returns resource names carrying the project number, so a vault may be
+    // configured by number as well as by id.
+    expect(() => parseGcp({ projectId: "123456789012" })).not.toThrow();
+    // Five characters, a trailing hyphen, and an id far longer than Google issues: each
+    // would be accepted by the board and then rejected by the runtime.
+    expect(() => parseGcp({ projectId: "abcde" })).toThrow();
+    expect(() => parseGcp({ projectId: "example-project-" })).toThrow();
+    expect(() => parseGcp({ projectId: `a${"b".repeat(40)}` })).toThrow();
+  });
+
+  it("accepts only a real GCP location, since it selects the endpoint host", () => {
+    const parseGcp = (config: Record<string, unknown>) =>
+      secretProviderConfigPayloadSchema.parse({ provider: "gcp_secret_manager", config });
+
+    expect(() => parseGcp({ projectId: "example-project", location: "us-west1" })).not.toThrow();
+    expect(() => parseGcp({ projectId: "example-project", location: "global" })).not.toThrow();
+    expect(() => parseGcp({ projectId: "example-project", location: "somewhere" })).toThrow();
+  });
+
   it("caps AWS remote import paging and row counts", () => {
     expect(() =>
       remoteSecretImportPreviewSchema.parse({

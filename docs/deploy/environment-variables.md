@@ -94,6 +94,42 @@ configuration fails closed.
 | `PAPERCLIP_SECRETS_MASTER_KEY_FILE` | `~/.paperclip/.../secrets/master.key` | Path to key file |
 | `PAPERCLIP_SECRETS_STRICT_MODE` | `false` | Require secret refs for sensitive env vars |
 
+### GCP Secret Manager
+
+Read only when the `gcp_secret_manager` provider is in use. They configure the
+deployment-level default vault; a per-company provider vault carries its own
+`projectId` and `location` in vault config instead, and that vault's project is
+the tenancy boundary every secret reference in it is checked against.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `PAPERCLIP_SECRETS_GCP_PROJECT_ID` | `GOOGLE_CLOUD_PROJECT`, then `GCLOUD_PROJECT`, then the project in the service-account key file | Project the deployment-level provider reads secrets from |
+| `PAPERCLIP_SECRETS_GCP_ENDPOINT` | `https://secretmanager.googleapis.com` | Secret Manager base URL. For proxies and emulators; it overrides the regional endpoint a vault `location` would otherwise select |
+| `PAPERCLIP_SECRETS_GCP_ACCESS_TOKEN` | (none) | A pre-issued OAuth access token, used ahead of every other credential source. Local break-glass only — it cannot be rotated by the platform, and `doctor` reports a warning while it is set |
+
+Credentials themselves are Google application default credentials and are never
+read from Paperclip secrets: workload identity, a
+`GOOGLE_APPLICATION_CREDENTIALS` service-account key file, or the Compute Engine
+metadata server. `GCE_METADATA_HOST` and `GCE_METADATA_IP` are honoured for the
+metadata server address, as google-auth-library does.
+
+### AWS Secrets Manager
+
+Read only when the `aws_secrets_manager` provider is in use. The full operational
+contract — IAM and KMS scoping, naming and tag conventions, backup and incident
+runbooks — is in `doc/SECRETS-AWS-PROVIDER.md`.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `PAPERCLIP_SECRETS_AWS_REGION` | `AWS_REGION`, then `AWS_DEFAULT_REGION` | Region the provider reads and writes in |
+| `PAPERCLIP_SECRETS_AWS_DEPLOYMENT_ID` | (none, required) | Deployment segment of the managed secret namespace |
+| `PAPERCLIP_SECRETS_AWS_KMS_KEY_ID` | (none, required) | KMS key managed secrets are encrypted with |
+| `PAPERCLIP_SECRETS_AWS_PREFIX` | `paperclip` | Leading segment of the managed secret namespace |
+| `PAPERCLIP_SECRETS_AWS_ENVIRONMENT` | `NODE_ENV`, then `unknown` | Value of the `paperclip:environment` tag |
+| `PAPERCLIP_SECRETS_AWS_PROVIDER_OWNER` | `paperclip` | Value of the `paperclip:provider-owner` tag |
+| `PAPERCLIP_SECRETS_AWS_ENDPOINT` | `https://secretsmanager.<region>.amazonaws.com` | Secrets Manager base URL, for proxies and emulators |
+| `PAPERCLIP_SECRETS_AWS_DELETE_RECOVERY_DAYS` | `30` | Recovery window on delete, 7-30 |
+
 ## Agent Runtime (Injected into agent processes)
 
 These are set automatically by the server when invoking agents:

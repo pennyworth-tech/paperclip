@@ -2134,21 +2134,40 @@ describeEmbeddedPostgres("secretService", () => {
   it("blocks coming-soon provider vaults from secret selection", async () => {
     const companyId = await seedCompany();
     const svc = secretService(db);
+    // Vault is the remaining provider whose runtime module is a stub: its vaults default
+    // to coming_soon and stay locked out of every runtime operation.
     const draftVault = await svc.createProviderConfig(companyId, {
-      provider: "gcp_secret_manager",
-      displayName: "GCP draft",
-      config: { projectId: "paperclip-prod1" },
+      provider: "vault",
+      displayName: "Vault draft",
+      config: { address: "https://vault.example.com" },
     });
 
     expect(draftVault.status).toBe("coming_soon");
     await expect(
       svc.create(companyId, {
         name: `draft-${randomUUID()}`,
-        provider: "gcp_secret_manager",
+        provider: "vault",
         providerConfigId: draftVault.id,
         value: "runtime-secret",
       }),
     ).rejects.toThrow(/coming soon/i);
+  });
+
+  // GCP has a runtime module, so its vaults are created ready like any other implemented
+  // provider rather than parked as draft metadata.
+  it("creates GCP Secret Manager vaults ready, not coming soon", async () => {
+    const companyId = await seedCompany();
+    const svc = secretService(db);
+    const gcpVault = await svc.createProviderConfig(companyId, {
+      provider: "gcp_secret_manager",
+      displayName: "GCP production",
+      config: { projectId: "example-project" },
+    });
+
+    expect(gcpVault.status).toBe("ready");
+
+    const promoted = await svc.updateProviderConfig(gcpVault.id, { isDefault: true });
+    expect(promoted?.isDefault).toBe(true);
   });
 
   it("passes selected provider vault config through create, rotate, and resolve", async () => {
