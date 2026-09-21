@@ -142,6 +142,42 @@ describe("prepareOpenCodeRuntimeConfig", () => {
     await prepared.cleanup();
   });
 
+  it("bakes the run's LLM gateway attribution tags into a provider header", async () => {
+    // The adapter assigns LITELLM_TAGS to the run env before this runs, so a
+    // provider header written as {env:LITELLM_TAGS} must come out as the tag
+    // string itself. Equality, not non-empty: an unresolved placeholder
+    // survives as a literal and the gateway would record that literal.
+    const configHome = await makeConfigHome({ permission: { read: "allow" } });
+    const providers = {
+      gateway: {
+        npm: "@ai-sdk/openai-compatible",
+        options: {
+          baseURL: "http://gateway.example/v1",
+          apiKey: "{env:GATEWAY_API_KEY}",
+          headers: { "x-litellm-tags": "{env:LITELLM_TAGS}" },
+        },
+        models: { "example/model-a": {} },
+      },
+    };
+    const prepared = await prepareOpenCodeRuntimeConfig({
+      env: {
+        XDG_CONFIG_HOME: configHome,
+        PAPERCLIP_OPENCODE_PROVIDERS: JSON.stringify(providers),
+        GATEWAY_API_KEY: "sk-gw-REALVK",
+        LITELLM_TAGS: "agent:reviewer,issue:PRJ-12,stage:none",
+      },
+      config: {},
+    });
+    cleanupPaths.add(prepared.env.XDG_CONFIG_HOME);
+    const runtimeConfig = JSON.parse(
+      await fs.readFile(path.join(prepared.env.XDG_CONFIG_HOME, "opencode", "opencode.json"), "utf8"),
+    ) as { provider: { gateway: { options: { headers: Record<string, string> } } } };
+    expect(runtimeConfig.provider.gateway.options.headers["x-litellm-tags"]).toBe(
+      "agent:reviewer,issue:PRJ-12,stage:none",
+    );
+    await prepared.cleanup();
+  });
+
   it("leaves an unresolvable {env:VAR} placeholder intact", async () => {
     const configHome = await makeConfigHome({ permission: { read: "allow" } });
     const providers = { bifrost: { options: { apiKey: "{env:DEFINITELY_UNSET_VAR_XYZ}" }, models: { "x/y": {} } } };

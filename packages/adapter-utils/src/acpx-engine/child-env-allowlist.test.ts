@@ -113,6 +113,14 @@ describe("ACP-spawned harness child environment", () => {
     expect(keys).not.toContain("PAPERCLIP_CHILD_ENV_CONFIG_KEYS");
   }, 60_000);
 
+  it("carries the per-run LLM gateway attribution tags the engine assigns", async () => {
+    // LITELLM_TAGS is assigned by the engine itself, not by config, so it is
+    // admitted by the LITELLM_ prefix rather than the config-keys path.
+    const keys = await spawnAndReadChildEnvKeys({});
+
+    expect(keys).toContain("LITELLM_TAGS");
+  }, 60_000);
+
   it("strips the Claude Code nesting guards the CLI lane strips", async () => {
     // A `claude` child that sees these refuses to start with "cannot be
     // launched inside another session". They leak in whenever the server is

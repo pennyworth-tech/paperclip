@@ -35,6 +35,7 @@ import {
   asNumber,
   parseObject,
   buildPaperclipEnv,
+  buildLlmAttributionTags,
   buildInvocationEnvForLogs,
   ensureAbsoluteDirectory,
   ensurePaperclipSkillSymlink,
@@ -947,6 +948,11 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       executionTargetIsRemote,
       executionCwd: effectiveExecutionCwd,
     });
+    // Per-run LLM gateway attribution; after the config env so a static
+    // adapter value cannot override it. A provider that should send it reads
+    // the variable from its own process env at request time
+    // (`env_http_headers`), so the managed config.toml needs no placeholder.
+    env.LITELLM_TAGS = buildLlmAttributionTags({ agent, context });
     if (targetWorkspaceRealization) {
       env.PAPERCLIP_WORKSPACE_REALIZATION_MODE = targetWorkspaceRealization.mode;
       env.PAPERCLIP_WORKSPACE_AUTHORITATIVE_ROOT = targetWorkspaceRealization.authoritativeRoot;

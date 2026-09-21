@@ -31,6 +31,7 @@ import {
   asStringArray,
   parseObject,
   buildPaperclipEnv,
+  buildLlmAttributionTags,
   joinPromptSections,
   buildInvocationEnvForLogs,
   ensureAbsoluteDirectory,
@@ -324,6 +325,11 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   // selection is already handled via the --model CLI flag.  Set after the
   // envConfig loop so user overrides cannot disable this guard.
   env.OPENCODE_DISABLE_PROJECT_CONFIG = "true";
+  // Per-run LLM gateway attribution. After the config env so a static
+  // adapter value cannot override it; before prepareOpenCodeRuntimeConfig,
+  // which bakes a provider header's {env:LITELLM_TAGS} placeholder from this
+  // env into the run's opencode.json.
+  env.LITELLM_TAGS = buildLlmAttributionTags({ agent, context });
   if (authToken) {
     env.PAPERCLIP_API_KEY = authToken;
   }
