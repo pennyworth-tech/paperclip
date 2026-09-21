@@ -74,6 +74,18 @@ describe("applyChildEnvAllowlist", () => {
     expect(Object.keys(env)).toHaveLength(20);
   });
 
+  it("passes the per-run LLM gateway attribution tags through by prefix", () => {
+    // Every lane assigns LITELLM_TAGS to the run env; the LITELLM_ prefix is
+    // what carries it (and any LITELLM_* client setting) into the child.
+    const { env, droppedKeys } = applyChildEnvAllowlist({
+      PATH: "/usr/bin",
+      LITELLM_TAGS: "agent:reviewer,issue:PRJ-12,stage:none",
+    });
+
+    expect(droppedKeys).toEqual([]);
+    expect(env.LITELLM_TAGS).toBe("agent:reviewer,issue:PRJ-12,stage:none");
+  });
+
   it("keeps the headless shaping and node-version-manager roots the adapters rely on", () => {
     // buildKimiHeadlessEnv writes CI/NO_COLOR, buildGeminiHeadlessEnv writes
     // COLORTERM, and the harness CLI shim reads its root from the version

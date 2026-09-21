@@ -52,6 +52,7 @@ import {
   asString,
   buildInvocationEnvForLogs,
   buildPaperclipEnv,
+  buildLlmAttributionTags,
   ensureAbsoluteDirectory,
   ensurePathInEnv,
   ensurePaperclipSkillSymlink,
@@ -1971,6 +1972,12 @@ async function buildRuntime(input: {
     // are absent from tempKeysApplied and keep their compatibility protection.
     if (!scratchKeys.has(key) || value !== scratch.dir) resolvedAdapterEnv[key] = value;
   }
+  // Per-run LLM gateway attribution. Assigned after the config loop so a
+  // static adapter value cannot override it, and onto `env` only — it is per
+  // wake, so it must stay out of resolvedAdapterEnv and the session
+  // fingerprint hashed from it. The child receives it at spawn: a resumed
+  // warm session keeps the tags it was first spawned with.
+  env.LITELLM_TAGS = buildLlmAttributionTags({ agent, context });
   if (authToken) env.PAPERCLIP_API_KEY = authToken;
   // For the claude agent, set model via ANTHROPIC_MODEL at startup rather than
   // via session/set_config_option — the ACP server's set_config_option handler
