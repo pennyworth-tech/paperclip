@@ -1448,6 +1448,48 @@ export function readPaperclipIssueWorkModeFromContext(value: unknown): string | 
   return wake?.issue?.workMode ?? null;
 }
 
+// One tag value. A comma would split the header into extra tags and a colon
+// would blur the `name:value` shape, and anything outside a conservative set
+// is unsafe in a request header, so runs of other characters collapse to `-`.
+// An empty value reads `none` rather than vanishing, so every run carries the
+// same three tags and a missing id is visible as such in the spend ledger.
+function llmAttributionTagValue(value: unknown): string {
+  const cleaned = asString(value, "")
+    .replace(/[^A-Za-z0-9._-]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 64);
+  return cleaned.length > 0 ? cleaned : "none";
+}
+
+/**
+ * `agent:<name>,issue:<identifier>,stage:<key>` for an LLM gateway that reads
+ * comma-separated attribution tags from a request header (LiteLLM's
+ * `x-litellm-tags`) and records them against spend. Issue prefers the human
+ * identifier from the wake payload or the issue snapshot, then the raw
+ * issue/task id; a timer or heartbeat wake with no issue tags `issue:none`.
+ * Stage reads the run context's `stageKey`, which the server does not set at
+ * this pin, so every run tags `stage:none` unless a waker supplies one.
+ *
+ * The value is per run. Each lane assigns it to the child env AFTER the
+ * config-bound env is forwarded (a static config value must not override the
+ * run's) and never folds it into a session fingerprint (it would invalidate a
+ * warm session on every wake).
+ */
+export function buildLlmAttributionTags(input: { agent: { name?: unknown }; context: unknown }): string {
+  const context = parseObject(input.context);
+  const wake = normalizePaperclipWakePayload(context.paperclipWake);
+  const issue =
+    (wake?.issue?.identifier ?? "") ||
+    asString(parseObject(context.paperclipIssue).identifier, "").trim() ||
+    asString(context.issueId, "").trim() ||
+    asString(context.taskId, "").trim();
+  return [
+    `agent:${llmAttributionTagValue(input.agent?.name)}`,
+    `issue:${llmAttributionTagValue(issue)}`,
+    `stage:${llmAttributionTagValue(context.stageKey)}`,
+  ].join(",");
+}
+
 // Wake reasons that (re)start work on an issue, where the session may not have
 // seen the task brief yet even though the adapter session itself is resuming.
 const ASSIGNMENT_SHAPED_PAPERCLIP_WAKE_REASONS = new Set([
