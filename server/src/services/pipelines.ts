@@ -4991,6 +4991,20 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
           actor: input.actor,
           automationLedgers,
         });
+        // The decision records what it was decided ON, so a reader never has to
+        // pair this event with the case's fields at some later version. The head
+        // comes from `transitioned.case` — the row AFTER this decision's own
+        // `edits.fields` patch — never from `detail.case`, which is the pre-edit
+        // read and would name the head the edit just replaced. A board decision
+        // sends no edits, so `transitioned.case.fields` is the case exactly as
+        // the human saw it, pinned by the `expectedVersion` the board sent. The
+        // kind is taken only from THIS decision's edits: with no edits the case
+        // field still carries whatever the previous decision left, and that is
+        // not this decision's kind.
+        const plainRecord = (value: unknown): Record<string, unknown> | null =>
+          value !== null && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : null;
+        const decidedHeadShaRaw = plainRecord(transitioned.case.fields)?.headSha;
+        const decidedVerdictKindRaw = plainRecord(input.edits?.fields)?.verdictKind;
         const reviewEvent = await writeCaseEvent(tx, {
           companyId: input.companyId,
           caseId: input.caseId,
@@ -5006,6 +5020,10 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
             transitionEventId: transitioned.event.id,
             approvedCaseVersion: input.decision === "approve" ? expectedVersion : null,
             approvedTransitionVersion: input.decision === "approve" ? transitioned.case.version : null,
+            // Every decision, not only `approve`: the version it was taken against.
+            decidedCaseVersion: expectedVersion,
+            decidedHeadSha: typeof decidedHeadShaRaw === "string" && /^[0-9a-f]{40}$/.test(decidedHeadShaRaw) ? decidedHeadShaRaw : null,
+            decidedVerdictKind: typeof decidedVerdictKindRaw === "string" && decidedVerdictKindRaw.length > 0 ? decidedVerdictKindRaw : null,
           },
         });
         return { ...transitioned, updateEvent, reviewEvent };
