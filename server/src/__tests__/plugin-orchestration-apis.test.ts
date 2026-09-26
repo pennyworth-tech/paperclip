@@ -1493,6 +1493,17 @@ describeEmbeddedPostgres("plugin orchestration APIs", () => {
         .from(pipelineCaseEvents)
         .where(and(eq(pipelineCaseEvents.caseId, caseId), eq(pipelineCaseEvents.type, "review_decided")));
       expect(event).toMatchObject({ id: result.reviewEventId, actorType: "agent", actorAgentId: seeded.reviewerAId, runId: runA });
+      // The decision records what it was decided ON: the head AFTER its own
+      // fields patch, the kind THIS decision carried, and the version it was
+      // taken against. A reader never has to pair the event with the case's
+      // fields at some later version to know what tree was judged.
+      expect(event.payload).toMatchObject({
+        decidedHeadSha: "a".repeat(40),
+        decidedVerdictKind: "APPROVE",
+        // With edits riding the decision, its own fields patch bumps the version
+        // first; the head was read from THAT row, so the version pins it.
+        decidedCaseVersion: seeded.version + 1,
+      });
     });
 
     it("refuses a forged actorAgentId whose run belongs to another agent", async () => {

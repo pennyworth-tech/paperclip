@@ -167,7 +167,7 @@ describeEmbeddedPostgres("pipelineService", () => {
   }
 
   describe("linked_reviewer stage approver", () => {
-    async function seedLinkedReviewerCase() {
+    async function seedLinkedReviewerCase(fields?: Record<string, unknown>) {
       const { company, pipeline, byKey } = await seedPipeline();
       const reviewStage = byKey.get("review")!;
       await svc.updateStage({
@@ -179,6 +179,8 @@ describeEmbeddedPostgres("pipelineService", () => {
             ...(reviewStage.config as Record<string, unknown>),
             requireApproval: true,
             approver: { kind: "linked_reviewer" },
+            // So a `request_changes` has somewhere to go; the approve-only tests never take it.
+            requestChangesToStageKey: "in_progress",
           },
         },
       });
@@ -197,6 +199,7 @@ describeEmbeddedPostgres("pipelineService", () => {
         stageKey: "review",
         caseKey: `linked-reviewer-${randomUUID().slice(0, 8)}`,
         title: "Review PR",
+        ...(fields ? { fields } : {}),
         actor: userActor,
       });
       return { company, created, reviewerA: reviewerA!, reviewerB: reviewerB! };
@@ -218,6 +221,9 @@ describeEmbeddedPostgres("pipelineService", () => {
         companyId: company.id,
         caseId: created.case.id,
         decision: "approve",
+        // The verdict pair rides the decision's own transaction; the event must
+        // record the head AFTER this patch, never the pre-edit one.
+        edits: { fields: { headSha: "a".repeat(40), verdictKind: "APPROVE" } },
         expectedVersion: created.case.version,
         actor: { type: "agent", agentId: reviewerA.id, runId },
       });
@@ -226,6 +232,14 @@ describeEmbeddedPostgres("pipelineService", () => {
       const events = await reviewDecidedEvents(created.case.id);
       expect(events).toHaveLength(1);
       expect(events[0]).toMatchObject({ actorAgentId: reviewerA.id, runId });
+      expect(events[0]!.payload).toMatchObject({
+        decidedHeadSha: "a".repeat(40),
+        decidedVerdictKind: "APPROVE",
+        // The edits patch bumped the version before the decision; both pins name
+        // the row the head was read from.
+        decidedCaseVersion: created.case.version + 1,
+        approvedCaseVersion: created.case.version + 1,
+      });
     });
 
     it("refuses an agent deciding on a case whose review link is assigned to another agent", async () => {
@@ -293,8 +307,8 @@ describeEmbeddedPostgres("pipelineService", () => {
       expect(await reviewDecidedEvents(created.case.id)).toHaveLength(0);
     });
 
-    it("lets a board user decide when no reviewer is linked", async () => {
-      const { company, created } = await seedLinkedReviewerCase();
+    it("lets a board user decide when no reviewer is linked, and records the head the board showed", async () => {
+      const { company, created } = await seedLinkedReviewerCase({ headSha: "b".repeat(40) });
 
       const result = await svc.reviewCase({
         companyId: company.id,
@@ -305,6 +319,34 @@ describeEmbeddedPostgres("pipelineService", () => {
       });
 
       expect(result.reviewEvent).toMatchObject({ type: "review_decided", actorType: "user" });
+      // No edits on a board decision: the head is the case's own, as the human
+      // saw it; the kind is null because THIS decision carried none — the case
+      // field is whatever a previous decision left and is not this one's.
+      expect(result.reviewEvent.payload).toMatchObject({
+        decidedHeadSha: "b".repeat(40),
+        decidedVerdictKind: null,
+        decidedCaseVersion: created.case.version,
+      });
+    });
+
+    it("records the decided version on a non-approve, where approvedCaseVersion is null", async () => {
+      const { company, created } = await seedLinkedReviewerCase({ headSha: "c".repeat(40) });
+
+      const result = await svc.reviewCase({
+        companyId: company.id,
+        caseId: created.case.id,
+        decision: "request_changes",
+        reason: "needs a test",
+        expectedVersion: created.case.version,
+        actor: userActor,
+      });
+
+      expect(result.reviewEvent.payload).toMatchObject({
+        decision: "request_changes",
+        approvedCaseVersion: null,
+        decidedCaseVersion: created.case.version,
+        decidedHeadSha: "c".repeat(40),
+      });
     });
   });
 
