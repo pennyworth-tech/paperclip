@@ -50,6 +50,31 @@ interface Candidate {
 
 const DEFAULT_CONTEXT_LENGTH = 48;
 
+/** ATX heading ancestry at a Markdown offset, ignoring fenced code. Shared by
+ * source feedback selection, host verification, and conservative remapping. */
+export function documentHeadingPath(markdown: string, offset: number) {
+  const stack: Array<{ level: number; title: string }> = [];
+  let fence: { marker: string; length: number } | null = null;
+  const end = markdown.indexOf("\n", offset);
+  for (const line of markdown.slice(0, end < 0 ? markdown.length : end).split(/\r?\n/)) {
+    const fenceMatch = line.match(/^\s{0,3}(\x60{3,}|~{3,})/);
+    if (fenceMatch) {
+      const marker = fenceMatch[1]!;
+      if (!fence) fence = { marker: marker[0]!, length: marker.length };
+      else if (marker[0] === fence.marker && marker.length >= fence.length && line.slice(fenceMatch[0].length).trim() === "") fence = null;
+      continue;
+    }
+    if (fence) continue;
+    const heading = line.match(/^(#{1,6})\s+(.+?)\s*#*\s*$/);
+    if (heading) {
+      const level = heading[1]!.length;
+      while (stack.length && stack[stack.length - 1]!.level >= level) stack.pop();
+      stack.push({ level, title: heading[2]! });
+    }
+  }
+  return stack.map((heading) => heading.title);
+}
+
 export function normalizeAnchorText(value: string): string {
   return value.replace(/\s+/g, " ").trim();
 }

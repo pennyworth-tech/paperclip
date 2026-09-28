@@ -178,3 +178,4 @@ export { pluginJobs, pluginJobRuns } from "./plugin_jobs.js";
 export { pluginWebhookDeliveries } from "./plugin_webhooks.js";
 export { pluginLogs } from "./plugin_logs.js";
 export { pipelineStageEvidence } from "./pipeline_stage_evidence.js";
+export { pipelineCaseWork, pipelineCaseWorkTurns, pipelineCaseWorkResults } from "./pipeline_case_work.js";

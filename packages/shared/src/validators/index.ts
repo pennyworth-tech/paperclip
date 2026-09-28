@@ -394,6 +394,12 @@ export {
 export {
   createDocumentAnnotationCommentSchema,
   createDocumentAnnotationThreadSchema,
+  createPipelineAnnotationSchema,
+  updatePipelineAnnotationSchema,
+  reanchorPipelineAnnotationSchema,
+  type ReanchorPipelineAnnotation,
+  type CreatePipelineAnnotation,
+  type UpdatePipelineAnnotation,
   documentAnnotationAnchorConfidenceSchema,
   documentAnnotationAnchorSelectorSchema,
   documentAnnotationAnchorStateSchema,

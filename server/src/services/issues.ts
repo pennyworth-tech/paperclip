@@ -2,6 +2,9 @@ import { Buffer } from "node:buffer";
 import { createHash, randomUUID } from "node:crypto";
 import { and, asc, desc, eq, gt, gte, inArray, isNotNull, isNull, like, lt, ne, notInArray, or, sql, type SQL } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
+import { assertCaseWorkIssuePatch } from "./pipeline-case-work.js";
+import { assertCaseWorkCheckout } from "./pipeline-case-work-execution.js";
+import { lockIssueSourceWorkspaces, withSourceWriteClaimGuard } from "./workspace-source-write-guard.js";
 import {
   activityLog,
   agentWakeupRequests,
@@ -8329,6 +8332,8 @@ export function issueService(db: Db) {
       }
 
       const runUpdate = async (tx: any) => {
+        await lockIssueSourceWorkspaces(tx, existing.companyId, id, issueData.executionWorkspaceId);
+        await assertCaseWorkIssuePatch(tx, existing.companyId, id, issueData);
         // The receipt baseline must be read under the same row lock as the
         // write. Otherwise a concurrent update can be mistaken for a change
         // made by this request.
@@ -8671,6 +8676,8 @@ export function issueService(db: Db) {
       if (!issueCompany) throw notFound("Issue not found");
       await assertAssignableAgent(db, issueCompany.companyId, agentId, { kind: "work" });
 
+      return withSourceWriteClaimGuard(db, issueCompany.companyId, id, async (guardTx) => {
+      await assertCaseWorkCheckout(guardTx, issueCompany.companyId, id, agentId, checkoutRunId);
       const now = new Date();
       const activePauseHold = await treeControlSvc.getActivePauseHoldGate(issueCompany.companyId, id);
       if (
@@ -8913,9 +8920,14 @@ export function issueService(db: Db) {
           ? terminalActorRunRefusal(checkoutRunId, actorRunAtConflict.status)
           : {}),
       });
+      });
     },
 
     assertCheckoutOwner: async (id: string, actorAgentId: string, actorRunId: string | null) => {
+      const [binding] = await db.select({ companyId: issues.companyId }).from(issues).where(eq(issues.id, id));
+      if (!binding) throw notFound("Issue not found");
+      return withSourceWriteClaimGuard(db, binding.companyId, id, async (guardTx) => {
+      await assertCaseWorkCheckout(guardTx, binding.companyId, id, actorAgentId, actorRunId);
       await clearExecutionRunIfTerminal(id);
       await clearCheckoutRunIfTerminal(id);
       const loadCurrent = () =>
@@ -9070,6 +9082,7 @@ export function issueService(db: Db) {
         actorAgentId,
         actorRunId,
         ...terminalActorDetails,
+      });
       });
     },
 

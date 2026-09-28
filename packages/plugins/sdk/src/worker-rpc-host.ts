@@ -746,6 +746,11 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
       },
 
       executionWorkspaces: {
+        editSources(workspaceId, input, companyId) { return callHost("executionWorkspaces.editSources", { workspaceId, input, companyId }); },
+        abortSourceEdit(workspaceId, input, companyId) { return callHost("executionWorkspaces.abortSourceEdit", { workspaceId, input, companyId }); },
+        inspectRevision(workspaceId, input, companyId) {
+          return callHost("executionWorkspaces.inspectRevision", { workspaceId, input, companyId });
+        },
         async get(workspaceId: string, companyId: string) {
           return callHost("executionWorkspaces.get", { workspaceId, companyId });
         },
@@ -832,6 +837,7 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
 
         async create(input) {
           return callHost("issues.create", {
+            idempotencyKey: input.idempotencyKey,
             companyId: input.companyId,
             projectId: input.projectId,
             goalId: input.goalId,
@@ -892,6 +898,7 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
 
         async requestWakeup(issueId: string, companyId: string, options) {
           return callHost("issues.requestWakeup", {
+            expectedCaseWork: options?.expectedCaseWork,
             issueId,
             companyId,
             reason: options?.reason,
@@ -1148,6 +1155,18 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
       },
 
       pipelines: {
+        async list(companyId) { return callHost("pipelines.list", { companyId }); },
+        async listCases(pipelineId, companyId, page) { return callHost("pipelines.cases.list", { pipelineId, companyId, page }); },
+        async createCase(input, companyId) { return callHost("pipelines.cases.create", { input, companyId }); },
+        async patchCase(caseId, input, companyId) { return callHost("pipelines.cases.patch", { caseId, input, companyId }); },
+        async linkIssue(caseId, input, companyId) { return callHost("pipelines.cases.linkIssue", { caseId, input, companyId }); },
+        async transitionCase(caseId, input, companyId) { return callHost("pipelines.cases.transition", { caseId, input, companyId }); },
+        async listEvents(caseId, companyId, page) { return callHost("pipelines.cases.events", { caseId, companyId, page }); },
+        async getWork(caseId, companyId) { return callHost("pipelines.cases.work.get", { caseId, companyId }); },
+        async bindWork(caseId, issueId, companyId) { return callHost("pipelines.cases.work.bind", { caseId, issueId, companyId }); },
+        async handoffWork(caseId, input, companyId) { return callHost("pipelines.cases.work.handoff", { caseId, input, companyId }); },
+        async recordWorkResult(caseId, input, companyId) { return callHost("pipelines.cases.work.result", { caseId, input, companyId }); },
+        async publishRevision(caseId, input, companyId) { return callHost("pipelines.cases.publishRevision", { caseId, input, companyId }); },
         async publishEvidence(caseId, evidence, companyId) {
           return callHost("pipelines.cases.publishEvidence", { caseId, evidence, companyId });
         },

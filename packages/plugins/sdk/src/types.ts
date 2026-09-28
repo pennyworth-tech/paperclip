@@ -9,6 +9,8 @@
  * @see PLUGIN_SPEC.md §29.2 — SDK Versioning
  */
 
+import type { PluginPipelineAuthoringClient } from "./pipeline-authoring-types.js";
+
 import type {
   PaperclipPluginManifestV1,
   PluginStateScopeKind,
@@ -889,6 +891,15 @@ export interface PluginProjectsClient {
  * Requires `execution.workspaces.read`.
  */
 export interface PluginExecutionWorkspacesClient {
+  /** Preview or reserve/apply canonical Markdown edits through the native case writer. */
+  editSources(workspaceId: string, input: import("./workspace-revision-types.js").PluginWorkspaceEditRequest,
+    companyId: string): Promise<import("./workspace-revision-types.js").PluginWorkspaceEditReceipt>;
+  /** Abandon only when the execution journal proves no push was attempted. */
+  abortSourceEdit(workspaceId: string, input: import("./workspace-revision-types.js").PluginWorkspaceEditAbortRequest,
+    companyId: string): Promise<import("./workspace-revision-types.js").PluginWorkspaceEditAbortReceipt>;
+  /** Runs host-owned Git/OpenSpec inspection in the workspace's execution environment. */
+  inspectRevision(workspaceId: string, input: import("./workspace-revision-types.js").PluginWorkspaceRevisionRequest,
+    companyId: string): Promise<import("./workspace-revision-types.js").PluginWorkspaceRevisionInspection>;
   /**
    * Return plugin-safe metadata for an execution workspace. The host enforces
    * company access before returning any workspace coordinates.
@@ -1424,6 +1435,8 @@ export interface PluginIssuesClient {
   create(input: {
     companyId: string;
     projectId?: string;
+    /** Host namespaces this retry key by plugin. */
+    idempotencyKey?: string;
     goalId?: string;
     parentId?: string;
     inheritExecutionWorkspaceFromIssueId?: string;
@@ -1494,6 +1507,7 @@ export interface PluginIssuesClient {
       reason?: string;
       contextSource?: string;
       idempotencyKey?: string | null;
+      expectedCaseWork?: { caseId: string; turn: number; agentId: string };
     } & PluginIssueMutationActor,
   ): Promise<PluginIssueWakeupResult>;
   requestWakeups(
@@ -1721,7 +1735,7 @@ export interface PluginPipelineReviewResult {
  * for `createReviewLink`, `pipeline.cases.review` for `reviewCase`, and
  * `pipeline.cases.documents.read` / `.write` for the document pair.
  */
-export interface PluginPipelinesClient {
+export interface PluginPipelinesClient extends PluginPipelineAuthoringClient {
   /** Mint immutable evidence as this installed plugin; never impersonates a reviewer. */
   publishEvidence(caseId: string, evidence: import("@paperclipai/shared").PipelineStageEvidenceInput,
     companyId: string): Promise<PluginPipelineStageEvidence>;

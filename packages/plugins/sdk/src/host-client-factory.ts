@@ -210,6 +210,9 @@ export interface HostServices {
 
   /** Provides `executionWorkspaces.get`. */
   executionWorkspaces: {
+    editSources(params: WorkerToHostMethods["executionWorkspaces.editSources"][0]): Promise<WorkerToHostMethods["executionWorkspaces.editSources"][1]>;
+    abortSourceEdit(params: WorkerToHostMethods["executionWorkspaces.abortSourceEdit"][0]): Promise<WorkerToHostMethods["executionWorkspaces.abortSourceEdit"][1]>;
+    inspectRevision(params: WorkerToHostMethods["executionWorkspaces.inspectRevision"][0]): Promise<WorkerToHostMethods["executionWorkspaces.inspectRevision"][1]>;
     get(params: WorkerToHostMethods["executionWorkspaces.get"][0]): Promise<WorkerToHostMethods["executionWorkspaces.get"][1]>;
   };
 
@@ -262,6 +265,18 @@ export interface HostServices {
 
   /** Provides `pipelines.cases.get`, `pipelines.cases.createReviewLink`, `pipelines.cases.review`, and the case-document pair. */
   pipelines: {
+    list(params: WorkerToHostMethods["pipelines.list"][0]): Promise<WorkerToHostMethods["pipelines.list"][1]>;
+    listCases(params: WorkerToHostMethods["pipelines.cases.list"][0]): Promise<WorkerToHostMethods["pipelines.cases.list"][1]>;
+    createCase(params: WorkerToHostMethods["pipelines.cases.create"][0]): Promise<WorkerToHostMethods["pipelines.cases.create"][1]>;
+    patchCase(params: WorkerToHostMethods["pipelines.cases.patch"][0]): Promise<WorkerToHostMethods["pipelines.cases.patch"][1]>;
+    linkIssue(params: WorkerToHostMethods["pipelines.cases.linkIssue"][0]): Promise<WorkerToHostMethods["pipelines.cases.linkIssue"][1]>;
+    transitionCase(params: WorkerToHostMethods["pipelines.cases.transition"][0]): Promise<WorkerToHostMethods["pipelines.cases.transition"][1]>;
+    listEvents(params: WorkerToHostMethods["pipelines.cases.events"][0]): Promise<WorkerToHostMethods["pipelines.cases.events"][1]>;
+    getWork(params: WorkerToHostMethods["pipelines.cases.work.get"][0]): Promise<WorkerToHostMethods["pipelines.cases.work.get"][1]>;
+    bindWork(params: WorkerToHostMethods["pipelines.cases.work.bind"][0]): Promise<WorkerToHostMethods["pipelines.cases.work.bind"][1]>;
+    handoffWork(params: WorkerToHostMethods["pipelines.cases.work.handoff"][0]): Promise<WorkerToHostMethods["pipelines.cases.work.handoff"][1]>;
+    recordWorkResult(params: WorkerToHostMethods["pipelines.cases.work.result"][0]): Promise<WorkerToHostMethods["pipelines.cases.work.result"][1]>;
+    publishRevision(params: WorkerToHostMethods["pipelines.cases.publishRevision"][0]): Promise<WorkerToHostMethods["pipelines.cases.publishRevision"][1]>;
     publishEvidence(params: WorkerToHostMethods["pipelines.cases.publishEvidence"][0]): Promise<WorkerToHostMethods["pipelines.cases.publishEvidence"][1]>;
     getCase(params: WorkerToHostMethods["pipelines.cases.get"][0]): Promise<WorkerToHostMethods["pipelines.cases.get"][1]>;
     createReviewLink(params: WorkerToHostMethods["pipelines.cases.createReviewLink"][0]): Promise<WorkerToHostMethods["pipelines.cases.createReviewLink"][1]>;
@@ -449,6 +464,9 @@ const METHOD_CAPABILITY_MAP: Record<WorkerToHostMethodName, PluginCapability | n
   "projects.getPrimaryWorkspace": "project.workspaces.read",
   "projects.getWorkspaceForIssue": "project.workspaces.read",
   "executionWorkspaces.get": "execution.workspaces.read",
+  "executionWorkspaces.inspectRevision": "execution.workspaces.inspect",
+  "executionWorkspaces.editSources": "execution.workspaces.edit",
+  "executionWorkspaces.abortSourceEdit": "execution.workspaces.edit",
   "projects.managed.get": "projects.managed",
   "projects.managed.reconcile": "projects.managed",
     "projects.managed.reset": "projects.managed",
@@ -489,6 +507,18 @@ const METHOD_CAPABILITY_MAP: Record<WorkerToHostMethodName, PluginCapability | n
   "approvals.decide": "approvals.respond",
 
   // Pipelines
+  "pipelines.list": "pipeline.cases.read",
+  "pipelines.cases.list": "pipeline.cases.read",
+  "pipelines.cases.create": "pipeline.cases.write",
+  "pipelines.cases.patch": "pipeline.cases.write",
+  "pipelines.cases.linkIssue": "pipeline.cases.links.write",
+  "pipelines.cases.transition": "pipeline.cases.write",
+  "pipelines.cases.events": "pipeline.cases.read",
+  "pipelines.cases.work.get": "pipeline.cases.read",
+  "pipelines.cases.work.bind": "pipeline.cases.work.write",
+  "pipelines.cases.work.handoff": "pipeline.cases.work.write",
+  "pipelines.cases.work.result": "pipeline.cases.work.write",
+  "pipelines.cases.publishRevision": "pipeline.cases.work.write",
   "pipelines.cases.get": "pipeline.cases.read",
   "pipelines.cases.getDocument": "pipeline.cases.documents.read",
   "pipelines.cases.putDocument": "pipeline.cases.documents.write",
@@ -856,6 +886,9 @@ export function createHostClientHandlers(
     "executionWorkspaces.get": gated("executionWorkspaces.get", async (params) => {
       return services.executionWorkspaces.get(params);
     }),
+    "executionWorkspaces.inspectRevision": gated("executionWorkspaces.inspectRevision", async (params) => services.executionWorkspaces.inspectRevision(params)),
+    "executionWorkspaces.editSources": gated("executionWorkspaces.editSources", async (params) => services.executionWorkspaces.editSources(params)),
+    "executionWorkspaces.abortSourceEdit": gated("executionWorkspaces.abortSourceEdit", async (params) => services.executionWorkspaces.abortSourceEdit(params)),
     "projects.managed.get": gated("projects.managed.get", async (params) => {
       return services.projects.getManaged(params);
     }),
@@ -975,6 +1008,18 @@ export function createHostClientHandlers(
     }),
 
     // Pipelines
+    "pipelines.list": gated("pipelines.list", async (params) => services.pipelines.list(params)),
+    "pipelines.cases.list": gated("pipelines.cases.list", async (params) => services.pipelines.listCases(params)),
+    "pipelines.cases.create": gated("pipelines.cases.create", async (params) => services.pipelines.createCase(params)),
+    "pipelines.cases.patch": gated("pipelines.cases.patch", async (params) => services.pipelines.patchCase(params)),
+    "pipelines.cases.linkIssue": gated("pipelines.cases.linkIssue", async (params) => services.pipelines.linkIssue(params)),
+    "pipelines.cases.transition": gated("pipelines.cases.transition", async (params) => services.pipelines.transitionCase(params)),
+    "pipelines.cases.events": gated("pipelines.cases.events", async (params) => services.pipelines.listEvents(params)),
+    "pipelines.cases.work.get": gated("pipelines.cases.work.get", async (params) => services.pipelines.getWork(params)),
+    "pipelines.cases.work.bind": gated("pipelines.cases.work.bind", async (params) => services.pipelines.bindWork(params)),
+    "pipelines.cases.work.handoff": gated("pipelines.cases.work.handoff", async (params) => services.pipelines.handoffWork(params)),
+    "pipelines.cases.work.result": gated("pipelines.cases.work.result", async (params) => services.pipelines.recordWorkResult(params)),
+    "pipelines.cases.publishRevision": gated("pipelines.cases.publishRevision", async (params) => services.pipelines.publishRevision(params)),
     "pipelines.cases.publishEvidence": gated("pipelines.cases.publishEvidence", async (params) => {
       return services.pipelines.publishEvidence(params);
     }),

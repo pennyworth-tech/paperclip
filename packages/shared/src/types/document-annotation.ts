@@ -56,6 +56,8 @@ export interface DocumentAnnotationAnchorSnapshot {
 }
 
 export interface DocumentAnnotationThread {
+  pipelineCaseId?: string | null;
+  feedbackKind?: "question" | "suggestion" | "blocker" | null;
   id: string;
   companyId: string;
   issueId: string | null;
@@ -91,6 +93,7 @@ export interface DocumentAnnotationThread {
 }
 
 export interface DocumentAnnotationComment {
+  pipelineCaseId?: string | null;
   id: string;
   companyId: string;
   threadId: string;

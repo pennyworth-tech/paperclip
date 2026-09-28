@@ -974,6 +974,7 @@ export async function prepareSandboxManagedRuntime(input: {
   adapterKey: string;
   client: SandboxManagedRuntimeClient;
   workspaceLocalDir: string;
+  gitHistoryDepth?: number;
   workspaceRemoteDir?: string;
   syncWorkspace?: boolean;
   workspaceExclude?: string[];
@@ -1207,6 +1208,7 @@ export async function prepareSandboxManagedRuntime(input: {
               await withShallowGitWorkspaceClone({
                 localDir: input.workspaceLocalDir,
                 snapshot: gitSnapshot,
+                historyDepth: input.gitHistoryDepth,
               }, async (cloneDir) => {
                 await createTarballFromDirectory({
                   localDir: cloneDir,

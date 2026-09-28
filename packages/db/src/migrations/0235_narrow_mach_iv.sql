@@ -1,0 +1,9 @@
+ALTER TABLE "document_annotation_comments" DROP CONSTRAINT "document_annotation_comments_exactly_one_owner_chk";--> statement-breakpoint
+ALTER TABLE "document_annotation_threads" DROP CONSTRAINT "document_annotation_threads_exactly_one_owner_chk";--> statement-breakpoint
+ALTER TABLE "document_annotation_comments" ADD COLUMN "pipeline_case_id" uuid;--> statement-breakpoint
+ALTER TABLE "document_annotation_threads" ADD COLUMN "pipeline_case_id" uuid;--> statement-breakpoint
+ALTER TABLE "document_annotation_threads" ADD COLUMN "feedback_kind" text;--> statement-breakpoint
+ALTER TABLE "document_annotation_comments" ADD CONSTRAINT "document_annotation_comments_pipeline_case_id_pipeline_cases_id_fk" FOREIGN KEY ("pipeline_case_id") REFERENCES "public"."pipeline_cases"("id") ON DELETE cascade ON UPDATE no action;--> statement-breakpoint
+ALTER TABLE "document_annotation_threads" ADD CONSTRAINT "document_annotation_threads_pipeline_case_id_pipeline_cases_id_fk" FOREIGN KEY ("pipeline_case_id") REFERENCES "public"."pipeline_cases"("id") ON DELETE cascade ON UPDATE no action;--> statement-breakpoint
+ALTER TABLE "document_annotation_comments" ADD CONSTRAINT "document_annotation_comments_exactly_one_owner_chk" CHECK (num_nonnulls("document_annotation_comments"."issue_id", "document_annotation_comments"."routine_id", "document_annotation_comments"."case_id", "document_annotation_comments"."pipeline_case_id") = 1);--> statement-breakpoint
+ALTER TABLE "document_annotation_threads" ADD CONSTRAINT "document_annotation_threads_exactly_one_owner_chk" CHECK (num_nonnulls("document_annotation_threads"."issue_id", "document_annotation_threads"."routine_id", "document_annotation_threads"."case_id", "document_annotation_threads"."pipeline_case_id") = 1);

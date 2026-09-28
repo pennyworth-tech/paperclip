@@ -106,6 +106,8 @@ import { trackAgentFirstHeartbeat } from "@paperclipai/shared/telemetry";
 import { getTelemetryClient } from "../telemetry.js";
 import { companySkillService } from "./company-skills.js";
 import { budgetService, type BudgetEnforcementScope } from "./budgets.js";
+import { caseWorkRunClaimCondition, isCaseWorkRunCurrent } from "./pipeline-case-work-execution.js";
+import { withSourceWriteClaimGuard } from "./workspace-source-write-guard.js";
 import { secretService, type MissingRuntimeBinding } from "./secrets.js";
 import { resolveDefaultAgentWorkspaceDir, resolveManagedProjectWorkspaceDir } from "../home-paths.js";
 import {
@@ -12929,7 +12931,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       issueContext: issueId ? await getIssueExecutionContext(run.companyId, issueId) : null,
       routineEnvContext: { routineId: null, env: null, responsibleUserId: null },
     });
-    const claimed = await db
+    const claim = (connection: Pick<Db, "update">) => connection
       .update(heartbeatRuns)
       .set({
         status: "running",
@@ -12937,9 +12939,18 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         startedAt: run.startedAt ?? claimedAt,
         updatedAt: claimedAt,
       })
-      .where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.status, "queued")))
+      .where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.status, "queued"),
+        issueId ? caseWorkRunClaimCondition(run.companyId, issueId, run.agentId, context) : undefined))
       .returning()
       .then((rows) => rows[0] ?? null);
+    let claimed: typeof heartbeatRuns.$inferSelect | null;
+    try {
+      claimed = issueId ? await withSourceWriteClaimGuard(db, run.companyId, issueId, claim) : await claim(db);
+    } catch (error) {
+      const code = (error as { details?: { code?: string } }).details?.code;
+      if (code === "source_write_pending" || code === "workspace_mismatch") return null;
+      throw error;
+    }
     if (!claimed) return null;
 
     publishLiveEvent({
@@ -13105,6 +13116,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           | "issue_not_in_progress"
           | "issue_execution_lock_changed"
           | "issue_review_participant_changed"
+          | "issue_preparation_turn_changed"
           | "issue_continuation_waiting_on_review";
         details: Record<string, unknown>;
       };
@@ -13133,6 +13145,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         reason: "Cancelled because the target issue no longer exists",
         details: { issueId },
       };
+    }
+
+    if (!await isCaseWorkRunCurrent(db, run.companyId, issueId, run.agentId, context)) {
+      return { stale: true, errorCode: "issue_preparation_turn_changed",
+        reason: "Cancelled because the preparation turn changed or its wake lacks the current turn binding",
+        details: { issueId } };
     }
 
     const wakeCommentId = deriveCommentId(context, null);

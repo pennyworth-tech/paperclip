@@ -15,6 +15,10 @@
  * @see https://www.jsonrpc.org/specification
  */
 
+import type { PluginPipelineAuthoringClient } from "./pipeline-authoring-types.js";
+import type { PluginWorkspaceRevisionRequest, PluginWorkspaceRevisionInspection, PluginWorkspaceEditRequest,
+  PluginWorkspaceEditReceipt, PluginWorkspaceEditAbortRequest, PluginWorkspaceEditAbortReceipt } from "./workspace-revision-types.js";
+
 import type {
   PaperclipPluginManifestV1,
   PluginLauncherBounds,
@@ -1729,6 +1733,12 @@ export interface WorkerToHostMethods {
     },
     result: PluginExecutionWorkspaceMetadata | null,
   ];
+  "executionWorkspaces.inspectRevision": [
+    params: { workspaceId: string; companyId: string; input: PluginWorkspaceRevisionRequest },
+    result: PluginWorkspaceRevisionInspection,
+  ];
+  "executionWorkspaces.editSources": [params: { workspaceId: string; companyId: string; input: PluginWorkspaceEditRequest }, result: PluginWorkspaceEditReceipt];
+  "executionWorkspaces.abortSourceEdit": [params: { workspaceId: string; companyId: string; input: PluginWorkspaceEditAbortRequest }, result: PluginWorkspaceEditAbortReceipt];
   "projects.managed.get": [
     params: { projectKey: string; companyId: string },
     result: PluginManagedProjectResolution,
@@ -1815,6 +1825,7 @@ export interface WorkerToHostMethods {
   ];
   "issues.create": [
     params: {
+      idempotencyKey?: string;
       companyId: string;
       projectId?: string;
       goalId?: string;
@@ -1912,6 +1923,7 @@ export interface WorkerToHostMethods {
   ];
   "issues.requestWakeup": [
     params: {
+      expectedCaseWork?: { caseId: string; turn: number; agentId: string };
       issueId: string;
       companyId: string;
       reason?: string;
@@ -2050,6 +2062,18 @@ export interface WorkerToHostMethods {
   ];
 
   // Pipelines
+  "pipelines.cases.publishRevision": [params: { companyId: string; caseId: string; input: Parameters<PluginPipelineAuthoringClient["publishRevision"]>[1] }, result: Awaited<ReturnType<PluginPipelineAuthoringClient["publishRevision"]>>];
+  "pipelines.list": [params: { companyId: string }, result: Awaited<ReturnType<PluginPipelineAuthoringClient["list"]>>];
+  "pipelines.cases.list": [params: { pipelineId: string; companyId: string; page?: { limit?: number; offset?: number } }, result: Awaited<ReturnType<PluginPipelineAuthoringClient["listCases"]>>];
+  "pipelines.cases.create": [params: { input: Parameters<PluginPipelineAuthoringClient["createCase"]>[0]; companyId: string }, result: Awaited<ReturnType<PluginPipelineAuthoringClient["createCase"]>>];
+  "pipelines.cases.patch": [params: { caseId: string; input: Parameters<PluginPipelineAuthoringClient["patchCase"]>[1]; companyId: string }, result: Awaited<ReturnType<PluginPipelineAuthoringClient["patchCase"]>>];
+  "pipelines.cases.linkIssue": [params: { caseId: string; input: Parameters<PluginPipelineAuthoringClient["linkIssue"]>[1]; companyId: string }, result: Awaited<ReturnType<PluginPipelineAuthoringClient["linkIssue"]>>];
+  "pipelines.cases.transition": [params: { caseId: string; input: Parameters<PluginPipelineAuthoringClient["transitionCase"]>[1]; companyId: string }, result: Awaited<ReturnType<PluginPipelineAuthoringClient["transitionCase"]>>];
+  "pipelines.cases.events": [params: { caseId: string; companyId: string; page?: { limit?: number; offset?: number } }, result: Awaited<ReturnType<PluginPipelineAuthoringClient["listEvents"]>>];
+  "pipelines.cases.work.get": [params: { caseId: string; companyId: string }, result: Awaited<ReturnType<PluginPipelineAuthoringClient["getWork"]>>];
+  "pipelines.cases.work.bind": [params: { caseId: string; issueId: string; companyId: string }, result: Awaited<ReturnType<PluginPipelineAuthoringClient["bindWork"]>>];
+  "pipelines.cases.work.handoff": [params: { caseId: string; input: Parameters<PluginPipelineAuthoringClient["handoffWork"]>[1]; companyId: string }, result: Awaited<ReturnType<PluginPipelineAuthoringClient["handoffWork"]>>];
+  "pipelines.cases.work.result": [params: { caseId: string; input: Parameters<PluginPipelineAuthoringClient["recordWorkResult"]>[1]; companyId: string }, result: Awaited<ReturnType<PluginPipelineAuthoringClient["recordWorkResult"]>>];
   "pipelines.cases.publishEvidence": [
     params: { caseId: string; companyId: string; evidence: import("@paperclipai/shared").PipelineStageEvidenceInput },
     result: import("./types.js").PluginPipelineStageEvidence,

@@ -60,6 +60,13 @@ Paperclip should make outputs first-class. That means generated artifacts, previ
 
 Some work needs more than a task description before execution starts. Deeper planning means a dedicated planning mode, revisioned plans, and explicit plan approvals for strategy-heavy work before agents begin execution.
 
+The OpenSpec Studio integration is in progress: one company pipeline and one
+reassigned preparation issue per case, with immutable review evidence and
+confined source-edit publication. Native writer reservations keep approval and
+agent execution paused until publication or proven abandonment finishes. See the
+[host integration record](doc/plans/2026-09-27-openspec-stage-evidence.md) for current
+verification limits; the complete multi-repository pilot and rollout are pending.
+
 ### ✅ Enforced Outcomes (watchdogs, recovery actions, review gates)
 
 Paperclip should get stricter about what counts as finished work. Watchdogs, recovery actions, and review gates keep execution moving toward clear outcomes like merged code, published artifacts, shipped docs, or explicit decisions instead of vague status updates.
