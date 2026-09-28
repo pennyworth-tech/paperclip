@@ -1,5 +1,5 @@
 import { useQuery } from "@tanstack/react-query";
-import { healthApi } from "@/api/health";
+import { healthApi, type CloudInstanceHealthStatus } from "@/api/health";
 import { queryKeys } from "@/lib/queryKeys";
 
 /**
@@ -15,4 +15,20 @@ export function useCloudInstance() {
   });
 
   return healthQuery.data?.cloud ?? null;
+}
+
+/**
+ * Whether the instance sits behind the Paperclip Cloud app.
+ *
+ * `health.cloud` is advertised from the managed signal alone, and a
+ * self-hosted instance that boots with `PAPERCLIP_MANAGED_CONFIG` (to elect its
+ * bundled plugins and pin managed features) advertises it too — with no stack
+ * and no cloud origin. Only a live stack behind the Cloud app carries
+ * `cloudBaseUrl`, and only there do the Cloud-owned surfaces exist: the stack
+ * portfolio, stack entry, and the `/cloud/logout` sequence. Anything that
+ * navigates into the Cloud app keys on this, not on `cloud` being present;
+ * the managed floors (no in-app company creation or import) key on `cloud`.
+ */
+export function hasCloudApp(cloud: CloudInstanceHealthStatus | null | undefined): boolean {
+  return Boolean(cloud?.cloudBaseUrl);
 }

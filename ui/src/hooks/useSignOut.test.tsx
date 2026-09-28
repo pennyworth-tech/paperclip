@@ -76,6 +76,37 @@ describe("useSignOut", () => {
     flushSync(() => root.unmount());
   });
 
+  it("keeps sign-out local on a managed instance with no cloud origin", async () => {
+    // `cloud` is advertised from the managed signal alone; without a cloud
+    // origin there is no Cloud app owning /cloud/logout, so the navigation would
+    // land on the not-found route with the local session still valid.
+    mockAuthApi.signOut.mockResolvedValue(undefined);
+    const onSignedOut = vi.fn();
+    queryClient.setQueryData(queryKeys.health, {
+      status: "ok",
+      deploymentMode: "authenticated",
+      cloud: {
+        managed: true,
+        managedBy: "paperclip-cloud",
+        stackSlug: null,
+        cloudBaseUrl: null,
+      },
+    });
+    queryClient.setQueryData(queryKeys.auth.session, { session: { id: "session-1" } });
+    const root = renderHarness(onSignedOut);
+
+    flushSync(() => captured?.mutate());
+
+    await vi.waitFor(() => expect(onSignedOut).toHaveBeenCalledOnce());
+    expect(mockAuthApi.signOut).toHaveBeenCalledOnce();
+    expect(mockNavigateTopLevel).not.toHaveBeenCalled();
+    await vi.waitFor(() =>
+      expect(queryClient.getQueryData(queryKeys.auth.session)).toBeUndefined(),
+    );
+
+    flushSync(() => root.unmount());
+  });
+
   it("keeps self-hosted sign-out pending until the local request finishes, then clears account caches", async () => {
     let resolveSignOut: (() => void) | undefined;
     mockAuthApi.signOut.mockImplementation(() => new Promise<void>((resolve) => {

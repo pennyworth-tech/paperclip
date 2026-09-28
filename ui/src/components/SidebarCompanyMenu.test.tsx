@@ -737,7 +737,15 @@ describe("SidebarCompanyMenu", () => {
       });
     });
 
-    it("falls back to the stack slug and hides creation without a cloud base url", async () => {
+    // A managed instance is not always behind the Cloud app: a self-hosted
+    // server that boots with PAPERCLIP_MANAGED_CONFIG (to elect its bundled
+    // plugins) advertises `cloud` with no stack and no cloud origin, and so
+    // does a stack that is still being provisioned. Neither has a portfolio to
+    // list — GET /api/cloud/stacks is 403 without a trusted Cloud tenant — nor
+    // anywhere to switch to, so asking is guaranteed to end in "Could not load
+    // organizations". The menu lists the instance's own companies instead, and
+    // creation stays hidden because the managed floor still refuses it.
+    it("lists the instance's own companies and hides creation without a cloud origin", async () => {
       mockCloudApi.listStacks.mockRejectedValue(new Error("portfolio unavailable"));
       const { root } = renderMenu({
         cloud: true,
@@ -749,10 +757,57 @@ describe("SidebarCompanyMenu", () => {
       await flushReact();
       await flushReact();
 
-      await openMenu("Open acme-labs organization switcher");
+      expect(mockCloudApi.listStacks).not.toHaveBeenCalled();
+      await openMenu("Open Acme Labs organization switcher");
 
-      expect(document.body.textContent).toContain("Could not load organizations");
+      expect(document.body.textContent).toContain("Switch organization");
+      expect(document.body.textContent).toContain("Acme Labs");
+      expect(document.body.textContent).toContain("Strata");
+      expect(document.body.textContent).toContain("Anachronist Wiki");
+      expect(document.body.textContent).not.toContain("Could not load organizations");
+      expect(document.body.textContent).not.toContain("No organizations");
       expect(document.body.textContent).not.toContain("Create new organization...");
+      expect(mockCloudApi.listStacks).not.toHaveBeenCalled();
+
+      // The rows are companies: picking one is client routing, never a
+      // top-level navigation into a Cloud app this instance does not have.
+      const strataRow = Array.from(document.body.querySelectorAll('[data-slot="dropdown-menu-item"]'))
+        .find((element) => element.textContent?.includes("Strata"));
+      act(() => {
+        strataRow?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      });
+      await flushReact();
+      expect(mockSetSelectedCompanyId).toHaveBeenCalledWith("company-2");
+      expect(mockNavigateTopLevel).not.toHaveBeenCalled();
+
+      act(() => {
+        root.unmount();
+      });
+    });
+
+    it("signs out locally without a cloud origin, since /cloud/logout has no owner there", async () => {
+      const { root } = renderMenu({
+        cloud: true,
+        health: {
+          status: "ok" as const,
+          cloud: { ...CLOUD_HEALTH.cloud, cloudBaseUrl: null },
+        },
+      });
+      await flushReact();
+      await flushReact();
+      await openMenu("Open Acme Labs organization switcher");
+
+      const signOutItem = Array.from(document.body.querySelectorAll('[data-slot="dropdown-menu-item"]'))
+        .find((element) => element.textContent?.includes("Sign out"));
+      expect(signOutItem).toBeTruthy();
+
+      act(() => {
+        signOutItem?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      });
+      await flushReact();
+
+      expect(mockAuthApi.signOut).toHaveBeenCalledOnce();
+      expect(mockNavigateTopLevel).not.toHaveBeenCalled();
 
       act(() => {
         root.unmount();

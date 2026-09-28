@@ -2,7 +2,7 @@ import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { authApi } from "@/api/auth";
 import { navigateTopLevel } from "@/lib/browserNavigation";
 import { queryKeys } from "@/lib/queryKeys";
-import { useCloudInstance } from "./useCloudInstance";
+import { hasCloudApp, useCloudInstance } from "./useCloudInstance";
 
 const CLOUD_SIGN_OUT_PATH = "/cloud/logout";
 
@@ -38,7 +38,9 @@ interface UseSignOutOptions {
  * first clearing the tenant session; that path is a top-level navigation, so
  * the document reload it triggers builds a new QueryClient and there is nothing
  * left here to clear. Authenticated self-hosted instances keep the local API
- * flow and drop the account-scoped caches afterward.
+ * flow and drop the account-scoped caches afterward — including a managed
+ * instance with no cloud origin, where `/cloud/logout` has no owner and the
+ * navigation would land on the app's not-found route with the session intact.
  */
 export function useSignOut({ onSignedOut }: UseSignOutOptions = {}) {
   const cloud = useCloudInstance();
@@ -46,7 +48,7 @@ export function useSignOut({ onSignedOut }: UseSignOutOptions = {}) {
 
   return useMutation({
     mutationFn: async () => {
-      if (cloud) {
+      if (hasCloudApp(cloud)) {
         onSignedOut?.();
         navigateTopLevel(CLOUD_SIGN_OUT_PATH);
         return "cloud" as const;
