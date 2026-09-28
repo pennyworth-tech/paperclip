@@ -627,12 +627,13 @@ describeEmbeddedPostgres("isolated-execution-workspace run serialization", () =>
     // forced hook, so it still promotes a live path for the issue rather than
     // abandoning it -- exactly the "SHALL NOT strand" half of the scenario.
     // The invariant this test owns is that the lock moved OFF the dead run.
-    const issueRow = await db
+    // Run cancellation precedes the separate execution-lock release write.
+    await expect.poll(async () => db
       .select({ executionRunId: issues.executionRunId })
       .from(issues)
       .where(eq(issues.id, fixture.issueId))
-      .then((rows) => rows[0] ?? null);
-    expect(issueRow?.executionRunId).not.toBe(run!.id);
+      .then((rows) => rows[0]?.executionRunId), { timeout: 10_000 })
+      .not.toBe(run!.id);
   });
 
   it("serializes an inherited worktree even when the issue policy says allow", async () => {
