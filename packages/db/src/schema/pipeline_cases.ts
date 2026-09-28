@@ -50,6 +50,8 @@ export const pipelineCases = pgTable(
     requestKey: text("request_key"),
     automationAttemptId: uuid("automation_attempt_id"),
     version: integer("version").notNull().default(1),
+    // Host-owned pointer. Never accepted from a case fields/content PATCH.
+    stageEvidenceId: uuid("stage_evidence_id"),
     pendingSuggestion: jsonb("pending_suggestion").$type<PipelineCasePendingSuggestion>(),
     leaseOwnerType: text("lease_owner_type"),
     leaseAgentId: uuid("lease_agent_id").references(() => agents.id, { onDelete: "set null" }),

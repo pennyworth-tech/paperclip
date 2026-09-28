@@ -980,3 +980,5 @@ export * from "./app-definition.js";
 export * from "./chat-channels.js";
 
 export * from "./email.js";
+export { pipelineStageEvidencePolicySchema, pipelineStageEvidenceInputSchema } from "./pipeline.js";
+export type { PipelineStageEvidencePolicy, PipelineStageEvidenceInput } from "./pipeline.js";

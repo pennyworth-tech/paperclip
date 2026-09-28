@@ -109,6 +109,7 @@ const OPERATION_CAPABILITIES: Record<string, readonly PluginCapability[]> = {
   "pipelines.cases.putDocument": ["pipeline.cases.documents.write"],
   "pipelines.cases.createReviewLink": ["pipeline.cases.links.write"],
   "pipelines.cases.review": ["pipeline.cases.review"],
+  "pipelines.cases.publishEvidence": ["pipeline.cases.evidence.write"],
   "activity.log": ["activity.log.write"],
   "metrics.write": ["metrics.write"],
   "telemetry.track": ["telemetry.track"],

@@ -46,6 +46,7 @@ import { budgetService } from "./budgets.js";
 import { issueApprovalService } from "./issue-approvals.js";
 import { approvalService } from "./approvals.js";
 import { pipelineService } from "./pipelines.js";
+import { publishStageEvidence } from "./pipeline-stage-evidence.js";
 import {
   parsePipelineCaseDocumentInput,
   parsePipelineDocumentKey,
@@ -2817,6 +2818,12 @@ export function buildHostServices(
     },
 
     pipelines: {
+      async publishEvidence(params) {
+        const companyId = ensureCompanyId(params.companyId);
+        await ensurePluginAvailableForCompany(companyId);
+        return publishStageEvidence(db, { companyId, caseId: params.caseId,
+          producerPluginId: pluginId, producerPluginKey: pluginKey, evidence: params.evidence });
+      },
       async getCase(params) {
         const companyId = ensureCompanyId(params.companyId);
         await ensurePluginAvailableForCompany(companyId);
@@ -2842,6 +2849,7 @@ export function buildHostServices(
           companyId: row.case.companyId,
           pipelineId: row.case.pipelineId,
           caseKey: row.case.caseKey,
+          stageEvidenceId: row.case.stageEvidenceId,
           title: row.case.title,
           summary: row.case.summary,
           fields: row.case.fields,
@@ -2953,6 +2961,7 @@ export function buildHostServices(
           ...(params.fields !== undefined ? { edits: { fields: params.fields } } : {}),
           expectedVersion: params.expectedVersion,
           actor: { type: "agent", agentId: params.actorAgentId, runId: params.actorRunId },
+          evidenceId: params.evidenceId,
         });
         return {
           caseId: result.case.id,

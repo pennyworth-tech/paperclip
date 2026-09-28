@@ -2092,6 +2092,10 @@ export interface WorkerToHostMethods {
   ];
 
   // Pipelines
+  "pipelines.cases.publishEvidence": [
+    params: { caseId: string; companyId: string; evidence: import("@paperclipai/shared").PipelineStageEvidenceInput },
+    result: import("./types.js").PluginPipelineStageEvidence,
+  ];
   "pipelines.cases.get": [
     params: { caseId: string; companyId: string },
     result: PluginPipelineCase | null,
@@ -2135,6 +2139,7 @@ export interface WorkerToHostMethods {
       reason?: string | null;
       fields?: Record<string, unknown>;
       expectedVersion: number;
+      evidenceId?: string | null;
       actorAgentId: string;
       actorRunId: string;
     },

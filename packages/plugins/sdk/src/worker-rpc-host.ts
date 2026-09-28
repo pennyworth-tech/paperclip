@@ -1149,6 +1149,9 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
       },
 
       pipelines: {
+        async publishEvidence(caseId, evidence, companyId) {
+          return callHost("pipelines.cases.publishEvidence", { caseId, evidence, companyId });
+        },
         async getCase(caseId, companyId) {
           return callHost("pipelines.cases.get", { caseId, companyId });
         },
@@ -1171,6 +1174,7 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
             reason: input.reason,
             ...(input.fields !== undefined ? { fields: input.fields } : {}),
             expectedVersion: input.expectedVersion,
+            evidenceId: input.evidenceId,
             actorAgentId: input.actorAgentId,
             actorRunId: input.actorRunId,
           });

@@ -2767,3 +2767,5 @@ export * from "./ai-connections.js";
 export * from "./types/email.js";
 export * from "./validators/email.js";
 export * from "./announcements.js";
+export { pipelineStageEvidencePolicySchema, pipelineStageEvidenceInputSchema } from "./validators/pipeline.js";
+export type { PipelineStageEvidencePolicy, PipelineStageEvidenceInput } from "./validators/pipeline.js";

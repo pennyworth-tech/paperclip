@@ -1655,6 +1655,17 @@ export interface PluginApprovalsClient {
 
 export type PluginPipelineReviewDecision = "approve" | "reject" | "request_changes";
 
+export interface PluginPipelineStageEvidence {
+  id: string;
+  companyId: string;
+  caseId: string;
+  stageId: string;
+  caseVersion: number;
+  revisionId: string;
+  contentDigest: string;
+  readiness: string;
+}
+
 export interface PluginPipelineCaseIssueLink {
   id: string;
   caseId: string;
@@ -1668,6 +1679,7 @@ export interface PluginPipelineCaseIssueLink {
 }
 
 export interface PluginPipelineCase {
+  stageEvidenceId?: string | null;
   id: string;
   companyId: string;
   pipelineId: string;
@@ -1724,6 +1736,9 @@ export interface PluginPipelineReviewResult {
  * `pipeline.cases.documents.read` / `.write` for the document pair.
  */
 export interface PluginPipelinesClient {
+  /** Mint immutable evidence as this installed plugin; never impersonates a reviewer. */
+  publishEvidence(caseId: string, evidence: import("@paperclipai/shared").PipelineStageEvidenceInput,
+    companyId: string): Promise<PluginPipelineStageEvidence>;
   /** Read a case with its stage and issue links; `null` when not in the company. */
   getCase(caseId: string, companyId: string): Promise<PluginPipelineCase | null>;
   /**
@@ -1753,6 +1768,7 @@ export interface PluginPipelinesClient {
       reason?: string | null;
       fields?: Record<string, unknown>;
       expectedVersion: number;
+      evidenceId?: string | null;
       actorAgentId: string;
       actorRunId: string;
     },

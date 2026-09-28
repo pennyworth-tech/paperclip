@@ -137,6 +137,7 @@ export interface PipelineCase {
   parentCaseVersion?: number | null;
   requestKey?: string | null;
   version?: number;
+  stageEvidenceId?: string | null;
   pendingSuggestion?: PipelineCasePendingSuggestion | null;
   terminalKind?: string | null;
   terminalAt?: Date | string | null;
@@ -283,6 +284,7 @@ export interface PipelineCaseEventsPage {
 }
 
 export interface PipelineAttentionCaseRef {
+  stageEvidenceId?: string | null;
   id: string;
   caseKey: string | null;
   title: string;
@@ -604,6 +606,7 @@ export const pipelinesApi = {
     data: {
       toStageKey: string;
       expectedVersion: number;
+      evidenceId?: string | null;
       reason?: string | null;
       leaseToken?: string | null;
       acceptSuggestionId?: string;
@@ -660,6 +663,7 @@ export const pipelinesApi = {
       decision: PipelineReviewDecision;
       reason?: string | null;
       expectedVersion: number;
+      evidenceId?: string | null;
       leaseToken?: string | null;
     },
   ) => api.post<unknown>(`/cases/${caseId}/review`, data),
@@ -671,6 +675,7 @@ export const pipelinesApi = {
         decision: PipelineReviewDecision;
         reason?: string | null;
         expectedVersion: number;
+        evidenceId?: string | null;
       }>;
     },
   ) => api.post<PipelineBulkReviewResult>(`/companies/${companyId}/review-cases/bulk`, data),

@@ -86,6 +86,7 @@ export const releaseCaseSchema = z.object({
   force: z.boolean().optional(),
 });
 export const transitionCaseSchema = z.object({
+  evidenceId: z.string().guid().nullable().optional(),
   toStageKey: z.string().trim().min(1).max(120),
   expectedVersion: z.number().int().positive(),
   leaseToken: z.string().guid().nullable().optional(),
@@ -119,6 +120,7 @@ export const reviewEditsSchema = z.object({
   parentCaseId: z.string().guid().nullable().optional(),
 });
 export const reviewCaseSchema = z.object({
+  evidenceId: z.string().guid().nullable().optional(),
   decision: z.enum(["approve", "reject", "request_changes"]),
   reason: z.string().max(4_000).nullable().optional(),
   edits: reviewEditsSchema.optional(),

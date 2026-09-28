@@ -13,6 +13,7 @@ import {
 import { upsertPipelineCaseDocumentSchema, issueDocumentKeySchema, PIPELINE_CASE_BODY_DOCUMENT_KEY } from "@paperclipai/shared";
 import { badRequest, conflict, notFound } from "../errors.js";
 import { documentAnnotationService } from "./document-annotations.js";
+import { invalidateEvidenceForDocuments, lockEvidenceCase } from "./pipeline-stage-evidence.js";
 import { resolveActorSourceTrustForIssue } from "./source-trust.js";
 import {
   ensurePipelineCaseBodyDocumentFromSummary,
@@ -194,7 +195,9 @@ export async function putPipelineCaseDocument(
   const sourceTrust = await sourceTrustForPipelineCaseDocumentWrite(db, { companyId, caseId, actor });
 
   const result = await db.transaction(async (tx) => {
+    await lockEvidenceCase(tx, companyId, caseId);
     const existing = await getPipelineCaseDocumentRow(tx, { companyId, caseId, key });
+    if (existing) await invalidateEvidenceForDocuments(tx, [existing.document.id]);
 
     if (existing && !payload.baseRevisionId) {
       throw conflict("Pipeline case document update requires baseRevisionId", {

@@ -221,6 +221,9 @@ export function documentService(db: Db) {
         try {
           return await db.transaction(async (tx) => {
           const now = new Date();
+          const linkedBeforeWrite = await tx.select({ documentId: issueDocuments.documentId }).from(issueDocuments)
+            .where(and(eq(issueDocuments.issueId, issue.id), eq(issueDocuments.key, key)));
+          await invalidateEvidenceForDocuments(tx, linkedBeforeWrite.map((row) => row.documentId));
           const existing = await tx
             .select({
               id: documents.id,
@@ -589,6 +592,9 @@ export function documentService(db: Db) {
     }) => {
       const key = normalizeDocumentKey(input.key);
       return db.transaction(async (tx) => {
+        const linkedBeforeWrite = await tx.select({ documentId: issueDocuments.documentId }).from(issueDocuments)
+          .where(and(eq(issueDocuments.issueId, input.issueId), eq(issueDocuments.key, key)));
+        await invalidateEvidenceForDocuments(tx, linkedBeforeWrite.map((row) => row.documentId));
         const existing = await tx
           .select(issueDocumentSelect)
           .from(issueDocuments)
@@ -783,6 +789,9 @@ export function documentService(db: Db) {
     deleteIssueDocument: async (issueId: string, rawKey: string) => {
       const key = normalizeDocumentKey(rawKey);
       return db.transaction(async (tx) => {
+        const linkedBeforeWrite = await tx.select({ documentId: issueDocuments.documentId }).from(issueDocuments)
+          .where(and(eq(issueDocuments.issueId, issueId), eq(issueDocuments.key, key)));
+        await invalidateEvidenceForDocuments(tx, linkedBeforeWrite.map((row) => row.documentId));
         const existing = await tx
           .select(issueDocumentSelect)
           .from(issueDocuments)
@@ -811,3 +820,4 @@ export function documentService(db: Db) {
     },
   };
 }
+import { invalidateEvidenceForDocuments } from "./pipeline-stage-evidence.js";

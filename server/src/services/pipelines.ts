@@ -51,6 +51,7 @@ import { assertAssignableAgent } from "./agent-assignability.js";
 import { authorizationService } from "./authorization.js";
 import { visibleIssueCondition } from "./issue-visibility.js";
 import type { IssuePostCommitAction } from "./issues.js";
+import { assertStageEvidenceTransition } from "./pipeline-stage-evidence.js";
 import {
   formatPipelineCaseOutputContextMarkdown,
   pipelineCaseOutputsService,
@@ -3162,7 +3163,7 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
     },
   ) {
     if (input.fields !== undefined) assertJsonSize(input.fields, "fields");
-    const { case: existing, stage } = await getCaseWithStageOrThrow(tx, input.companyId, input.caseId);
+    const { case: existing, stage } = await getCaseWithStageForUpdateOrThrow(tx, input.companyId, input.caseId);
     const current = await assertLeaseAvailable(tx, existing, input.actor, input.leaseToken);
     if (input.expectedVersion !== undefined && current.version !== input.expectedVersion) {
       throw conflict("Pipeline case version conflict", conflictDetailsForCase(current, stage));
@@ -3188,7 +3189,10 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
     const patch: Partial<typeof pipelineCases.$inferInsert> = {
       updatedAt: nowDate(),
     };
-    if (materialChanged) patch.version = current.version + 1;
+    if (materialChanged || parentCaseChanged || workspaceRefChanged) {
+      patch.version = current.version + 1;
+      patch.stageEvidenceId = null;
+    }
     if (titleChanged) patch.title = input.title;
     if (summaryChanged) patch.summary = input.summary;
     if (fieldsChanged) patch.fields = input.fields;
@@ -3264,6 +3268,9 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
       automationLedgers?: Array<typeof pipelineAutomationExecutions.$inferSelect>;
       autoAdvanceVisitedStageIds?: Set<string>;
       skipChildrenTerminalGate?: boolean;
+      evidenceId?: string | null;
+      // Internal only: public transition inputs never populate this field.
+      reviewDecision?: PipelineReviewDecision;
     },
   ) {
     if (input.transitionClass === "auto" && input.actor.type !== "system") {
@@ -3280,8 +3287,10 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
       ? await getStageOrThrow(tx, current.pipelineId, input.toStageId)
       : await getStageByKeyOrThrow(tx, current.pipelineId, input.toStageKey ?? "");
     assertStageEnabled(toStage, "transition");
+    let evidence: Awaited<ReturnType<typeof assertStageEvidenceTransition>> = null;
     if (fromStage.id !== toStage.id) {
       await assertActorCanApproveStageExit(tx, current, fromStage, input.actor);
+      evidence = await assertStageEvidenceTransition(tx, current, fromStage, toStage, input);
       await assertStageTransitionGates(tx, current, fromStage, { skipChildrenTerminalGate: input.skipChildrenTerminalGate });
       await assertLatestReviewApprovalStillCurrent(tx, current, fromStage, toStage, {
         allowWorkflowVersionDrift: input.transitionClass === "auto" && input.reason === "children_terminal",
@@ -3321,6 +3330,7 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
       .set({
         stageId: toStage.id,
         version: current.version + 1,
+        stageEvidenceId: null,
         terminalKind: enteringTerminal,
         terminalAt: enteringTerminal ? nowDate() : null,
         pendingSuggestion: input.suggestionId === current.pendingSuggestion?.id ? null : current.pendingSuggestion,
@@ -3351,6 +3361,7 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
         suggestionId: input.suggestionId ?? null,
         reason: input.reason ?? null,
         transitionClass: input.transitionClass ?? "manual",
+        ...(evidence ? { evidence } : {}),
       },
     });
     if (forcedTransition) {
@@ -3399,7 +3410,7 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
         visitedStageIds: input.autoAdvanceVisitedStageIds,
       });
     }
-    return { case: updated, event, automationLedger: ledger };
+    return { case: updated, event, automationLedger: ledger, evidence };
   }
 
   // A case can enter an auto-advance stage after its children are already
@@ -4007,6 +4018,9 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
             .then((rows) => rows[0] ?? null);
         if (!stage) throw unprocessable("Pipeline has no stages", { code: "validation" });
         assertStageEnabled(stage, "ingest");
+        if (stage.config.requireApprovedEntryFromStageKey !== undefined) {
+          throw conflict("New cases cannot skip a required review", { code: "review_decision_required" });
+        }
         validateAddFormFieldsForStage(stage, input.fields ?? {});
 
         const [inserted] = await tx
@@ -4485,6 +4499,7 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
       toStageId?: string;
       toStageKey?: string;
       expectedVersion: number;
+      evidenceId?: string | null;
       leaseToken?: string | null;
       actor: PipelineActor;
       transitionClass?: "manual" | "suggested" | "auto";
@@ -4946,12 +4961,13 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
         parentCaseId?: string | null;
       };
       expectedVersion: number;
+      evidenceId?: string | null;
       leaseToken?: string | null;
       actor: PipelineActor;
     }) {
       const automationLedgers: Array<typeof pipelineAutomationExecutions.$inferSelect> = [];
       const result = await db.transaction(async (tx) => {
-        const detail = await getCaseWithStageOrThrow(tx, input.companyId, input.caseId);
+        const detail = await getCaseWithStageForUpdateOrThrow(tx, input.companyId, input.caseId);
         if (detail.stage.kind !== "review") {
           throw unprocessable("Pipeline case is not in a review stage", { code: "validation" });
         }
@@ -4991,6 +5007,8 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
           reason: input.reason,
           actor: input.actor,
           automationLedgers,
+          evidenceId: input.evidenceId,
+          reviewDecision: input.decision,
         });
         // The decision records what it was decided ON, so a reader never has to
         // pair this event with the case's fields at some later version. The head
@@ -5023,6 +5041,7 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
             approvedTransitionVersion: input.decision === "approve" ? transitioned.case.version : null,
             // Every decision, not only `approve`: the version it was taken against.
             decidedCaseVersion: expectedVersion,
+            ...(transitioned.evidence ? { evidence: transitioned.evidence } : {}),
             decidedHeadSha: typeof decidedHeadShaRaw === "string" && /^[0-9a-f]{40}$/.test(decidedHeadShaRaw) ? decidedHeadShaRaw : null,
             decidedVerdictKind: typeof decidedVerdictKindRaw === "string" && decidedVerdictKindRaw.length > 0 ? decidedVerdictKindRaw : null,
           },
