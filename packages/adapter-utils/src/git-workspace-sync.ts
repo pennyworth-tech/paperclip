@@ -542,9 +542,13 @@ export async function withShallowGitWorkspaceClone<T>(
   input: {
     localDir: string;
     snapshot: GitWorkspaceSnapshot;
+    /** Keep enough ancestry for callers that verify source freshness. */
+    historyDepth?: number;
   },
   fn: (cloneDir: string) => Promise<T>,
 ): Promise<T> {
+  const depth = input.historyDepth ?? 1;
+  if (!Number.isSafeInteger(depth) || depth < 1 || depth > 2_147_483_647) throw new Error("Invalid Git history depth");
   const cloneDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-git-workspace-"));
   const tempRef = `refs/paperclip/git-sync/import/${randomUUID()}`;
   try {
@@ -570,7 +574,7 @@ export async function withShallowGitWorkspaceClone<T>(
         maxBuffer: 16 * 1024,
       }).catch(() => undefined);
     }
-    await runLocalGit(cloneDir, ["fetch", "--depth=1", input.localDir, tempRef], {
+    await runLocalGit(cloneDir, ["fetch", "--depth=" + depth, input.localDir, tempRef], {
       timeout: 60_000,
       maxBuffer: 1024 * 1024,
     });

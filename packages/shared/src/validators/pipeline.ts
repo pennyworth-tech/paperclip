@@ -25,7 +25,7 @@ export const pipelineStageEvidenceInputSchema = z.object({
   documentPins: z.array(z.object({
     key: z.string().trim().min(1).max(80),
     revisionId: z.string().guid(),
-  }).strict()).min(1).max(100),
+  }).strict()).min(1).max(512),
   prerequisiteDecisionIds: z.array(z.string().guid()).max(20).default([]),
   readiness: z.enum(["ready", "not_ready"]),
   details: z.record(z.string(), z.unknown()).default({}),
@@ -139,6 +139,7 @@ export const pipelineStageConfigSchema = z.object({
   requireChildrenTerminal: z.boolean().optional(),
   requireNoUnresolvedDrift: z.boolean().optional(),
   evidencePolicy: pipelineStageEvidencePolicySchema.optional(),
+  revisionPublication: z.object({ producerPluginKey: z.string().min(1).max(200), reopenToStageKey: z.string().min(1).max(120) }).strict().optional(),
   // Guards entry as well as exit: even a forced move cannot skip this review.
   requireApprovedEntryFromStageKey: z.string().trim().min(1).max(120).optional(),
 }).passthrough().superRefine((value, ctx) => {

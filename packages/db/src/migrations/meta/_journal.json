@@ -1961,6 +1961,13 @@
       "when": 1790828276482,
       "tag": "0281_pipeline_stage_evidence",
       "breakpoints": true
+    },
+    {
+      "idx": 282,
+      "version": "7",
+      "when": 1790828639815,
+      "tag": "0282_pipeline_case_work_and_annotations",
+      "breakpoints": true
     }
   ]
 }

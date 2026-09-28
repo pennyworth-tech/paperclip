@@ -13,6 +13,7 @@ import {
 import { upsertPipelineCaseDocumentSchema, issueDocumentKeySchema, PIPELINE_CASE_BODY_DOCUMENT_KEY } from "@paperclipai/shared";
 import { badRequest, conflict, notFound } from "../errors.js";
 import { documentAnnotationService } from "./document-annotations.js";
+import { remapPipelineCaseThreads } from "./pipeline-case-annotations.js";
 import { invalidateEvidenceForDocuments, lockEvidenceCase } from "./pipeline-stage-evidence.js";
 import { resolveActorSourceTrustForIssue } from "./source-trust.js";
 import {
@@ -312,6 +313,9 @@ export async function putPipelineCaseDocument(
       .select({ issueId: issueDocuments.issueId, key: issueDocuments.key })
       .from(issueDocuments)
       .where(and(eq(issueDocuments.companyId, companyId), eq(issueDocuments.documentId, document!.id)));
+
+    if (existing) await remapPipelineCaseThreads(tx, { companyId, caseId, documentId: document!.id,
+      nextRevisionId: revision!.id, nextRevisionNumber: revision!.revisionNumber, nextBody: payload.body });
 
     return {
       created: !existing,

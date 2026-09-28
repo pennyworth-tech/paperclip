@@ -66,6 +66,24 @@ export const createDocumentAnnotationCommentSchema = z.object({
   issueCommentId: z.string().guid().nullable().optional(),
 }).strict();
 
+export const createPipelineAnnotationSchema = createDocumentAnnotationThreadSchema
+  .omit({ blocking: true, issueCommentId: true })
+  .extend({ feedbackKind: z.enum(["question", "suggestion", "blocker"]).default("question") }).strict();
+
+export const updatePipelineAnnotationSchema = z.object({
+  status: documentAnnotationThreadStatusSchema,
+  expectedUpdatedAt: z.string().datetime(),
+  resolutionDisposition: z.string().trim().min(1).max(4_000).optional(),
+}).strict();
+
+export type CreatePipelineAnnotation = z.input<typeof createPipelineAnnotationSchema>;
+export type UpdatePipelineAnnotation = z.infer<typeof updatePipelineAnnotationSchema>;
+
+export const reanchorPipelineAnnotationSchema = createPipelineAnnotationSchema
+  .omit({ body: true, feedbackKind: true })
+  .extend({ expectedUpdatedAt: z.string().datetime() }).strict();
+export type ReanchorPipelineAnnotation = z.input<typeof reanchorPipelineAnnotationSchema>;
+
 export const updateDocumentAnnotationThreadSchema = z.object({
   status: documentAnnotationThreadStatusSchema.optional(),
   resolutionDisposition: z.string().trim().min(1).max(4_000).optional(),

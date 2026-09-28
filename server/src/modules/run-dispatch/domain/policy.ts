@@ -108,6 +108,7 @@ export type ScheduledRetryFacts = {
 };
 
 export type QueuedRunStalenessErrorCode =
+  | "issue_preparation_turn_changed"
   | "execution_reconciliation_required"
   | "issue_dependencies_blocked"
   | "issue_not_found"

@@ -1157,6 +1157,18 @@ export function createTestHarness(options: TestHarnessOptions): TestHarness {
       },
     },
     executionWorkspaces: {
+      async editSources() {
+        requireCapability(manifest, capabilitySet, "execution.workspaces.edit");
+        throw new Error("Source editing requires native case storage and workspace execution");
+      },
+      async abortSourceEdit() {
+        requireCapability(manifest, capabilitySet, "execution.workspaces.edit");
+        throw new Error("Source edit abandonment requires its native execution receipt");
+      },
+      async inspectRevision() {
+        requireCapability(manifest, capabilitySet, "execution.workspaces.inspect");
+        throw new Error("Revision inspection requires a real workspace execution environment");
+      },
       async get(workspaceId, companyId) {
         requireCapability(manifest, capabilitySet, "execution.workspaces.read");
         const workspace = executionWorkspaces.get(workspaceId);
@@ -2056,6 +2068,54 @@ export function createTestHarness(options: TestHarnessOptions): TestHarness {
       },
     },
     pipelines: {
+      async list() {
+        requireCapability(manifest, capabilitySet, "pipeline.cases.read");
+        throw new Error("Case authoring operations require the real host storage test harness");
+      },
+      async listCases() {
+        requireCapability(manifest, capabilitySet, "pipeline.cases.read");
+        throw new Error("Case authoring operations require the real host storage test harness");
+      },
+      async createCase() {
+        requireCapability(manifest, capabilitySet, "pipeline.cases.write");
+        throw new Error("Case authoring operations require the real host storage test harness");
+      },
+      async patchCase() {
+        requireCapability(manifest, capabilitySet, "pipeline.cases.write");
+        throw new Error("Case authoring operations require the real host storage test harness");
+      },
+      async linkIssue() {
+        requireCapability(manifest, capabilitySet, "pipeline.cases.links.write");
+        throw new Error("Case authoring operations require the real host storage test harness");
+      },
+      async transitionCase() {
+        requireCapability(manifest, capabilitySet, "pipeline.cases.write");
+        throw new Error("Case authoring operations require the real host storage test harness");
+      },
+      async listEvents() {
+        requireCapability(manifest, capabilitySet, "pipeline.cases.read");
+        throw new Error("Case authoring operations require the real host storage test harness");
+      },
+      async getWork() {
+        requireCapability(manifest, capabilitySet, "pipeline.cases.read");
+        throw new Error("Case authoring operations require the real host storage test harness");
+      },
+      async bindWork() {
+        requireCapability(manifest, capabilitySet, "pipeline.cases.work.write");
+        throw new Error("Case authoring operations require the real host storage test harness");
+      },
+      async handoffWork() {
+        requireCapability(manifest, capabilitySet, "pipeline.cases.work.write");
+        throw new Error("Case authoring operations require the real host storage test harness");
+      },
+      async recordWorkResult() {
+        requireCapability(manifest, capabilitySet, "pipeline.cases.work.write");
+        throw new Error("Case authoring operations require the real host storage test harness");
+      },
+      async publishRevision() {
+        requireCapability(manifest, capabilitySet, "pipeline.cases.work.write");
+        throw new Error("Revision publication requires the real host storage test harness");
+      },
       async publishEvidence() {
         requireCapability(manifest, capabilitySet, "pipeline.cases.evidence.write");
         throw new Error("Stage evidence requires the real host storage test harness");

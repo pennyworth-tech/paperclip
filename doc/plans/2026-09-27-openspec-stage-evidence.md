@@ -63,3 +63,32 @@ Build the Studio plugin with revision storage, source editing, dossier views,
 agent contracts, controlled intake, and delivery handoff. Run the complete
 isolated pilot and recovery matrix before live provisioning. Do not activate
 the production evidence policy from these partial checks alone.
+
+## Revision-bound work and source editing
+
+Pipeline preparation uses one durable work record per case. Turns identify the
+current agent, role, source revision and plugin producer. Queued claims and issue
+checkouts must match that turn. Completed work keeps an immutable result receipt;
+a handoff does not make an old queued continuation current again.
+
+Company-scoped workspace APIs inspect and edit repository sources through the
+execution target. A preview runs in an isolated snapshot and verifies the source
+revision, bounded paths and content hashes. Publication records a durable candidate
+before pushing without force. Recovery reconciles that same candidate rather than
+creating another commit after a lost response.
+
+A source writer reserves the case and workspace before changing Git. Pending
+publication prevents new execution, handoffs, evidence approval, workspace
+rebinding and cleanup. Releasing a reservation requires a matching publication
+receipt or proof that no push was attempted. An expired attempt lease alone does
+not release ownership.
+
+Native case annotations remain company-scoped and revision-bound. Blocking
+feedback invalidates stage evidence; resolving it requires a disposition. Rendered
+review artifacts use a renderer selected by exact digest. The private consumer
+owns its workflow configuration and delivery policy.
+
+Migration generation follows the selected upstream journal. Existing downstream
+migration adoption, actual database concurrency, provider execution and complete
+application qualification are required before rollout; local source reconstruction
+and schema snapshot checks do not establish those properties.

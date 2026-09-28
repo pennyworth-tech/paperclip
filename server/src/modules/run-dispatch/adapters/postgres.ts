@@ -1,3 +1,4 @@
+import { isCaseWorkRunCurrent } from "../../../services/pipeline-case-work-execution.js";
 import { hasConversationContinuationPolicy } from "../../../services/conversation-continuation.js";
 import { getExecutionBlocker } from "../../../services/execution-blocker.js";
 import { and, asc, eq, gte, inArray, lte, or, sql } from "drizzle-orm";
@@ -926,6 +927,13 @@ export function createPostgresRunDispatchAdapter(
       now,
       tx,
     );
+    if (facts.issueFound && !await isCaseWorkRunCurrent(tx, run.companyId, issueId, run.agentId, contextSnapshot)) {
+      return { issueId, facts, decision: { stale: true as const,
+        errorCode: "issue_preparation_turn_changed" as const,
+        reason: "Cancelled because the preparation turn changed or its wake lacks the current turn binding",
+        details: { issueId },
+      } };
+    }
     return { issueId, facts, decision: decideQueuedRunStaleness(facts, now) };
   }
 

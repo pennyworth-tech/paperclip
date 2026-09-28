@@ -537,6 +537,7 @@ export async function prepareCommandManagedRuntime(input: {
   spec: CommandManagedRuntimeSpec;
   adapterKey: string;
   workspaceLocalDir: string;
+  gitHistoryDepth?: number;
   workspaceRemoteDir?: string;
   syncWorkspace?: boolean;
   workspaceInboundMode?: WorkspaceInboundMode;
@@ -602,6 +603,7 @@ export async function prepareCommandManagedRuntime(input: {
           client,
           adapterKey: input.adapterKey,
           workspaceLocalDir: input.workspaceLocalDir,
+          gitHistoryDepth: input.gitHistoryDepth,
           workspaceRemoteDir,
           syncWorkspace: input.syncWorkspace,
           workspaceInboundMode: input.workspaceInboundMode,
@@ -645,6 +647,7 @@ export async function prepareCommandManagedRuntime(input: {
     client,
     adapterKey: input.adapterKey,
     workspaceLocalDir: input.workspaceLocalDir,
+    gitHistoryDepth: input.gitHistoryDepth,
     workspaceRemoteDir,
     syncWorkspace: input.syncWorkspace,
     workspaceInboundMode: input.workspaceInboundMode,

@@ -49,6 +49,8 @@
 // Main factory
 // ---------------------------------------------------------------------------
 
+export type * from "./pipeline-authoring-types.js";
+export type * from "./workspace-revision-types.js";
 export { definePlugin } from "./define-plugin.js";
 export { createTestHarness, createEnvironmentTestHarness, createFakeEnvironmentDriver, filterEnvironmentEvents, assertEnvironmentEventOrder, assertLeaseLifecycle, assertWorkspaceRealizationLifecycle, assertExecutionLifecycle, assertEnvironmentError } from "./testing.js";
 export { createPluginBundlerPresets } from "./bundlers.js";
@@ -259,6 +261,9 @@ export type {
   PluginIssueCheckoutOwnership,
   PluginPipelinesClient,
   PluginPipelineCase,
+  PluginPipelineStageEvidence,
+  PluginPipelineCaseDocument,
+  PluginPipelineCaseDocumentWrite,
   PluginPipelineCaseIssueLink,
   PluginPipelineReviewDecision,
   PluginPipelineReviewResult,

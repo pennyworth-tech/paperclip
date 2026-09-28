@@ -303,6 +303,8 @@ import {
 import { reportRunFailure } from "./run-failure-report.js";
 import { companySkillService } from "./company-skills.js";
 import { budgetService, type BudgetEnforcementScope } from "./budgets.js";
+import { caseWorkRunClaimCondition } from "./pipeline-case-work-execution.js";
+import { withSourceWriteClaimGuard, lockSourceWriteClaim, isSourceWriteClaimDeferred } from "./workspace-source-write-guard.js";
 import { secretService, type MissingRuntimeBinding } from "./secrets.js";
 import {
   resolveDefaultAgentWorkspaceDir,
@@ -16913,7 +16915,15 @@ export function heartbeatService(
     const issueId = readNonEmptyString(
       parseObject(run.contextSnapshot).issueId,
     );
-    if (!issueId || run.invocationSource !== "automation") return onClear(db);
+    if (!issueId || run.invocationSource !== "automation") {
+      if (stage !== "claim" || !issueId) return onClear(db);
+      try {
+        return await withSourceWriteClaimGuard(db, run.companyId, issueId, (tx) => onClear(tx as Db));
+      } catch (error) {
+        if (isSourceWriteClaimDeferred(error)) return null;
+        throw error;
+      }
+    }
     await options.beforeChatControlRecoveryCheck?.({
       runId: run.id,
       issueId,
@@ -16954,6 +16964,7 @@ export function heartbeatService(
     try {
       const attempt = () => db.transaction(async (tx) => {
         terminal = null;
+        if (stage === "claim") await lockSourceWriteClaim(tx, run.companyId, issueId);
         // Same queue-edit lock order, then the close committer's conversation
         // row. NOWAIT releases partial locks on contention. Claim defers to the
         // queue; dispatch retries this transaction before considering failure.
@@ -17142,6 +17153,7 @@ export function heartbeatService(
       }
       return result;
     } catch (error) {
+      if (stage === "claim" && isSourceWriteClaimDeferred(error)) return null;
       if (!isExternalChatWaitAuthorizationContention(error)) throw error;
       if (stage === "dispatch") {
         // No effect was admitted. Let the existing setup-failure path settle
@@ -17324,6 +17336,7 @@ export function heartbeatService(
       issueId && run.wakeupRequestId && queuedCommentIds.length > 0
         ? await db
             .transaction(async (tx) => {
+              await lockSourceWriteClaim(tx, run.companyId, issueId);
               // Match the queue-edit lock order: issue, wake, then run. Once the
               // run becomes running, a concurrent discard must observe the
               // claimed wake and return an explicit conflict; if discard wins,
@@ -17485,6 +17498,7 @@ export function heartbeatService(
                     and(
                       eq(heartbeatRuns.id, lockedRun.id),
                       eq(heartbeatRuns.status, "queued"),
+                    issueId ? caseWorkRunClaimCondition(run.companyId, issueId, run.agentId, context) : undefined,
                     ),
                   )
                   .returning();
@@ -17587,6 +17601,7 @@ export function heartbeatService(
                   and(
                     eq(heartbeatRuns.id, lockedRun.id),
                     eq(heartbeatRuns.status, "queued"),
+                    issueId ? caseWorkRunClaimCondition(run.companyId, issueId, run.agentId, context) : undefined,
                   ),
                 )
                 .returning();
@@ -17595,7 +17610,7 @@ export function heartbeatService(
                 : { kind: "stale" as const, run: null };
             })
             .catch((error) => {
-              if (isExternalChatWaitAuthorizationContention(error))
+              if (isExternalChatWaitAuthorizationContention(error) || isSourceWriteClaimDeferred(error))
                 return { kind: "stale" as const, run: null };
               throw error;
             })
@@ -17651,6 +17666,7 @@ export function heartbeatService(
               and(
                 eq(heartbeatRuns.id, run.id),
                 eq(heartbeatRuns.status, "queued"),
+                    issueId ? caseWorkRunClaimCondition(run.companyId, issueId, run.agentId, context) : undefined,
               ),
             )
             .returning()
@@ -19679,7 +19695,7 @@ export function heartbeatService(
         // like a ready run and has to be escalated like one. Runs that genuinely
         // cannot be claimed are never escalated — the cancellation sweep below
         // is what resolves those.
-        const claimable = ready || allowsIssueInteractionWake(context);
+        const claimable = ready || allowsIssueInteractionWake(context, ISSUE_TREE_CONTROL_INTERACTION_WAKE_REASONS);
         const escalated = starvationCeilingMs > 0
           && claimable
           && selectionNowMs - run.createdAt.getTime() >= starvationCeilingMs;

@@ -210,3 +210,4 @@ export { aiProviderDefaults } from "./ai_provider_defaults.js";
 export * from "./email.js";
 export { announcementDismissals, announcementPublications } from "./announcement_dismissals.js";
 export { pipelineStageEvidence } from "./pipeline_stage_evidence.js";
+export { pipelineCaseWork, pipelineCaseWorkTurns, pipelineCaseWorkResults } from "./pipeline_case_work.js";

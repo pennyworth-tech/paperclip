@@ -1054,6 +1054,7 @@ export async function prepareSandboxManagedRuntime(input: {
   adapterKey: string;
   client: SandboxManagedRuntimeClient;
   workspaceLocalDir: string;
+  gitHistoryDepth?: number;
   workspaceRemoteDir?: string;
   syncWorkspace?: boolean;
   /** Selects authoritative host staging, exact durable-seed replay, or no-overwrite adoption. */
@@ -1352,6 +1353,7 @@ export async function prepareSandboxManagedRuntime(input: {
                   {
                     localDir: input.workspaceLocalDir,
                     snapshot: gitSnapshot,
+                    historyDepth: input.gitHistoryDepth,
                   },
                   async (cloneDir) => {
                     await createTarballFromDirectory({

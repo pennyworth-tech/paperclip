@@ -3,13 +3,14 @@ import { and, asc, desc, eq, inArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   documentAnnotationThreads, documents, pipelineCaseDocuments, pipelineCaseEvents,
-  pipelineCases, pipelineStageEvidence, pipelineStages,
+  pipelineCases, pipelineStageEvidence, pipelineStages, pipelineCaseWork,
 } from "@paperclipai/db";
 import {
   pipelineStageEvidenceInputSchema, pipelineStageEvidencePolicySchema,
   type PipelineStageEvidenceInput,
 } from "@paperclipai/shared";
 import { conflict, forbidden, notFound, unprocessable } from "../errors.js";
+import { assertCaseSourceWriteAvailable } from "./workspace-source-write-guard.js";
 
 type EvidenceDb = Db | Parameters<Parameters<Db["transaction"]>[0]>[0];
 type CaseRow = typeof pipelineCases.$inferSelect;
@@ -58,7 +59,12 @@ export async function invalidateEvidenceForDocuments(db: EvidenceDb, documentIds
 async function validatePins(db: EvidenceDb, current: CaseRow, stage: StageRow,
   evidence: Pick<EvidenceRow, "documentPins" | "prerequisiteDecisionIds" | "revisionId" | "contentDigest">,
   requireReady = true) {
+  await assertCaseSourceWriteAvailable(db, current.companyId, current.id);
   const policy = stageEvidencePolicy(stage)!;
+  const [work] = await db.select().from(pipelineCaseWork).where(eq(pipelineCaseWork.caseId, current.id));
+  if (work?.sourceRevisionId && (work.sourceRevisionId !== evidence.revisionId || work.sourceContentDigest !== evidence.contentDigest)) {
+    throw conflict("Evidence does not describe the published source revision", { code: "evidence_stale" });
+  }
   const pins = new Map(evidence.documentPins.map((pin) => [pin.key, pin.revisionId]));
   if (pins.size !== evidence.documentPins.length || (requireReady && policy.requiredDocumentKeys.some((key) => !pins.has(key)))) {
     throw conflict("Required document evidence is missing", { code: "evidence_stale" });
@@ -73,8 +79,9 @@ async function validatePins(db: EvidenceDb, current: CaseRow, stage: StageRow,
     throw conflict("Document revisions changed since evidence was prepared", { code: "evidence_stale" });
   }
   const [blocker] = await db.select({ id: documentAnnotationThreads.id }).from(documentAnnotationThreads)
+    .innerJoin(pipelineCaseDocuments, and(eq(pipelineCaseDocuments.documentId, documentAnnotationThreads.documentId),
+      eq(pipelineCaseDocuments.companyId, current.companyId), eq(pipelineCaseDocuments.caseId, current.id)))
     .where(and(eq(documentAnnotationThreads.companyId, current.companyId),
-      inArray(documentAnnotationThreads.documentId, rows.map((row) => row.document.id)),
       eq(documentAnnotationThreads.blocking, true), eq(documentAnnotationThreads.status, "open"))).limit(1);
   if (requireReady && blocker) throw conflict("Blocking feedback must be resolved before approval", { code: "blocking_feedback" });
 

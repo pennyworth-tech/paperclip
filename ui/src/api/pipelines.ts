@@ -1,5 +1,11 @@
 import type {
   Issue,
+  CreatePipelineAnnotation,
+  UpdatePipelineAnnotation,
+  ReanchorPipelineAnnotation,
+  DocumentAnnotationThread,
+  DocumentAnnotationThreadWithComments,
+  DocumentAnnotationComment,
   PipelineAutomationRetryCleanupOptions,
   PipelineAutomationRetryPlan,
   PipelineAutomationRetryScope,
@@ -524,6 +530,18 @@ export const pipelinesApi = {
     }>(`/pipelines/${pipelineId}/documents/${encodeURIComponent(key)}/revisions/${revisionId}/restore`, {}),
   getCaseDocument: (caseId: string, key: string) =>
     api.get<PipelineCaseDocumentPayload>(`/cases/${caseId}/documents/${encodeURIComponent(key)}`),
+  listCaseAnnotations: (caseId: string, key: string) =>
+    api.get<DocumentAnnotationThreadWithComments[]>(`/cases/${caseId}/documents/${encodeURIComponent(key)}/annotations`),
+  listAllCaseAnnotations: (caseId: string) =>
+    api.get<Array<DocumentAnnotationThreadWithComments & { caseDocumentKey: string; sourceTitle: string | null }>>(`/cases/${caseId}/annotations`),
+  createCaseAnnotation: (caseId: string, key: string, data: CreatePipelineAnnotation) =>
+    api.post<DocumentAnnotationThreadWithComments>(`/cases/${caseId}/documents/${encodeURIComponent(key)}/annotations`, data),
+  replyToCaseAnnotation: (caseId: string, key: string, threadId: string, body: string) =>
+    api.post<DocumentAnnotationComment>(`/cases/${caseId}/documents/${encodeURIComponent(key)}/annotations/${threadId}/comments`, { body }),
+  updateCaseAnnotation: (caseId: string, key: string, threadId: string, data: UpdatePipelineAnnotation) =>
+    api.patch<DocumentAnnotationThread>(`/cases/${caseId}/documents/${encodeURIComponent(key)}/annotations/${threadId}`, data),
+  reanchorCaseAnnotation: (caseId: string, key: string, threadId: string, data: ReanchorPipelineAnnotation) =>
+    api.post<DocumentAnnotationThread>(`/cases/${caseId}/documents/${encodeURIComponent(key)}/annotations/${threadId}/reanchor`, data),
   upsertCaseDocument: (
     caseId: string,
     key: string,

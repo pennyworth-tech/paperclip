@@ -25,6 +25,9 @@ import {
   type SQL,
 } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
+import { assertCaseWorkIssuePatch } from "./pipeline-case-work.js";
+import { assertCaseWorkCheckout } from "./pipeline-case-work-execution.js";
+import { lockIssueSourceWorkspaces, withSourceWriteClaimGuard } from "./workspace-source-write-guard.js";
 import {
   activityLog,
   chatActions,
@@ -2077,7 +2080,6 @@ function executionHolderIsReleasable(
 export const STALE_RUN_LOCK_AGE_OUT_MS = 2 * 60 * 60 * 1000;
 export const STALE_RUN_LOCK_AGE_OUT_ERROR_CODE = "stale_execution_lock_aged_out";
 
-type DbTransaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
 
 type RunLivenessRow = {
   id: string;
@@ -11100,6 +11102,8 @@ export function issueService(db: Db) {
       }
 
       const runUpdate = async (tx: any) => {
+        await lockIssueSourceWorkspaces(tx, existing.companyId, id, issueData.executionWorkspaceId);
+        await assertCaseWorkIssuePatch(tx, existing.companyId, id, issueData);
         // The receipt baseline must be read under the same row lock as the
         // write. Otherwise a concurrent update can be mistaken for a change
         // made by this request.
@@ -11563,6 +11567,8 @@ export function issueService(db: Db) {
         kind: "work",
       });
 
+      return withSourceWriteClaimGuard(db, issueCompany.companyId, id, async (guardTx) => {
+      await assertCaseWorkCheckout(guardTx, issueCompany.companyId, id, agentId, checkoutRunId);
       const now = new Date();
       const activePauseHold = await treeControlSvc.getActivePauseHoldGate(
         issueCompany.companyId,
@@ -11837,13 +11843,14 @@ export function issueService(db: Db) {
           ? terminalActorRunRefusal(checkoutRunId, actorRunAtConflict.status)
           : {}),
       });
+      });
     },
 
-    assertCheckoutOwner: async (
-      id: string,
-      actorAgentId: string,
-      actorRunId: string | null,
-    ) => {
+    assertCheckoutOwner: async (id: string, actorAgentId: string, actorRunId: string | null) => {
+      const [binding] = await db.select({ companyId: issues.companyId }).from(issues).where(eq(issues.id, id));
+      if (!binding) throw notFound("Issue not found");
+      return withSourceWriteClaimGuard(db, binding.companyId, id, async (guardTx) => {
+      await assertCaseWorkCheckout(guardTx, binding.companyId, id, actorAgentId, actorRunId);
       await clearExecutionRunIfTerminal(id);
       await clearCheckoutRunIfTerminal(id);
       const loadCurrent = () =>
@@ -12003,6 +12010,7 @@ export function issueService(db: Db) {
         actorAgentId,
         actorRunId,
         ...terminalActorDetails,
+      });
       });
     },
 
