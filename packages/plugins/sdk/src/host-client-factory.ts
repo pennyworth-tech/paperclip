@@ -262,6 +262,7 @@ export interface HostServices {
 
   /** Provides `pipelines.cases.get`, `pipelines.cases.createReviewLink`, `pipelines.cases.review`, and the case-document pair. */
   pipelines: {
+    publishEvidence(params: WorkerToHostMethods["pipelines.cases.publishEvidence"][0]): Promise<WorkerToHostMethods["pipelines.cases.publishEvidence"][1]>;
     getCase(params: WorkerToHostMethods["pipelines.cases.get"][0]): Promise<WorkerToHostMethods["pipelines.cases.get"][1]>;
     createReviewLink(params: WorkerToHostMethods["pipelines.cases.createReviewLink"][0]): Promise<WorkerToHostMethods["pipelines.cases.createReviewLink"][1]>;
     reviewCase(params: WorkerToHostMethods["pipelines.cases.review"][0]): Promise<WorkerToHostMethods["pipelines.cases.review"][1]>;
@@ -493,6 +494,7 @@ const METHOD_CAPABILITY_MAP: Record<WorkerToHostMethodName, PluginCapability | n
   "pipelines.cases.putDocument": "pipeline.cases.documents.write",
   "pipelines.cases.createReviewLink": "pipeline.cases.links.write",
   "pipelines.cases.review": "pipeline.cases.review",
+  "pipelines.cases.publishEvidence": "pipeline.cases.evidence.write",
 
   // Issue Documents
   "issues.documents.list": "issue.documents.read",
@@ -973,6 +975,9 @@ export function createHostClientHandlers(
     }),
 
     // Pipelines
+    "pipelines.cases.publishEvidence": gated("pipelines.cases.publishEvidence", async (params) => {
+      return services.pipelines.publishEvidence(params);
+    }),
     "pipelines.cases.get": gated("pipelines.cases.get", async (params) => {
       return services.pipelines.getCase(params);
     }),

@@ -2055,6 +2055,10 @@ export function createTestHarness(options: TestHarnessOptions): TestHarness {
       },
     },
     pipelines: {
+      async publishEvidence() {
+        requireCapability(manifest, capabilitySet, "pipeline.cases.evidence.write");
+        throw new Error("Stage evidence requires the real host storage test harness");
+      },
       async getCase(caseId, companyId) {
         requireCapability(manifest, capabilitySet, "pipeline.cases.read");
         const pipelineCase = pipelineCases.get(caseId);

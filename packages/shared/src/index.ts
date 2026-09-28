@@ -2592,3 +2592,5 @@ export {
   isPaperclipDevRunnerCommand,
   rewriteUrlHostToLoopback,
 } from "./runtime-exposure/loopback-bind.js";
+export { pipelineStageEvidencePolicySchema, pipelineStageEvidenceInputSchema } from "./validators/pipeline.js";
+export type { PipelineStageEvidencePolicy, PipelineStageEvidenceInput } from "./validators/pipeline.js";

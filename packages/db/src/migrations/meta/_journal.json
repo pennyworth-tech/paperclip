@@ -1611,6 +1611,13 @@
       "when": 1789593449416,
       "tag": "0231_case_issue_link_review_role",
       "breakpoints": true
+    },
+    {
+      "idx": 232,
+      "version": "7",
+      "when": 1790572029553,
+      "tag": "0232_natural_joystick",
+      "breakpoints": true
     }
   ]
 }

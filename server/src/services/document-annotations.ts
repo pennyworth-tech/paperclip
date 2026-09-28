@@ -23,6 +23,7 @@ import {
   UpdateDocumentAnnotationThread,
 } from "@paperclipai/shared";
 import { conflict, notFound, unprocessable } from "../errors.js";
+import { invalidateEvidenceForDocuments } from "./pipeline-stage-evidence.js";
 
 type ActorInput = {
   actorType: "agent" | "user";
@@ -64,6 +65,9 @@ type CaseDocumentRow = {
 
 const threadSelect = {
   id: documentAnnotationThreads.id,
+  blocking: documentAnnotationThreads.blocking,
+  sourceLocator: documentAnnotationThreads.sourceLocator,
+  resolutionDisposition: documentAnnotationThreads.resolutionDisposition,
   companyId: documentAnnotationThreads.companyId,
   issueId: documentAnnotationThreads.issueId,
   routineId: documentAnnotationThreads.routineId,
@@ -414,6 +418,8 @@ export function documentAnnotationService(db: Db) {
       input: CreateDocumentAnnotationThread,
       actor: ActorInput,
     ) => db.transaction(async (tx) => {
+      const base = await getIssueDocument(issueId, key, tx);
+      if (base && input.blocking) await invalidateEvidenceForDocuments(tx, [base.documentId]);
       await tx.execute(sql`
         select ${documents.id}
         from ${issueDocuments}
@@ -453,6 +459,8 @@ export function documentAnnotationService(db: Db) {
           documentId: doc.documentId,
           documentKey: doc.documentKey,
           status: "open",
+          blocking: input.blocking ?? false,
+          sourceLocator: input.sourceLocator ?? null,
           anchorState: "active",
           anchorConfidence: "exact",
           originalRevisionId: doc.latestRevisionId,
@@ -501,6 +509,8 @@ export function documentAnnotationService(db: Db) {
       input: CreateDocumentAnnotationThread,
       actor: ActorInput,
     ) => db.transaction(async (tx) => {
+      const base = await getRoutineDocument(routineId, key, tx);
+      if (base && input.blocking) await invalidateEvidenceForDocuments(tx, [base.documentId]);
       await tx.execute(sql`
         select ${documents.id}
         from ${routineDocuments}
@@ -540,6 +550,8 @@ export function documentAnnotationService(db: Db) {
           documentId: doc.documentId,
           documentKey: doc.documentKey,
           status: "open",
+          blocking: input.blocking ?? false,
+          sourceLocator: input.sourceLocator ?? null,
           anchorState: "active",
           anchorConfidence: "exact",
           originalRevisionId: doc.latestRevisionId,
@@ -589,6 +601,8 @@ export function documentAnnotationService(db: Db) {
       input: CreateDocumentAnnotationThread,
       actor: ActorInput,
     ) => db.transaction(async (tx) => {
+      const base = await getCaseDocument(caseId, key, tx);
+      if (base && input.blocking) await invalidateEvidenceForDocuments(tx, [base.documentId]);
       await tx.execute(sql`
         select ${documents.id}
         from ${caseDocuments}
@@ -629,6 +643,8 @@ export function documentAnnotationService(db: Db) {
           documentId: doc.documentId,
           documentKey: doc.documentKey,
           status: "open",
+          blocking: input.blocking ?? false,
+          sourceLocator: input.sourceLocator ?? null,
           anchorState: "active",
           anchorConfidence: "exact",
           originalRevisionId: doc.latestRevisionId,
@@ -836,6 +852,7 @@ export function documentAnnotationService(db: Db) {
             .where(and(
               inArray(documentAnnotationThreads.id, emptyThreadIds),
               eq(documentAnnotationThreads.status, "open"),
+              eq(documentAnnotationThreads.blocking, false),
             ))
             .returning({ id: documentAnnotationThreads.id });
 
@@ -858,6 +875,12 @@ export function documentAnnotationService(db: Db) {
       const thread = await getThreadForIssue(issueId, key, threadId, tx);
       if (!thread) throw notFound("Annotation thread not found");
       if (!input.status || input.status === thread.status) return thread;
+      if (thread.blocking) {
+        if (input.status === "resolved" && !input.resolutionDisposition?.trim()) {
+          throw unprocessable("Resolving blocking feedback requires a disposition");
+        }
+        await invalidateEvidenceForDocuments(tx, [thread.documentId]);
+      }
 
       const now = new Date();
       const [updated] = await tx
@@ -866,6 +889,7 @@ export function documentAnnotationService(db: Db) {
           ? {
             status: "resolved",
             resolvedByAgentId: actor.agentId ?? null,
+            resolutionDisposition: input.resolutionDisposition ?? null,
             resolvedByUserId: actor.userId ?? null,
             resolvedAt: now,
             updatedAt: now,
@@ -873,6 +897,7 @@ export function documentAnnotationService(db: Db) {
           : {
             status: "open",
             resolvedByAgentId: null,
+            resolutionDisposition: null,
             resolvedByUserId: null,
             resolvedAt: null,
             updatedAt: now,
@@ -894,6 +919,12 @@ export function documentAnnotationService(db: Db) {
       const thread = await getThreadForRoutine(routineId, key, threadId, doc.companyId, doc.documentId, tx);
       if (!thread) throw notFound("Annotation thread not found");
       if (!input.status || input.status === thread.status) return thread;
+      if (thread.blocking) {
+        if (input.status === "resolved" && !input.resolutionDisposition?.trim()) {
+          throw unprocessable("Resolving blocking feedback requires a disposition");
+        }
+        await invalidateEvidenceForDocuments(tx, [thread.documentId]);
+      }
 
       const now = new Date();
       const [updated] = await tx
@@ -902,6 +933,7 @@ export function documentAnnotationService(db: Db) {
           ? {
             status: "resolved",
             resolvedByAgentId: actor.agentId ?? null,
+            resolutionDisposition: input.resolutionDisposition ?? null,
             resolvedByUserId: actor.userId ?? null,
             resolvedAt: now,
             updatedAt: now,
@@ -909,6 +941,7 @@ export function documentAnnotationService(db: Db) {
           : {
             status: "open",
             resolvedByAgentId: null,
+            resolutionDisposition: null,
             resolvedByUserId: null,
             resolvedAt: null,
             updatedAt: now,
@@ -930,6 +963,12 @@ export function documentAnnotationService(db: Db) {
       const thread = await getThreadForCase(caseId, key, threadId, doc.companyId, doc.documentId, tx);
       if (!thread) throw notFound("Annotation thread not found");
       if (!input.status || input.status === thread.status) return thread;
+      if (thread.blocking) {
+        if (input.status === "resolved" && !input.resolutionDisposition?.trim()) {
+          throw unprocessable("Resolving blocking feedback requires a disposition");
+        }
+        await invalidateEvidenceForDocuments(tx, [thread.documentId]);
+      }
 
       const now = new Date();
       const [updated] = await tx
@@ -938,6 +977,7 @@ export function documentAnnotationService(db: Db) {
           ? {
             status: "resolved",
             resolvedByAgentId: actor.agentId ?? null,
+            resolutionDisposition: input.resolutionDisposition ?? null,
             resolvedByUserId: actor.userId ?? null,
             resolvedAt: now,
             updatedAt: now,
@@ -945,6 +985,7 @@ export function documentAnnotationService(db: Db) {
           : {
             status: "open",
             resolvedByAgentId: null,
+            resolutionDisposition: null,
             resolvedByUserId: null,
             resolvedAt: null,
             updatedAt: now,

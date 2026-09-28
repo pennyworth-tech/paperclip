@@ -64,6 +64,9 @@ export interface DocumentAnnotationThread {
   documentId: string;
   documentKey: string;
   status: DocumentAnnotationThreadStatus;
+  blocking?: boolean;
+  sourceLocator?: Record<string, unknown> | null;
+  resolutionDisposition?: string | null;
   anchorState: DocumentAnnotationAnchorState;
   anchorConfidence: DocumentAnnotationAnchorConfidence;
   originalRevisionId: string | null;

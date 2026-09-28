@@ -178,6 +178,7 @@ const releaseCaseSchema = z.object({
   force: z.boolean().optional(),
 });
 const transitionCaseSchema = z.object({
+  evidenceId: z.string().guid().nullable().optional(),
   toStageKey: z.string().trim().min(1).max(120),
   expectedVersion: z.number().int().positive(),
   leaseToken: z.string().guid().nullable().optional(),
@@ -211,6 +212,7 @@ const reviewEditsSchema = z.object({
   parentCaseId: z.string().guid().nullable().optional(),
 });
 const reviewCaseSchema = z.object({
+  evidenceId: z.string().guid().nullable().optional(),
   decision: z.enum(["approve", "reject", "request_changes"]),
   reason: z.string().max(4_000).nullable().optional(),
   edits: reviewEditsSchema.optional(),
@@ -1536,6 +1538,7 @@ export function pipelineRoutes(db: Db, options: Parameters<typeof pipelineServic
     const actor = actorForMutation(req);
 
     const result = await db.transaction(async (tx) => {
+      await lockEvidenceCase(tx, companyId, caseId);
       const existing = await tx
         .select({ link: pipelineCaseDocuments, document: documents, revision: documentRevisions })
         .from(pipelineCaseDocuments)
@@ -1549,6 +1552,8 @@ export function pipelineRoutes(db: Db, options: Parameters<typeof pipelineServic
         .limit(1)
         .then((rows) => rows[0] ?? null);
       if (!existing) throw notFound("Pipeline case document not found");
+
+      await invalidateEvidenceForDocuments(tx, [existing.document.id]);
 
       const sourceRevision = await tx
         .select()
@@ -1696,6 +1701,7 @@ export function pipelineRoutes(db: Db, options: Parameters<typeof pipelineServic
       caseId,
       toStageKey: req.body.toStageKey,
       expectedVersion: req.body.expectedVersion,
+      evidenceId: req.body.evidenceId,
       leaseToken: req.body.leaseToken,
       reason: req.body.reason,
       force: req.body.force,
@@ -2657,3 +2663,4 @@ async function getChildOutcomeSummaries(db: Db, companyId: string, caseId: strin
     };
   });
 }
+import { invalidateEvidenceForDocuments, lockEvidenceCase } from "../services/pipeline-stage-evidence.js";

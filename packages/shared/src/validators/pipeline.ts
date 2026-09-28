@@ -9,6 +9,31 @@ const routineVariableLikeNameSchema = z.string().trim().regex(/^[A-Za-z][A-Za-z0
 export const pipelineStageKindSchema = z.enum(["working", "review", "done", "cancelled"]);
 export const legacyPipelineStageKindSchema = z.enum(["open", "working", "review", "done", "cancelled"]);
 
+export const pipelineStageEvidencePolicySchema = z.object({
+  kind: z.string().trim().min(1).max(120),
+  producerPluginKey: z.string().trim().min(1).max(200),
+  requiredDocumentKeys: z.array(z.string().trim().min(1).max(80)).min(1).max(100),
+  prerequisiteReviewStageKey: z.string().trim().min(1).max(120).optional(),
+}).strict();
+
+export const pipelineStageEvidenceInputSchema = z.object({
+  expectedVersion: z.number().int().positive(),
+  requestKey: z.string().trim().min(1).max(200),
+  kind: z.string().trim().min(1).max(120),
+  revisionId: z.string().trim().min(1).max(200),
+  contentDigest: z.string().regex(/^[a-f0-9]{64}$/),
+  documentPins: z.array(z.object({
+    key: z.string().trim().min(1).max(80),
+    revisionId: z.string().guid(),
+  }).strict()).min(1).max(100),
+  prerequisiteDecisionIds: z.array(z.string().guid()).max(20).default([]),
+  readiness: z.enum(["ready", "not_ready"]),
+  details: z.record(z.string(), z.unknown()).default({}),
+}).strict();
+
+export type PipelineStageEvidencePolicy = z.infer<typeof pipelineStageEvidencePolicySchema>;
+export type PipelineStageEvidenceInput = z.infer<typeof pipelineStageEvidenceInputSchema>;
+
 export const pipelineStageApproverSchema = z.object({
   kind: z.enum(["any_human", "user", "agent", "linked_reviewer"]).optional().default("any_human"),
   id: z.string().trim().min(1).max(200).optional(),
@@ -113,6 +138,9 @@ export const pipelineStageConfigSchema = z.object({
   requireRequestChangesReason: z.boolean().optional(),
   requireChildrenTerminal: z.boolean().optional(),
   requireNoUnresolvedDrift: z.boolean().optional(),
+  evidencePolicy: pipelineStageEvidencePolicySchema.optional(),
+  // Guards entry as well as exit: even a forced move cannot skip this review.
+  requireApprovedEntryFromStageKey: z.string().trim().min(1).max(120).optional(),
 }).passthrough().superRefine((value, ctx) => {
   const keys = new Set<string>();
   value.variables.forEach((variable, index) => {

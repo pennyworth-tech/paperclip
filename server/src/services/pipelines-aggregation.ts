@@ -47,6 +47,7 @@ function caseDisplay(row: { case: CaseRow; stage: StageRow; pipeline: PipelineRo
     title: row.case.title,
     summary: row.case.summary,
     version: row.case.version,
+    stageEvidenceId: row.case.stageEvidenceId,
     terminalKind: row.case.terminalKind,
     parentCaseId: row.case.parentCaseId,
     updatedAt: row.case.updatedAt,

@@ -5,7 +5,7 @@ import type {
   DocumentAnnotationThreadStatus,
 } from "@paperclipai/shared";
 import { sql } from "drizzle-orm";
-import { check, index, integer, jsonb, pgTable, text, timestamp, uuid } from "drizzle-orm/pg-core";
+import { boolean, check, index, integer, jsonb, pgTable, text, timestamp, uuid } from "drizzle-orm/pg-core";
 import { agents } from "./agents.js";
 import { companies } from "./companies.js";
 import { documentRevisions } from "./document_revisions.js";
@@ -25,6 +25,9 @@ export const documentAnnotationThreads = pgTable(
     documentId: uuid("document_id").notNull().references(() => documents.id, { onDelete: "cascade" }),
     documentKey: text("document_key").notNull(),
     status: text("status").$type<DocumentAnnotationThreadStatus>().notNull().default("open"),
+    blocking: boolean("blocking").notNull().default(false),
+    sourceLocator: jsonb("source_locator").$type<Record<string, unknown>>(),
+    resolutionDisposition: text("resolution_disposition"),
     anchorState: text("anchor_state").$type<DocumentAnnotationAnchorState>().notNull().default("active"),
     originalRevisionId: uuid("original_revision_id").references(() => documentRevisions.id, { onDelete: "set null" }),
     originalRevisionNumber: integer("original_revision_number").notNull(),
