@@ -527,7 +527,11 @@ jobs:
         run: pnpm install --frozen-lockfile
 
       - name: Install Linux process confinement
-        run: sudo apt-get update && sudo apt-get install -y bubblewrap
+        if: matrix.group == 'general-workspaces-b'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap
+          bwrap --ro-bind / / --unshare-pid --unshare-ipc --unshare-uts -- /bin/true
 
       - name: Run grouped general test suites
         run: |
