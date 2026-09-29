@@ -46,7 +46,7 @@ function editOpenSpec(input: SourceEditProgramInput, inspectTree: typeof inspect
     if (fs.realpathSync(git(["rev-parse", "--show-toplevel"]).trim()) !== fs.realpathSync(root)) fail("workspace_root_mismatch");
     if (git(["symbolic-ref", "--short", "HEAD"]).trim() !== input.branch) fail("branch_mismatch");
     if (git(["config", "--get", "remote.origin.url"]).trim() !== input.repositorySsh) fail("repository_mismatch");
-    const transport = cp.spawnSync("git", ["config", "--get-regexp", "^(url\\..*\\.(insteadof|pushinsteadof)|remote\\.origin\\.(proxy|pushurl))$"], { cwd: root, env, encoding: "utf8" });
+    const transport = cp.spawnSync("git", ["config", "--get-regexp", "^(core\\.sshcommand|url\\..*\\.(insteadof|pushinsteadof)|remote\\.origin\\.(proxy|pushurl))$"], { cwd: root, env, encoding: "utf8" });
     if (transport.stdout?.trim()) fail("git_transport_override");
     const requestDigest = hash(JSON.stringify({ operationId: input.operationId, commitSha: input.commitSha,
       repositorySsh: input.repositorySsh, branch: input.branch, changeId: input.changeId,
