@@ -809,6 +809,7 @@ describe("runChildProcess — child env allowlist boundary", () => {
         ...extra,
       },
     );
+    expect(result.exitCode, result.stderr).toBe(0);
     return JSON.parse(result.stdout) as Record<string, string>;
   }
 
