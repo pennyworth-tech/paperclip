@@ -954,7 +954,7 @@ describe("runChildProcess — child env allowlist boundary", () => {
   // `runChildProcess` itself is already tested with elsewhere in this file.
   async function readChildEnv(
     env: Record<string, string>,
-    extra: { localProcessSandbox?: LocalProcessSandboxOptions } = {},
+    extra: { cwd?: string; localProcessSandbox?: LocalProcessSandboxOptions } = {},
   ): Promise<Record<string, string>> {
     const result = await runChildProcess(
       randomUUID(),
@@ -1102,6 +1102,7 @@ describe("runChildProcess — child env allowlist boundary", () => {
         const childEnv = await readChildEnv(
           {},
           {
+            cwd: workspace,
             localProcessSandbox: {
               workspaceDir: workspace,
               filesystemScope: "workspace",
