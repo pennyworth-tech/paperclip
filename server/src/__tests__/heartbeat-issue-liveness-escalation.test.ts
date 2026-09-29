@@ -21,6 +21,10 @@ import {
   issueTreeHoldMembers,
   issueTreeHolds,
   issues,
+  pipelineCaseIssueLinks,
+  pipelineCases,
+  pipelineStages,
+  pipelines,
   projects,
   projectWorkspaces,
   workspaceOperations,
@@ -431,6 +435,98 @@ describeEmbeddedPostgres("heartbeat resolved dependency wake reconciliation", ()
         expect.objectContaining({ id: "choose_review_path", label: "Choose review path" }),
       ]),
     });
+  });
+
+  it("treats an active origin pipeline case link as a maintained review path", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const issueId = randomUUID();
+    const pipelineId = randomUUID();
+    const stageId = randomUUID();
+    const caseId = randomUUID();
+    const linkId = randomUUID();
+    const issuePrefix = `P${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Pipeline Review Co",
+      issuePrefix,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "Producer",
+      role: "engineer",
+      status: "idle",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: { heartbeat: { wakeOnDemand: false } },
+      permissions: {},
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Delivered PR parked on the merge pipeline",
+      status: "in_review",
+      priority: "medium",
+      assigneeAgentId: agentId,
+      issueNumber: 1,
+      identifier: `${issuePrefix}-1`,
+    });
+    await db.insert(pipelines).values({
+      id: pipelineId,
+      companyId,
+      key: "merge-queue",
+      name: "Merge queue",
+    });
+    await db.insert(pipelineStages).values({
+      id: stageId,
+      pipelineId,
+      key: "review",
+      name: "Review",
+      kind: "review",
+      position: 1,
+    });
+    await db.insert(pipelineCases).values({
+      id: caseId,
+      companyId,
+      pipelineId,
+      stageId,
+      caseKey: "pr-1",
+      title: "PR #1",
+    });
+    await db.insert(pipelineCaseIssueLinks).values({
+      id: linkId,
+      companyId,
+      caseId,
+      issueId,
+      role: "origin",
+    });
+
+    const reviewInput = [{ id: issueId, companyId, status: "in_review" }];
+    const covered = await issueService(db).listReviewAttention(companyId, reviewInput);
+    expect(covered.get(issueId)).toMatchObject({
+      state: "covered",
+      paths: [expect.objectContaining({ kind: "pipeline_case", label: "Active pipeline case", ref: caseId })],
+    });
+
+    // A non-origin link role does not stand in for the pipeline's review.
+    await db.update(pipelineCaseIssueLinks).set({ role: "work" }).where(eq(pipelineCaseIssueLinks.id, linkId));
+    const workLinked = await issueService(db).listReviewAttention(companyId, reviewInput);
+    expect(workLinked.get(issueId)).toMatchObject({ state: "stalled", paths: [] });
+    await db.update(pipelineCaseIssueLinks).set({ role: "origin" }).where(eq(pipelineCaseIssueLinks.id, linkId));
+
+    // A retired link no longer covers the review.
+    await db.update(pipelineCaseIssueLinks).set({ retiredAt: new Date() }).where(eq(pipelineCaseIssueLinks.id, linkId));
+    const retired = await issueService(db).listReviewAttention(companyId, reviewInput);
+    expect(retired.get(issueId)).toMatchObject({ state: "stalled", paths: [] });
+    await db.update(pipelineCaseIssueLinks).set({ retiredAt: null }).where(eq(pipelineCaseIssueLinks.id, linkId));
+
+    // Neither does a case that reached a terminal stage.
+    await db.update(pipelineCases).set({ terminalKind: "done", terminalAt: new Date() }).where(eq(pipelineCases.id, caseId));
+    const terminal = await issueService(db).listReviewAttention(companyId, reviewInput);
+    expect(terminal.get(issueId)).toMatchObject({ state: "stalled", paths: [] });
+
   });
 
   it("keeps resolved dependency wake reconciliation active", async () => {

@@ -51,7 +51,15 @@ const mockDbSelectWhere = vi.hoisted(() => vi.fn(() => ({
       permissions: null,
     }]).then(onFulfilled, onRejected),
 })));
-const mockDbSelectFrom = vi.hoisted(() => vi.fn(() => ({ where: mockDbSelectWhere })));
+const mockCaseLinkRows = vi.hoisted(() => ({ rows: [] as unknown[] }));
+const mockDbSelectInnerJoin = vi.hoisted(() => vi.fn(() => ({
+  where: () => ({
+    limit: () => Promise.resolve(mockCaseLinkRows.rows),
+    then: (onFulfilled: (rows: unknown[]) => unknown, onRejected?: (reason: unknown) => unknown) =>
+      Promise.resolve(mockCaseLinkRows.rows).then(onFulfilled, onRejected),
+  }),
+})));
+const mockDbSelectFrom = vi.hoisted(() => vi.fn(() => ({ where: mockDbSelectWhere, innerJoin: mockDbSelectInnerJoin })));
 const mockDbSelect = vi.hoisted(() => vi.fn(() => ({ from: mockDbSelectFrom })));
 const mockDb = vi.hoisted(() => ({
   select: mockDbSelect,
@@ -210,7 +218,15 @@ describe("issue execution policy routes", () => {
     mockIssueThreadInteractionService.expireRequestConfirmationsSupersededByComment.mockResolvedValue([]);
     mockIssueApprovalService.listApprovalsForIssue.mockResolvedValue([]);
     mockDbSelect.mockImplementation(() => ({ from: mockDbSelectFrom }));
-    mockDbSelectFrom.mockImplementation(() => ({ where: mockDbSelectWhere }));
+    mockDbSelectFrom.mockImplementation(() => ({ where: mockDbSelectWhere, innerJoin: mockDbSelectInnerJoin }));
+    mockDbSelectInnerJoin.mockImplementation(() => ({
+      where: () => ({
+        limit: () => Promise.resolve(mockCaseLinkRows.rows),
+        then: (onFulfilled: (rows: unknown[]) => unknown, onRejected?: (reason: unknown) => unknown) =>
+          Promise.resolve(mockCaseLinkRows.rows).then(onFulfilled, onRejected),
+      }),
+    }));
+    mockCaseLinkRows.rows = [];
     mockDbSelectWhere.mockImplementation(() => ({
       for: () => ({
         then: (onFulfilled: (rows: unknown[]) => unknown, onRejected?: (reason: unknown) => unknown) =>
@@ -334,7 +350,46 @@ describe("issue execution policy routes", () => {
       code: "invalid_issue_disposition",
       missing: "review_path",
     });
+    expect(res.body.details.validReviewPaths).toContain("linked_active_pipeline_case");
     expect(mockIssueService.update).not.toHaveBeenCalled();
+  });
+
+  it("allows an agent-authored in_review transition when the issue is the origin of an active pipeline case", async () => {
+    const issue = {
+      id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      companyId: "company-1",
+      status: "todo",
+      assigneeAgentId: "33333333-3333-4333-8333-333333333333",
+      assigneeUserId: null,
+      createdByUserId: "local-board",
+      identifier: "PAP-1003",
+      title: "Delivered PR under pipeline review",
+      executionPolicy: null,
+      executionState: null,
+    };
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockCaseLinkRows.rows = [{ caseId: "44444444-4444-4444-8444-444444444444" }];
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...issue,
+      ...patch,
+      updatedAt: new Date(),
+    }));
+
+    const res = await request(await createApp({
+      type: "agent",
+      agentId: "33333333-3333-4333-8333-333333333333",
+      companyId: "company-1",
+      runId: "55555555-5555-4555-8555-555555555555",
+    }))
+      .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+      .send({ status: "in_review" });
+
+    expect(res.status).toBe(200);
+    expect(mockIssueService.update).toHaveBeenCalledWith(
+      "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      expect.objectContaining({ status: "in_review" }),
+      expect.anything(),
+    );
   });
 
   it("allows an agent-authored in_review transition with a pending confirmation interaction", async () => {

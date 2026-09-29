@@ -436,7 +436,8 @@ export type IssueReviewAttentionPathKind =
   | "human_reviewer"
   | "active_run"
   | "queued_wake"
-  | "recovery";
+  | "recovery"
+  | "pipeline_case";
 
 export interface IssueReviewAttentionPath {
   kind: IssueReviewAttentionPathKind;
