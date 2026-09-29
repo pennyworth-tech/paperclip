@@ -52,6 +52,7 @@ import type {
   ExternalObjectMentionConfidence,
   ExternalObjectMentionSourceKind,
   EnvSecretRefBinding,
+  PipelineCaseIssueLinkRole,
 } from "@paperclipai/shared";
 export type { PluginLauncherRenderContextSnapshot } from "@paperclipai/shared";
 
@@ -2108,6 +2109,17 @@ export interface WorkerToHostMethods {
       caseId: string;
       companyId: string;
       issueId: string;
+      actorAgentId?: string | null;
+      actorRunId?: string | null;
+    },
+    result: PluginPipelineCaseIssueLink,
+  ];
+  "pipelines.cases.createCaseLink": [
+    params: {
+      caseId: string;
+      companyId: string;
+      issueId: string;
+      role: PipelineCaseIssueLinkRole;
       actorAgentId?: string | null;
       actorRunId?: string | null;
     },

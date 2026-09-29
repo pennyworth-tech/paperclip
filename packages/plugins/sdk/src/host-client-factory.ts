@@ -263,7 +263,7 @@ export interface HostServices {
     decide(params: WorkerToHostMethods["approvals.decide"][0]): Promise<WorkerToHostMethods["approvals.decide"][1]>;
   };
 
-  /** Provides `pipelines.cases.get`, `pipelines.cases.createReviewLink`, `pipelines.cases.review`, and the case-document pair. */
+  /** Provides `pipelines.cases.get`, `pipelines.cases.createReviewLink`, `pipelines.cases.createCaseLink`, `pipelines.cases.review`, and the case-document pair. */
   pipelines: {
     list(params: WorkerToHostMethods["pipelines.list"][0]): Promise<WorkerToHostMethods["pipelines.list"][1]>;
     listCases(params: WorkerToHostMethods["pipelines.cases.list"][0]): Promise<WorkerToHostMethods["pipelines.cases.list"][1]>;
@@ -280,6 +280,7 @@ export interface HostServices {
     publishEvidence(params: WorkerToHostMethods["pipelines.cases.publishEvidence"][0]): Promise<WorkerToHostMethods["pipelines.cases.publishEvidence"][1]>;
     getCase(params: WorkerToHostMethods["pipelines.cases.get"][0]): Promise<WorkerToHostMethods["pipelines.cases.get"][1]>;
     createReviewLink(params: WorkerToHostMethods["pipelines.cases.createReviewLink"][0]): Promise<WorkerToHostMethods["pipelines.cases.createReviewLink"][1]>;
+    createCaseLink(params: WorkerToHostMethods["pipelines.cases.createCaseLink"][0]): Promise<WorkerToHostMethods["pipelines.cases.createCaseLink"][1]>;
     reviewCase(params: WorkerToHostMethods["pipelines.cases.review"][0]): Promise<WorkerToHostMethods["pipelines.cases.review"][1]>;
     getDocument(params: WorkerToHostMethods["pipelines.cases.getDocument"][0]): Promise<WorkerToHostMethods["pipelines.cases.getDocument"][1]>;
     putDocument(params: WorkerToHostMethods["pipelines.cases.putDocument"][0]): Promise<WorkerToHostMethods["pipelines.cases.putDocument"][1]>;
@@ -523,6 +524,7 @@ const METHOD_CAPABILITY_MAP: Record<WorkerToHostMethodName, PluginCapability | n
   "pipelines.cases.getDocument": "pipeline.cases.documents.read",
   "pipelines.cases.putDocument": "pipeline.cases.documents.write",
   "pipelines.cases.createReviewLink": "pipeline.cases.links.write",
+  "pipelines.cases.createCaseLink": "pipeline.cases.links.write",
   "pipelines.cases.review": "pipeline.cases.review",
   "pipelines.cases.publishEvidence": "pipeline.cases.evidence.write",
 
@@ -1028,6 +1030,9 @@ export function createHostClientHandlers(
     }),
     "pipelines.cases.createReviewLink": gated("pipelines.cases.createReviewLink", async (params) => {
       return services.pipelines.createReviewLink(params);
+    }),
+    "pipelines.cases.createCaseLink": gated("pipelines.cases.createCaseLink", async (params) => {
+      return services.pipelines.createCaseLink(params);
     }),
     "pipelines.cases.review": gated("pipelines.cases.review", async (params) => {
       return services.pipelines.reviewCase(params);

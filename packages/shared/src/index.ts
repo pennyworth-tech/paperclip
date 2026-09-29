@@ -2593,7 +2593,7 @@ export {
   isPaperclipDevRunnerCommand,
   rewriteUrlHostToLoopback,
 } from "./runtime-exposure/loopback-bind.js";
-export { pipelineStageEvidencePolicySchema, pipelineStageEvidenceInputSchema } from "./validators/pipeline.js";
-export type { PipelineStageEvidencePolicy, PipelineStageEvidenceInput } from "./validators/pipeline.js";
+export { pipelineStageEvidencePolicySchema, pipelineStageEvidenceInputSchema, pipelineCaseIssueLinkRoleSchema } from "./validators/pipeline.js";
+export type { PipelineStageEvidencePolicy, PipelineStageEvidenceInput, PipelineCaseIssueLinkRole } from "./validators/pipeline.js";
 export { createPipelineAnnotationSchema, updatePipelineAnnotationSchema, reanchorPipelineAnnotationSchema } from "./validators/document-annotation.js";
 export type { CreatePipelineAnnotation, UpdatePipelineAnnotation, ReanchorPipelineAnnotation } from "./validators/document-annotation.js";

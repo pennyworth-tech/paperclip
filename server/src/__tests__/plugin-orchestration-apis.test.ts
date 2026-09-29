@@ -1570,6 +1570,92 @@ describeEmbeddedPostgres("plugin orchestration APIs", () => {
       expect(await reviewDecidedCount(caseId)).toBe(0);
     });
 
+    it("links a case to a task another agent has checked out, as the system, with a chosen role", async () => {
+      const seeded = await seedLinkedReviewerCase();
+      const { companyId, caseId } = seeded;
+      const services = buildHostServices(db, "plugin-record-id", "backlit.operations", createEventBusStub());
+
+      // The producer's task: assigned to reviewer B and in progress. This is
+      // the exact shape the agent-authenticated REST route refuses for any
+      // other agent (409 while in_progress, 403 otherwise), so a plugin acting
+      // as its own agent could never attach the case to it.
+      const [producerTask] = await db.insert(issues).values({
+        companyId,
+        title: "Ship the widget",
+        status: "in_progress",
+        priority: "medium",
+        assigneeAgentId: seeded.reviewerBId,
+      }).returning();
+
+      const link = await services.pipelines.createCaseLink({
+        caseId,
+        companyId,
+        issueId: producerTask!.id,
+        role: "origin",
+      });
+      expect(link).toMatchObject({
+        caseId,
+        issueId: producerTask!.id,
+        role: "origin",
+        createdByRunId: null,
+        issueStatus: "in_progress",
+        issueAssigneeAgentId: seeded.reviewerBId,
+      });
+
+      const read = await services.pipelines.getCase({ caseId, companyId });
+      expect(read?.issueLinks).toEqual([
+        expect.objectContaining({ issueId: producerTask!.id, role: "origin", issueAssigneeAgentId: seeded.reviewerBId, retiredAt: null }),
+      ]);
+
+      // The link and its event are the system's, stamped with the plugin key
+      // and the role that was asked for.
+      const [event] = await db
+        .select()
+        .from(pipelineCaseEvents)
+        .where(and(eq(pipelineCaseEvents.caseId, caseId), eq(pipelineCaseEvents.type, "issue_linked")));
+      expect(event).toMatchObject({ actorType: "system", actorAgentId: null, runId: null });
+      expect(event!.payload).toMatchObject({ issueId: producerTask!.id, role: "origin", pluginKey: "backlit.operations" });
+
+      // A role outside the REST route's enum is refused before anything is read.
+      await expect(services.pipelines.createCaseLink({
+        caseId,
+        companyId,
+        issueId: seeded.reviewIssueId,
+        role: "sidecar",
+      } as unknown as Parameters<typeof services.pipelines.createCaseLink>[0])).rejects.toMatchObject({ status: 422, details: { code: "validation" } });
+      await expect(services.pipelines.createCaseLink({
+        caseId: randomUUID(),
+        companyId,
+        issueId: seeded.reviewIssueId,
+        role: "sidecar",
+      } as unknown as Parameters<typeof services.pipelines.createCaseLink>[0])).rejects.toMatchObject({ status: 422, details: { code: "validation" } });
+      const links = await db
+        .select({ id: pipelineCaseIssueLinks.id })
+        .from(pipelineCaseIssueLinks)
+        .where(eq(pipelineCaseIssueLinks.caseId, caseId));
+      expect(links).toHaveLength(1);
+
+      // The same actor rules as createReviewLink: a half pair is refused, a
+      // verified pair attributes the link to the run.
+      await expect(services.pipelines.createCaseLink({
+        caseId,
+        companyId,
+        issueId: seeded.reviewIssueId,
+        role: "review",
+        actorAgentId: seeded.reviewerAId,
+      })).rejects.toMatchObject({ status: 422, details: { code: "actor_required" } });
+      const runA = await seeded.runFor(seeded.reviewerAId);
+      const attributed = await services.pipelines.createCaseLink({
+        caseId,
+        companyId,
+        issueId: seeded.reviewIssueId,
+        role: "review",
+        actorAgentId: seeded.reviewerAId,
+        actorRunId: runA,
+      });
+      expect(attributed).toMatchObject({ issueId: seeded.reviewIssueId, role: "review", createdByRunId: runA });
+    });
+
     it("writes a case document as the system, with no agent run behind it", async () => {
       const seeded = await seedLinkedReviewerCase();
       const { companyId, caseId } = seeded;
@@ -1639,6 +1725,12 @@ describeEmbeddedPostgres("plugin orchestration APIs", () => {
         caseId: seeded.caseId,
         companyId: seeded.companyId,
         issueId: seeded.reviewIssueId,
+      })).rejects.toMatchObject({ code: PLUGIN_RPC_ERROR_CODES.CAPABILITY_DENIED });
+      await expect(denied["pipelines.cases.createCaseLink"]({
+        caseId: seeded.caseId,
+        companyId: seeded.companyId,
+        issueId: seeded.reviewIssueId,
+        role: "origin",
       })).rejects.toMatchObject({ code: PLUGIN_RPC_ERROR_CODES.CAPABILITY_DENIED });
       await expect(denied["pipelines.cases.putDocument"]({
         caseId: seeded.caseId,

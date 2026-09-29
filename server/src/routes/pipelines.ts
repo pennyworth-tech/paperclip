@@ -75,6 +75,7 @@ import {
   PIPELINE_CASE_BODY_DOCUMENT_KEY,
   pipelineAutomationRetryRequestSchema,
   pipelineAutomationRetryScopeSchema,
+  pipelineCaseIssueLinkRoleSchema,
   type PipelineStageAutomation,
   type PipelineCaseLiveness,
   type PipelineHealthFailedAutomationInput,
@@ -225,10 +226,9 @@ const reviewCaseSchema = z.object({
   leaseToken: z.string().guid().nullable().optional(),
 });
 const blockersSchema = z.object({ blockedByCaseIds: z.array(z.string().guid()).max(100) });
-const issueLinkRoleSchema = z.enum(["origin", "conversation", "work", "automation", "review"]);
 const createIssueLinkSchema = z.object({
   issueId: z.string().guid(),
-  role: issueLinkRoleSchema,
+  role: pipelineCaseIssueLinkRoleSchema,
 });
 const bulkReviewSchema = z.object({
   items: z.array(reviewCaseSchema.extend({ caseId: z.string().guid() })).max(100),

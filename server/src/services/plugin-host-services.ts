@@ -32,8 +32,8 @@ import type {
   PluginIssueOrchestrationSummary,
   PluginExecutionWorkspaceMetadata,
 } from "@paperclipai/plugin-sdk";
-import type { CreateIssueThreadInteraction, InviteJoinType, IssueDocumentSummary, PermissionKey, PrincipalType } from "@paperclipai/shared";
-import { pluginOperationIssueOriginKind } from "@paperclipai/shared";
+import type { CreateIssueThreadInteraction, InviteJoinType, IssueDocumentSummary, PermissionKey, PipelineCaseIssueLinkRole, PrincipalType } from "@paperclipai/shared";
+import { pipelineCaseIssueLinkRoleSchema, pluginOperationIssueOriginKind } from "@paperclipai/shared";
 import { companyService } from "./companies.js";
 import { agentService } from "./agents.js";
 import { projectService } from "./projects.js";
@@ -1128,6 +1128,62 @@ export function buildHostServices(
     retiredAt: link.retiredAt?.toISOString() ?? null,
     createdAt: link.createdAt.toISOString(),
   });
+
+  /**
+   * Link a pipeline case to an issue on the plugin's behalf. Without an actor
+   * pair the link and its `issue_linked` event are the system's, which is what
+   * lets a plugin attach a case to a task another agent owns: the REST route
+   * runs the same insert but refuses an agent actor whose target issue is
+   * assigned elsewhere (409 while in_progress, 403 otherwise). With an actor
+   * pair the run must belong to that agent and company, and the link is
+   * attributed to it. `role` is checked against the same enum the REST route
+   * validates its body with, so an unknown role is a 422 before any lookup.
+   */
+  const linkCaseIssue = async (params: {
+    companyId: string;
+    caseId: string;
+    issueId: string;
+    role: PipelineCaseIssueLinkRole;
+    actorAgentId?: string | null;
+    actorRunId?: string | null;
+  }) => {
+    const companyId = ensureCompanyId(params.companyId);
+    await ensurePluginAvailableForCompany(companyId);
+    const parsedRole = pipelineCaseIssueLinkRoleSchema.safeParse(params.role);
+    if (!parsedRole.success) {
+      throw unprocessable("Invalid pipeline case issue link role", { code: "validation", issues: parsedRole.error.issues });
+    }
+    const role = parsedRole.data;
+    await requirePipelineCaseInCompany(companyId, params.caseId);
+    const issue = requireInCompany("Issue", await issues.getById(params.issueId), companyId);
+    if (Boolean(params.actorAgentId) !== Boolean(params.actorRunId)) {
+      throw unprocessable("actorAgentId and actorRunId must be supplied together", { code: "actor_required" });
+    }
+    if (params.actorAgentId && params.actorRunId) {
+      await requireAgentRunInCompany(companyId, params.actorAgentId, params.actorRunId);
+    }
+    const actorPatch = params.actorAgentId
+      ? { actorType: "agent", actorAgentId: params.actorAgentId, runId: params.actorRunId }
+      : { actorType: "system" };
+    const link = await db.transaction(async (tx) => {
+      const [created] = await tx.insert(pipelineCaseIssueLinks).values({
+        companyId,
+        caseId: params.caseId,
+        issueId: issue.id,
+        role,
+        createdByRunId: params.actorRunId ?? null,
+      }).returning();
+      await tx.insert(pipelineCaseEvents).values({
+        companyId,
+        caseId: params.caseId,
+        type: "issue_linked",
+        ...actorPatch,
+        payload: { issueId: issue.id, role, pluginKey },
+      });
+      return created!;
+    });
+    return toPluginCaseIssueLink(link, { status: issue.status, assigneeAgentId: issue.assigneeAgentId ?? null });
+  };
 
   const logPluginActivity = async (input: {
     companyId: string;
@@ -2894,38 +2950,11 @@ export function buildHostServices(
           issueLinks: links.map(({ link, issue }) => toPluginCaseIssueLink(link, issue)),
         };
       },
+      async createCaseLink(params) {
+        return linkCaseIssue(params);
+      },
       async createReviewLink(params) {
-        const companyId = ensureCompanyId(params.companyId);
-        await ensurePluginAvailableForCompany(companyId);
-        await requirePipelineCaseInCompany(companyId, params.caseId);
-        const issue = requireInCompany("Issue", await issues.getById(params.issueId), companyId);
-        if (Boolean(params.actorAgentId) !== Boolean(params.actorRunId)) {
-          throw unprocessable("actorAgentId and actorRunId must be supplied together", { code: "actor_required" });
-        }
-        if (params.actorAgentId && params.actorRunId) {
-          await requireAgentRunInCompany(companyId, params.actorAgentId, params.actorRunId);
-        }
-        const actorPatch = params.actorAgentId
-          ? { actorType: "agent", actorAgentId: params.actorAgentId, runId: params.actorRunId }
-          : { actorType: "system" };
-        const link = await db.transaction(async (tx) => {
-          const [created] = await tx.insert(pipelineCaseIssueLinks).values({
-            companyId,
-            caseId: params.caseId,
-            issueId: issue.id,
-            role: "review",
-            createdByRunId: params.actorRunId ?? null,
-          }).returning();
-          await tx.insert(pipelineCaseEvents).values({
-            companyId,
-            caseId: params.caseId,
-            type: "issue_linked",
-            ...actorPatch,
-            payload: { issueId: issue.id, role: "review", pluginKey },
-          });
-          return created!;
-        });
-        return toPluginCaseIssueLink(link, { status: issue.status, assigneeAgentId: issue.assigneeAgentId ?? null });
+        return linkCaseIssue({ ...params, role: "review" });
       },
       async getDocument(params) {
         const companyId = ensureCompanyId(params.companyId);

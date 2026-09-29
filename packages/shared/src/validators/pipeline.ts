@@ -158,6 +158,15 @@ export const pipelineStageConfigSchema = z.object({
 
 export const pipelineAutomationRetryScopeSchema = z.enum(["current_stage", "previous_stage"]);
 
+/**
+ * Every role a pipeline case issue link may carry. This is the one list the
+ * REST route, the plugin host bridge and the database check constraint agree
+ * on, so a plugin linking a case to an issue picks from the same set the
+ * route would accept.
+ */
+export const pipelineCaseIssueLinkRoleSchema = z.enum(["origin", "conversation", "work", "automation", "review"]);
+export type PipelineCaseIssueLinkRole = z.infer<typeof pipelineCaseIssueLinkRoleSchema>;
+
 export const pipelineAutomationRetryCleanupOptionsSchema = z.object({
   retireDirectChildren: z.boolean().default(true),
   retireDescendants: z.boolean().default(true),

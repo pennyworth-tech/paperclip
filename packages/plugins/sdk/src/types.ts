@@ -51,6 +51,7 @@ import type {
   PrincipalPermissionGrant,
   PrincipalType,
   EnvSecretRefBinding,
+  PipelineCaseIssueLinkRole,
 } from "@paperclipai/shared";
 import type { PluginPerformActionContext } from "./protocol.js";
 
@@ -144,6 +145,7 @@ export type {
   PrincipalPermissionGrant,
   PrincipalType,
   EnvSecretRefBinding,
+  PipelineCaseIssueLinkRole,
 } from "@paperclipai/shared";
 
 // ---------------------------------------------------------------------------
@@ -1732,8 +1734,9 @@ export interface PluginPipelineReviewResult {
  * decisions as an authenticated agent run.
  *
  * Requires `pipeline.cases.read` for `getCase`, `pipeline.cases.links.write`
- * for `createReviewLink`, `pipeline.cases.review` for `reviewCase`, and
- * `pipeline.cases.documents.read` / `.write` for the document pair.
+ * for `createCaseLink` and `createReviewLink`, `pipeline.cases.review` for
+ * `reviewCase`, and `pipeline.cases.documents.read` / `.write` for the
+ * document pair.
  */
 export interface PluginPipelinesClient extends PluginPipelineAuthoringClient {
   /** Mint immutable evidence as this installed plugin; never impersonates a reviewer. */
@@ -1749,6 +1752,25 @@ export interface PluginPipelinesClient extends PluginPipelineAuthoringClient {
   createReviewLink(
     caseId: string,
     input: { issueId: string; actorAgentId?: string | null; actorRunId?: string | null },
+    companyId: string,
+  ): Promise<PluginPipelineCaseIssueLink>;
+  /**
+   * Link an issue to a case with a caller-chosen `role` (one of the roles the
+   * REST `POST /cases/:caseId/issue-links` route accepts; an unknown role is
+   * refused with code `validation`). Without an actor pair the link is
+   * system-made, so a plugin can attach a case to a task another agent owns —
+   * the case the agent-authenticated REST route refuses. When `actorAgentId`
+   * and `actorRunId` are given the host verifies the run belongs to that agent
+   * and company and attributes the link to it.
+   */
+  createCaseLink(
+    caseId: string,
+    input: {
+      issueId: string;
+      role: PipelineCaseIssueLinkRole;
+      actorAgentId?: string | null;
+      actorRunId?: string | null;
+    },
     companyId: string,
   ): Promise<PluginPipelineCaseIssueLink>;
   /**

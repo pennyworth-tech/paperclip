@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { pluginOperationIssueOriginKind } from "@paperclipai/shared";
+import { pipelineCaseIssueLinkRoleSchema, pluginOperationIssueOriginKind } from "@paperclipai/shared";
 import { JSONRPC_ERROR_CODES, PLUGIN_RPC_ERROR_CODES, PluginHostError, type PluginHostErrorData } from "./protocol.js";
 import type {
   PaperclipPluginManifestV1,
@@ -749,6 +749,41 @@ export function createTestHarness(options: TestHarnessOptions): TestHarness {
     }
     throw new Error(`Plugin may only use originKind values under ${defaultPluginOriginKind}`);
   }
+
+  // Shared by createReviewLink and createCaseLink: the same host routine
+  // backs both, review being the fixed-role case.
+  const linkCaseIssue = (
+    caseId: string,
+    input: { issueId: string; role: string; actorAgentId?: string | null; actorRunId?: string | null },
+    companyId: string,
+  ) => {
+    requireCapability(manifest, capabilitySet, "pipeline.cases.links.write");
+    const parsedRole = pipelineCaseIssueLinkRoleSchema.safeParse(input.role);
+    if (!parsedRole.success) {
+      const details = { code: "validation", issues: parsedRole.error.issues };
+      throw hostHttpError("Invalid pipeline case issue link role", { code: "validation", status: 422, details });
+    }
+    const pipelineCase = pipelineCases.get(caseId);
+    if (!pipelineCase || pipelineCase.companyId !== companyId) {
+      const details = { code: "case_not_found" };
+      throw hostHttpError(`Pipeline case not found: ${caseId}`, { code: "case_not_found", status: 404, details });
+    }
+    const issue = issues.get(input.issueId);
+    if (!issue || issue.companyId !== companyId) throw new Error(`Issue not found: ${input.issueId}`);
+    const link = {
+      id: randomUUID(),
+      caseId,
+      issueId: issue.id,
+      role: parsedRole.data,
+      issueStatus: issue.status,
+      issueAssigneeAgentId: issue.assigneeAgentId ?? null,
+      createdByRunId: input.actorRunId ?? null,
+      retiredAt: null,
+      createdAt: new Date().toISOString(),
+    };
+    pipelineCase.issueLinks.push(link);
+    return link;
+  };
 
   const ctx: PluginContext = {
     manifest,
@@ -2179,27 +2214,10 @@ export function createTestHarness(options: TestHarnessOptions): TestHarness {
         return { created: !existing, document, revision: { id: revisionId, revisionNumber } };
       },
       async createReviewLink(caseId, input, companyId) {
-        requireCapability(manifest, capabilitySet, "pipeline.cases.links.write");
-        const pipelineCase = pipelineCases.get(caseId);
-        if (!pipelineCase || pipelineCase.companyId !== companyId) {
-          const details = { code: "case_not_found" };
-          throw hostHttpError(`Pipeline case not found: ${caseId}`, { code: "case_not_found", status: 404, details });
-        }
-        const issue = issues.get(input.issueId);
-        if (!issue || issue.companyId !== companyId) throw new Error(`Issue not found: ${input.issueId}`);
-        const link = {
-          id: randomUUID(),
-          caseId,
-          issueId: issue.id,
-          role: "review",
-          issueStatus: issue.status,
-          issueAssigneeAgentId: issue.assigneeAgentId ?? null,
-          createdByRunId: input.actorRunId ?? null,
-          retiredAt: null,
-          createdAt: new Date().toISOString(),
-        };
-        pipelineCase.issueLinks.push(link);
-        return link;
+        return linkCaseIssue(caseId, { ...input, role: "review" }, companyId);
+      },
+      async createCaseLink(caseId, input, companyId) {
+        return linkCaseIssue(caseId, input, companyId);
       },
       async reviewCase(caseId, input, companyId) {
         requireCapability(manifest, capabilitySet, "pipeline.cases.review");

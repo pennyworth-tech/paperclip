@@ -1184,6 +1184,17 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
           });
         },
 
+        async createCaseLink(caseId, input, companyId) {
+          return callHost("pipelines.cases.createCaseLink", {
+            caseId,
+            companyId,
+            issueId: input.issueId,
+            role: input.role,
+            actorAgentId: input.actorAgentId,
+            actorRunId: input.actorRunId,
+          });
+        },
+
         async reviewCase(caseId, input, companyId) {
           return callHost("pipelines.cases.review", {
             caseId,
