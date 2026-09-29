@@ -1655,7 +1655,9 @@ const INVALID_AGENT_IN_REVIEW_DISPOSITION_MESSAGE =
   "This request would leave the issue in_review without anyone or anything owning the next action. " +
   "Keep working instead of moving to review, create a request_confirmation or ask_user_questions interaction, " +
   "link or request a pending approval, assign a human reviewer with assigneeUserId, set a typed executionState.currentParticipant through an execution policy, " +
-  "or schedule an issue monitor for an external review/check. After creating one of those review paths, retry the status update.";
+  "or schedule an issue monitor for an external review/check. " +
+  "An issue linked as the origin of an active pipeline case already has a review path: that pipeline owns the next action. " +
+  "After creating one of those review paths, retry the status update.";
 
 function executionPrincipalsEqual(
   left: ParsedExecutionState["currentParticipant"] | null,
@@ -3581,6 +3583,22 @@ export function issueRoutes(
     const approvals = await issueApprovalsSvc.listApprovalsForIssue(input.existing.id);
     if (approvals.some((approval) => ACTIVE_REVIEW_APPROVAL_STATUSES.has(String(approval.status)))) return null;
 
+    const [activeOriginCaseLink] = await db
+      .select({ caseId: pipelineCases.id })
+      .from(pipelineCaseIssueLinks)
+      .innerJoin(pipelineCases, eq(pipelineCaseIssueLinks.caseId, pipelineCases.id))
+      .where(and(
+        eq(pipelineCaseIssueLinks.companyId, input.existing.companyId),
+        eq(pipelineCases.companyId, input.existing.companyId),
+        eq(pipelineCaseIssueLinks.issueId, input.existing.id),
+        eq(pipelineCaseIssueLinks.role, "origin"),
+        isNull(pipelineCaseIssueLinks.retiredAt),
+        isNull(pipelineCases.retiredAt),
+        isNull(pipelineCases.terminalKind),
+      ))
+      .limit(1);
+    if (activeOriginCaseLink) return null;
+
     throw unprocessable(INVALID_AGENT_IN_REVIEW_DISPOSITION_MESSAGE, {
       code: "invalid_issue_disposition",
       missing: "review_path",
@@ -3590,6 +3608,7 @@ export function issueRoutes(
         "human_assignee_user_id",
         "typed_execution_state_current_participant",
         "scheduled_issue_monitor",
+        "linked_active_pipeline_case",
       ],
     });
   }

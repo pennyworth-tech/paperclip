@@ -520,6 +520,11 @@ describe("issue graph liveness classifier", () => {
         issue: baseReviewIssue,
         openRecoveryIssues: [{ companyId, issueId: reviewIssueId, status: "todo" }],
       },
+      {
+        name: "active origin pipeline case",
+        issue: baseReviewIssue,
+        activePipelineCaseLinks: [{ id: "case-1", companyId, issueId: reviewIssueId, status: "active" }],
+      },
     ];
 
     for (const testCase of cases) {
@@ -532,6 +537,7 @@ describe("issue graph liveness classifier", () => {
         pendingInteractions: testCase.pendingInteractions,
         pendingApprovals: testCase.pendingApprovals,
         openRecoveryIssues: testCase.openRecoveryIssues,
+        activePipelineCaseLinks: testCase.activePipelineCaseLinks,
       });
 
       expect(findings, testCase.name).toEqual([]);
