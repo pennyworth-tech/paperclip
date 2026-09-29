@@ -34,7 +34,7 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { useCompany } from "@/context/CompanyContext";
 import { useDialogActions } from "@/context/DialogContext";
-import { useCloudInstance } from "@/hooks/useCloudInstance";
+import { hasCloudApp, useCloudInstance } from "@/hooks/useCloudInstance";
 import { useHiddenSettings } from "@/hooks/useHiddenSettings";
 import { useCompanyOrder } from "@/hooks/useCompanyOrder";
 import { useSignOut } from "@/hooks/useSignOut";
@@ -250,8 +250,17 @@ export function SidebarCompanyMenu({ open: controlledOpen, onOpenChange }: Sideb
   // In Paperclip Cloud the switcher lists the signed-in user's stacks
   // (organizations) instead of the instance's companies: a cloud instance holds
   // exactly one company, and switching means leaving this tenant host entirely.
+  //
+  // That needs the Cloud app: the portfolio is proxied from it and every stack
+  // row navigates into it. A managed instance with no cloud origin (self-hosted
+  // with `PAPERCLIP_MANAGED_CONFIG`, or a stack still being provisioned) has
+  // neither, so the portfolio request can only fail — `/api/cloud/stacks` is
+  // 403 without a trusted Cloud tenant — and the switcher lists the instance's
+  // own companies instead, the same way the create row already drops out
+  // without a cloud origin. The managed floors stay keyed on `isCloud`.
   const cloud = useCloudInstance();
   const isCloud = Boolean(cloud);
+  const switchesStacks = hasCloudApp(cloud);
   // Invites now live on the Members page; hide the shortcut when the hosting
   // operator hides either surface. Until the health response resolves, the
   // hidden set is unknown — keep the shortcut out rather than flash it.
@@ -264,12 +273,12 @@ export function SidebarCompanyMenu({ open: controlledOpen, onOpenChange }: Sideb
   const stacksQuery = useQuery({
     queryKey: queryKeys.cloud.stacks,
     queryFn: () => cloudApi.listStacks(),
-    enabled: isCloud,
+    enabled: switchesStacks,
     staleTime: 30_000,
     retry: false,
   });
   const stacks = stacksQuery.data?.stacks ?? [];
-  const currentStack = isCloud
+  const currentStack = switchesStacks
     ? stacks.find((stack) => stack.isCurrent)
       ?? stacks.find((stack) => Boolean(cloud?.stackSlug) && stack.stackSlug === cloud?.stackSlug)
       ?? null
@@ -277,8 +286,8 @@ export function SidebarCompanyMenu({ open: controlledOpen, onOpenChange }: Sideb
   const createStackUrl = isCloud ? cloudStackCreateUrl(cloudBaseUrl) : null;
   const switcherNoun = "organization";
   // The one name the chrome shows for "where am I": the stack in cloud, the
-  // company when self-hosted.
-  const currentName = isCloud
+  // company otherwise.
+  const currentName = switchesStacks
     ? currentStack?.displayName ?? cloud?.stackDisplayName ?? cloud?.stackSlug ?? null
     : selectedCompany?.name ?? null;
 
@@ -377,7 +386,7 @@ export function SidebarCompanyMenu({ open: controlledOpen, onOpenChange }: Sideb
           }
         >
           <span className="flex min-w-0 flex-1 items-center gap-2">
-            {isCloud
+            {switchesStacks
               ? currentName ? <CurrentStackIcon displayName={currentName} company={selectedCompany} /> : null
               : selectedCompany ? <WorkspaceIcon company={selectedCompany} /> : null}
             {/* The header has room for ~110px of name beside the collapse
@@ -407,8 +416,8 @@ export function SidebarCompanyMenu({ open: controlledOpen, onOpenChange }: Sideb
             Organizations
           </DropdownMenuLabel>
           {/* Stack order is owned by cloud's own portfolio in v1, so the
-              drag-to-reorder affordance stays self-hosted-only. */}
-          {isCloud ? null : (
+              drag-to-reorder affordance stays with the company list. */}
+          {switchesStacks ? null : (
             <button
               type="button"
               onClick={(event) => {
@@ -423,7 +432,7 @@ export function SidebarCompanyMenu({ open: controlledOpen, onOpenChange }: Sideb
           )}
         </div>
         <div className="flex max-h-96 flex-col gap-0.5 overflow-y-auto px-2.5 pb-2 pt-1">
-          {isCloud ? (
+          {switchesStacks ? (
             <>
               {stacks.map((stack) => (
                 <CloudStackItem
