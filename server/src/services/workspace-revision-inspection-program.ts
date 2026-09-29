@@ -24,8 +24,9 @@ function inspectCommittedOpenSpec(input: PluginWorkspaceRevisionRequest, inspect
     if (git(["rev-parse", "HEAD"]).trim() !== input.commitSha) fail("revision_conflict");
     if (git(["status", "--porcelain=v1", "-z", "--untracked-files=all"])) fail("workspace_dirty");
     if (git(["config", "--get", "remote.origin.url"]).trim() !== input.repositorySsh) fail("repository_mismatch");
-    // Reject rewrites and proxies that could change the declared SSH transport or endpoint.
-    if (git(["config", "--get-regexp", "^(url\\..*\\.(insteadof|pushinsteadof)|remote\\.origin\\.(proxy|pushurl))$"], true).trim()) fail("git_transport_override");
+    // Reject repository shell commands, rewrites, and proxies before Git can
+    // replace the declared SSH transport or execute a repository-owned command.
+    if (git(["config", "--get-regexp", "^(core\\.sshcommand|url\\..*\\.(insteadof|pushinsteadof)|remote\\.origin\\.(proxy|pushurl))$"], true).trim()) fail("git_transport_override");
     const remoteLine = git(["ls-remote", "--exit-code", input.repositorySsh, "refs/heads/" + input.branch]).trim().split(/\r?\n/);
     if (remoteLine.length !== 1 || remoteLine[0] !== input.commitSha + "\trefs/heads/" + input.branch) fail("remote_revision_conflict");
     const snapshot = inspectTree(input, process.cwd());

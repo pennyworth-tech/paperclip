@@ -149,6 +149,21 @@ suite("committed Git and native OpenSpec inspection", () => {
     try { expect(await inspect()).toMatchObject({ ok: false, code: "git_transport_override" }); }
     finally { git("config", "--remove-section", "url.https://github.com/"); }
   });
+  it("rejects a repository SSH command before it can execute", async () => {
+    const marker = path.join(repo, ".git/ssh-override-ran");
+    git("config", "core.sshCommand", "sh -c 'touch .git/ssh-override-ran; exit 1' --");
+    // Use real Git, including its transport selection. The hostile command
+    // writes only a marker and exits, so this test never contacts the network.
+    vi.stubEnv("PATH", originalPath);
+    try {
+      const result = await inspect();
+      await expect(fs.stat(marker)).rejects.toMatchObject({ code: "ENOENT" });
+      expect(result).toMatchObject({ ok: false, code: "git_transport_override" });
+    } finally {
+      git("config", "--unset", "core.sshCommand");
+      await fs.rm(marker, { force: true });
+    }
+  });
   it("rejects invalid UTF-8 instead of hashing replacement characters as source", async () => {
     await fs.writeFile(path.join(repo, changeRoot, "proposal.md"), Buffer.from([0xf0, 0x90, 0x80])); commit();
     expect(await inspect()).toMatchObject({ ok: false, code: "source_not_utf8_text" });

@@ -150,6 +150,22 @@ suite("confined source editing with real Git and OpenSpec validation", { timeout
   afterEach(() => { vi.unstubAllEnvs(); });
   afterAll(async () => { if (root) await fs.rm(root, { recursive: true, force: true }); });
 
+  it("rejects a repository SSH command before editing or publishing", async () => {
+    const marker = path.join(repo, ".git/ssh-override-ran");
+    git("config", "core.sshCommand", "sh -c 'touch .git/ssh-override-ran; exit 1' --");
+    vi.stubEnv("PATH", originalPath);
+    try {
+      for (const mode of ["preview", "apply"] as const) {
+        const result = await execute({ ...input(), mode });
+        await expect(fs.stat(marker)).rejects.toMatchObject({ code: "ENOENT" });
+        expect(result).toMatchObject({ ok: false, code: "git_transport_override" });
+      }
+      expect(git("rev-parse", "HEAD")).toBe(baseline);
+    } finally {
+      git("config", "--unset", "core.sshCommand");
+      await fs.rm(marker, { force: true });
+    }
+  });
   it("previews a validated candidate without touching canonical files, index, refs, or remote", async () => {
     const before = await fs.readFile(path.join(repo, ".git/index"));
     const request = input(), result = await execute(request);
