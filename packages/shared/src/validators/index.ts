@@ -394,6 +394,12 @@ export {
 export {
   createDocumentAnnotationCommentSchema,
   createDocumentAnnotationThreadSchema,
+  createPipelineAnnotationSchema,
+  updatePipelineAnnotationSchema,
+  reanchorPipelineAnnotationSchema,
+  type ReanchorPipelineAnnotation,
+  type CreatePipelineAnnotation,
+  type UpdatePipelineAnnotation,
   documentAnnotationAnchorConfidenceSchema,
   documentAnnotationAnchorSelectorSchema,
   documentAnnotationAnchorStateSchema,
@@ -946,3 +952,5 @@ export {
 } from "./tool-access.js";
 export * from "./skill-policy.js";
 export * from "./app-definition.js";
+export { pipelineStageEvidencePolicySchema, pipelineStageEvidenceInputSchema } from "./pipeline.js";
+export type { PipelineStageEvidencePolicy, PipelineStageEvidenceInput } from "./pipeline.js";

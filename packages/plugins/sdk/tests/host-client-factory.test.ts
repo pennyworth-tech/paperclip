@@ -8,6 +8,22 @@ import {
 } from "../src/host-client-factory.js";
 import { PLUGIN_RPC_ERROR_CODES } from "../src/protocol.js";
 
+describe("source editing host capability and company boundary", () => {
+  it.each(["executionWorkspaces.editSources", "executionWorkspaces.abortSourceEdit"] as const)("gates %s before calling native execution", async (method) => {
+    const delegate = vi.fn(async () => ({ operationId: "operation", published: true }));
+    const services = { executionWorkspaces: { editSources: delegate, abortSourceEdit: delegate } } as unknown as HostServices;
+    const params = { companyId: "company-a", workspaceId: "workspace-a", input: {} } as never;
+    const scope = { invocationScope: { companyId: "company-a" } };
+    const denied = createHostClientHandlers({ pluginId: "paperclip.test", capabilities: ["execution.workspaces.inspect"], services });
+    await expect(denied[method](params, scope)).rejects.toBeInstanceOf(CapabilityDeniedError);
+    const allowed = createHostClientHandlers({ pluginId: "paperclip.test", capabilities: ["execution.workspaces.edit"], services });
+    await expect(allowed[method](params, { invocationScope: { companyId: "company-b" } })).rejects.toBeInstanceOf(InvocationScopeDeniedError);
+    expect(delegate).not.toHaveBeenCalled();
+    await expect(allowed[method](params, scope)).resolves.toMatchObject({ operationId: "operation" });
+    expect(delegate).toHaveBeenCalledWith(params);
+  });
+});
+
 describe("createHostClientHandlers invocation company scope", () => {
   it("rejects worker-selected config and secret company ids without a host invocation scope", async () => {
     const configGet = vi.fn(async () => ({ apiKeyRef: "unreachable" }));

@@ -35,6 +35,7 @@ import type {
 } from "@paperclipai/shared";
 import { deriveProjectUrlKey, WORKSPACE_OVERVIEW_LINKED_ISSUE_LIMIT } from "@paperclipai/shared";
 import { conflict, notFound, unprocessable } from "../errors.js";
+import { assertWorkspaceSourceWriteAvailable } from "./workspace-source-write-guard.js";
 import { logger } from "../middleware/logger.js";
 import {
   applyIssueExecutionPolicyTransition,
@@ -213,6 +214,9 @@ async function acquireExecutionWorkspaceLifecycleLock(
   await tx.execute(
     sql`select pg_advisory_xact_lock(hashtextextended(${`execution_workspace_lifecycle:${workspaceId}`}, 0))`,
   );
+  const [workspace] = await tx.select({ companyId: executionWorkspaces.companyId }).from(executionWorkspaces)
+    .where(eq(executionWorkspaces.id, workspaceId));
+  if (workspace) await assertWorkspaceSourceWriteAvailable(tx, workspace.companyId, workspaceId);
 }
 
 export type ReopenClosedIsolatedExecutionWorkspaceResult =

@@ -67,6 +67,10 @@ import {
   computePipelineHealth,
   deriveCaseType,
   envConfigSchema,
+  createPipelineAnnotationSchema,
+  createDocumentAnnotationCommentSchema,
+  updatePipelineAnnotationSchema,
+  reanchorPipelineAnnotationSchema,
   issueDocumentKeySchema,
   PIPELINE_CASE_BODY_DOCUMENT_KEY,
   pipelineAutomationRetryRequestSchema,
@@ -77,6 +81,7 @@ import {
   type PipelineHealthStageInput,
 } from "@paperclipai/shared";
 import { documentAnnotationService } from "../services/document-annotations.js";
+import { pipelineCaseAnnotationService, remapPipelineCaseThreads } from "../services/pipeline-case-annotations.js";
 import { logActivity } from "../services/activity-log.js";
 import {
   formatPipelineConversationBodyDocumentContextMarkdown,
@@ -178,6 +183,7 @@ const releaseCaseSchema = z.object({
   force: z.boolean().optional(),
 });
 const transitionCaseSchema = z.object({
+  evidenceId: z.string().guid().nullable().optional(),
   toStageKey: z.string().trim().min(1).max(120),
   expectedVersion: z.number().int().positive(),
   leaseToken: z.string().guid().nullable().optional(),
@@ -211,6 +217,7 @@ const reviewEditsSchema = z.object({
   parentCaseId: z.string().guid().nullable().optional(),
 });
 const reviewCaseSchema = z.object({
+  evidenceId: z.string().guid().nullable().optional(),
   decision: z.enum(["approve", "reject", "request_changes"]),
   reason: z.string().max(4_000).nullable().optional(),
   edits: reviewEditsSchema.optional(),
@@ -386,6 +393,13 @@ function actorForMutation(req: Request): PipelineActor {
   if (req.actor.type === "board") {
     return { type: "user", userId: req.actor.userId ?? "board" };
   }
+  throw unauthorized();
+}
+
+function annotationActorForMutation(req: Request) {
+  const actor = actorForMutation(req);
+  if (actor.type === "agent") return { actorType: "agent" as const, actorId: actor.agentId, agentId: actor.agentId, runId: actor.runId };
+  if (actor.type === "user") return { actorType: "user" as const, actorId: actor.userId, userId: actor.userId };
   throw unauthorized();
 }
 
@@ -736,6 +750,7 @@ export function pipelineRoutes(db: Db, options: Parameters<typeof pipelineServic
   const access = accessService(db);
   const issuesSvc = issueService(db);
   const documentAnnotationsSvc = documentAnnotationService(db);
+  const caseAnnotationsSvc = pipelineCaseAnnotationService(db);
 
   router.get("/companies/:companyId/pipelines", async (req, res) => {
     const companyId = req.params.companyId as string;
@@ -1526,6 +1541,55 @@ export function pipelineRoutes(db: Db, options: Parameters<typeof pipelineServic
     res.json(revisions);
   });
 
+  router.get("/cases/:caseId/documents/:key/annotations", async (req, res) => {
+    const caseId = req.params.caseId as string;
+    const companyId = await assertCaseAccess(db, req, caseId);
+    res.json(await caseAnnotationsSvc.list(companyId, caseId, parsePipelineDocumentKey(req.params.key)));
+  });
+
+  router.get("/cases/:caseId/annotations", async (req, res) => {
+    const caseId = req.params.caseId as string;
+    const companyId = await assertCaseAccess(db, req, caseId);
+    res.json(await caseAnnotationsSvc.listCase(companyId, caseId));
+  });
+
+  router.post("/cases/:caseId/documents/:key/annotations", validate(createPipelineAnnotationSchema), async (req, res) => {
+    const caseId = req.params.caseId as string;
+    const companyId = await assertCaseAccess(db, req, caseId);
+    const pipelineId = await resolveCasePipelineId(db, { companyId, caseId });
+    await assertPipelineWriteAccess(req, { access, companyId, pipelineId });
+    res.status(201).json(await caseAnnotationsSvc.create(companyId, caseId, parsePipelineDocumentKey(req.params.key), req.body,
+      annotationActorForMutation(req)));
+  });
+
+  router.post("/cases/:caseId/documents/:key/annotations/:threadId/comments",
+    validate(createDocumentAnnotationCommentSchema.omit({ issueCommentId: true }).strict()), async (req, res) => {
+      const caseId = req.params.caseId as string;
+      const companyId = await assertCaseAccess(db, req, caseId);
+      const pipelineId = await resolveCasePipelineId(db, { companyId, caseId });
+      await assertPipelineWriteAccess(req, { access, companyId, pipelineId });
+      res.status(201).json(await caseAnnotationsSvc.reply(companyId, caseId, parsePipelineDocumentKey(req.params.key),
+        req.params.threadId as string, req.body.body, annotationActorForMutation(req)));
+    });
+
+  router.patch("/cases/:caseId/documents/:key/annotations/:threadId", validate(updatePipelineAnnotationSchema), async (req, res) => {
+    const caseId = req.params.caseId as string;
+    const companyId = await assertCaseAccess(db, req, caseId);
+    const pipelineId = await resolveCasePipelineId(db, { companyId, caseId });
+    await assertPipelineWriteAccess(req, { access, companyId, pipelineId });
+    res.json(await caseAnnotationsSvc.update(companyId, caseId, parsePipelineDocumentKey(req.params.key),
+      req.params.threadId as string, req.body, annotationActorForMutation(req)));
+  });
+
+  router.post("/cases/:caseId/documents/:key/annotations/:threadId/reanchor", validate(reanchorPipelineAnnotationSchema), async (req, res) => {
+    const caseId = req.params.caseId as string;
+    const companyId = await assertCaseAccess(db, req, caseId);
+    const pipelineId = await resolveCasePipelineId(db, { companyId, caseId });
+    await assertPipelineWriteAccess(req, { access, companyId, pipelineId });
+    res.json(await caseAnnotationsSvc.reanchor(companyId, caseId, parsePipelineDocumentKey(req.params.key),
+      req.params.threadId as string, req.body, annotationActorForMutation(req)));
+  });
+
   router.post("/cases/:caseId/documents/:key/revisions/:revisionId/restore", async (req, res) => {
     const caseId = req.params.caseId as string;
     const key = parsePipelineDocumentKey(req.params.key);
@@ -1536,6 +1600,7 @@ export function pipelineRoutes(db: Db, options: Parameters<typeof pipelineServic
     const actor = actorForMutation(req);
 
     const result = await db.transaction(async (tx) => {
+      await lockEvidenceCase(tx, companyId, caseId);
       const existing = await tx
         .select({ link: pipelineCaseDocuments, document: documents, revision: documentRevisions })
         .from(pipelineCaseDocuments)
@@ -1549,6 +1614,8 @@ export function pipelineRoutes(db: Db, options: Parameters<typeof pipelineServic
         .limit(1)
         .then((rows) => rows[0] ?? null);
       if (!existing) throw notFound("Pipeline case document not found");
+
+      await invalidateEvidenceForDocuments(tx, [existing.document.id]);
 
       const sourceRevision = await tx
         .select()
@@ -1589,6 +1656,9 @@ export function pipelineRoutes(db: Db, options: Parameters<typeof pipelineServic
         updatedAt: now,
       }).where(eq(documents.id, existing.document.id)).returning();
       await tx.update(pipelineCaseDocuments).set({ updatedAt: now }).where(eq(pipelineCaseDocuments.documentId, existing.document.id));
+
+      await remapPipelineCaseThreads(tx, { companyId, caseId, documentId: document!.id,
+        nextRevisionId: restoredRevision!.id, nextRevisionNumber, nextBody: sourceRevision.body });
 
       const linkedIssueDocuments = await tx
         .select({ issueId: issueDocuments.issueId, key: issueDocuments.key })
@@ -1696,6 +1766,7 @@ export function pipelineRoutes(db: Db, options: Parameters<typeof pipelineServic
       caseId,
       toStageKey: req.body.toStageKey,
       expectedVersion: req.body.expectedVersion,
+      evidenceId: req.body.evidenceId,
       leaseToken: req.body.leaseToken,
       reason: req.body.reason,
       force: req.body.force,
@@ -2657,3 +2728,4 @@ async function getChildOutcomeSummaries(db: Db, companyId: string, caseId: strin
     };
   });
 }
+import { invalidateEvidenceForDocuments, lockEvidenceCase } from "../services/pipeline-stage-evidence.js";

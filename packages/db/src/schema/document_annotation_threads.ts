@@ -5,7 +5,7 @@ import type {
   DocumentAnnotationThreadStatus,
 } from "@paperclipai/shared";
 import { sql } from "drizzle-orm";
-import { check, index, integer, jsonb, pgTable, text, timestamp, uuid } from "drizzle-orm/pg-core";
+import { boolean, check, index, integer, jsonb, pgTable, text, timestamp, uuid } from "drizzle-orm/pg-core";
 import { agents } from "./agents.js";
 import { companies } from "./companies.js";
 import { documentRevisions } from "./document_revisions.js";
@@ -13,6 +13,7 @@ import { documents } from "./documents.js";
 import { issues } from "./issues.js";
 import { routines } from "./routines.js";
 import { cases } from "./cases.js";
+import { pipelineCases } from "./pipeline_cases.js";
 
 export const documentAnnotationThreads = pgTable(
   "document_annotation_threads",
@@ -22,9 +23,14 @@ export const documentAnnotationThreads = pgTable(
     issueId: uuid("issue_id").references(() => issues.id, { onDelete: "cascade" }),
     routineId: uuid("routine_id").references(() => routines.id, { onDelete: "cascade" }),
     caseId: uuid("case_id").references(() => cases.id, { onDelete: "cascade" }),
+    pipelineCaseId: uuid("pipeline_case_id").references(() => pipelineCases.id, { onDelete: "cascade" }),
     documentId: uuid("document_id").notNull().references(() => documents.id, { onDelete: "cascade" }),
     documentKey: text("document_key").notNull(),
     status: text("status").$type<DocumentAnnotationThreadStatus>().notNull().default("open"),
+    blocking: boolean("blocking").notNull().default(false),
+    feedbackKind: text("feedback_kind").$type<"question" | "suggestion" | "blocker">(),
+    sourceLocator: jsonb("source_locator").$type<Record<string, unknown>>(),
+    resolutionDisposition: text("resolution_disposition"),
     anchorState: text("anchor_state").$type<DocumentAnnotationAnchorState>().notNull().default("active"),
     originalRevisionId: uuid("original_revision_id").references(() => documentRevisions.id, { onDelete: "set null" }),
     originalRevisionNumber: integer("original_revision_number").notNull(),
@@ -83,7 +89,7 @@ export const documentAnnotationThreads = pgTable(
     ),
     exactlyOneOwnerChk: check(
       "document_annotation_threads_exactly_one_owner_chk",
-      sql`num_nonnulls(${table.issueId}, ${table.routineId}, ${table.caseId}) = 1`,
+      sql`num_nonnulls(${table.issueId}, ${table.routineId}, ${table.caseId}, ${table.pipelineCaseId}) = 1`,
     ),
   }),
 );

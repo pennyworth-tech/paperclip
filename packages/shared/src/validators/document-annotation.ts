@@ -49,6 +49,16 @@ export const createDocumentAnnotationThreadSchema = z.object({
   selector: documentAnnotationAnchorSelectorSchema,
   body: multilineTextSchema.pipe(z.string().min(1).max(20_000)),
   issueCommentId: z.string().guid().nullable().optional(),
+  blocking: z.boolean().optional(),
+  sourceLocator: z.object({
+    revisionId: z.string().trim().min(1).max(200),
+    artifactId: z.string().trim().min(1).max(500),
+    blobHash: z.string().regex(/^[a-f0-9]{64}$/),
+    headingPath: z.array(z.string().max(500)).max(20),
+    quote: z.string().min(1).max(10_000),
+    prefix: z.string().max(1_000).default(""),
+    suffix: z.string().max(1_000).default(""),
+  }).strict().nullable().optional(),
 }).strict();
 
 export const createDocumentAnnotationCommentSchema = z.object({
@@ -56,8 +66,27 @@ export const createDocumentAnnotationCommentSchema = z.object({
   issueCommentId: z.string().guid().nullable().optional(),
 }).strict();
 
+export const createPipelineAnnotationSchema = createDocumentAnnotationThreadSchema
+  .omit({ blocking: true, issueCommentId: true })
+  .extend({ feedbackKind: z.enum(["question", "suggestion", "blocker"]).default("question") }).strict();
+
+export const updatePipelineAnnotationSchema = z.object({
+  status: documentAnnotationThreadStatusSchema,
+  expectedUpdatedAt: z.string().datetime(),
+  resolutionDisposition: z.string().trim().min(1).max(4_000).optional(),
+}).strict();
+
+export type CreatePipelineAnnotation = z.input<typeof createPipelineAnnotationSchema>;
+export type UpdatePipelineAnnotation = z.infer<typeof updatePipelineAnnotationSchema>;
+
+export const reanchorPipelineAnnotationSchema = createPipelineAnnotationSchema
+  .omit({ body: true, feedbackKind: true })
+  .extend({ expectedUpdatedAt: z.string().datetime() }).strict();
+export type ReanchorPipelineAnnotation = z.input<typeof reanchorPipelineAnnotationSchema>;
+
 export const updateDocumentAnnotationThreadSchema = z.object({
   status: documentAnnotationThreadStatusSchema.optional(),
+  resolutionDisposition: z.string().trim().min(1).max(4_000).optional(),
 }).strict().refine((value) => value.status != null, {
   message: "At least one field must be provided",
 });

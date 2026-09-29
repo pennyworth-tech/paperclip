@@ -288,6 +288,14 @@ console.log(JSON.stringify({ type: "result", session_id: "22222222-2222-4222-822
   await fs.chmod(commandPath, 0o755);
 }
 
+async function seedClaudeTranscript(root: string, workspace: string, sessionId: string) {
+  // Resumed CLI fixtures need the same on-disk session record as a real CLI.
+  const slug = (await fs.realpath(workspace)).replace(/[^a-zA-Z0-9-]/g, "-");
+  const directory = path.join(root, ".claude", "projects", slug);
+  await fs.mkdir(directory, { recursive: true });
+  await fs.writeFile(path.join(directory, `${sessionId}.jsonl`), "{}\n");
+}
+
 async function setupExecuteEnv(
   root: string,
   options?: { commandWriter?: (commandPath: string) => Promise<void> },
@@ -302,6 +310,8 @@ async function setupExecuteEnv(
   await (options?.commandWriter ?? writeFakeClaudeCommand)(commandPath);
   const previousHome = process.env.HOME;
   const previousPath = process.env.PATH;
+  const previousClaudeConfigDir = process.env.CLAUDE_CONFIG_DIR;
+  process.env.CLAUDE_CONFIG_DIR = path.join(root, ".claude");
   process.env.HOME = root;
   process.env.PATH = `${binDir}${path.delimiter}${process.env.PATH ?? ""}`;
   return {
@@ -311,6 +321,8 @@ async function setupExecuteEnv(
       else process.env.HOME = previousHome;
       if (previousPath === undefined) delete process.env.PATH;
       else process.env.PATH = previousPath;
+      if (previousClaudeConfigDir === undefined) delete process.env.CLAUDE_CONFIG_DIR;
+      else process.env.CLAUDE_CONFIG_DIR = previousClaudeConfigDir;
     },
   };
 }
@@ -449,6 +461,7 @@ describe("claude execute", () => {
     const { workspace, commandPath, capturePath, restore } = await setupExecuteEnv(root);
     const instructionsFile = path.join(root, "instructions.md");
     await fs.writeFile(instructionsFile, "# Agent instructions", "utf-8");
+    await seedClaudeTranscript(root, workspace, "11111111-1111-4111-8111-111111111111");
     try {
       await execute({
         runId: "run-resume",
@@ -519,6 +532,7 @@ describe("claude execute", () => {
     const instructionsFile = path.join(root, "instructions.md");
     await fs.writeFile(instructionsFile, "# Agent instructions", "utf-8");
     let capturedNotes: string[] = ["sentinel"];
+    await seedClaudeTranscript(root, workspace, "11111111-1111-4111-8111-111111111111");
     try {
       await execute({
         runId: "run-notes-resume",
@@ -552,6 +566,7 @@ describe("claude execute", () => {
     const instructionsFile = path.join(root, "instructions.md");
     await fs.writeFile(instructionsFile, "# Agent instructions", "utf-8");
     const metaEvents: Array<{ commandArgs: string[]; commandNotes: string[] }> = [];
+    await seedClaudeTranscript(root, workspace, "11111111-1111-4111-8111-111111111111");
     try {
       const result = await execute({
         runId: "run-resume-fallback",
@@ -1121,6 +1136,7 @@ describe("claude execute", () => {
           instructionsFilePath: instructionsPath,
           env: {
             PAPERCLIP_TEST_CAPTURE_PATH: capturePath1,
+            CLAUDE_CONFIG_DIR: path.join(root, ".claude"),
           },
           promptTemplate: "Follow the paperclip heartbeat.",
           paperclipSkillSync: {
@@ -1139,6 +1155,7 @@ describe("claude execute", () => {
         cwd: workspace,
       });
       expect(typeof first.sessionParams?.promptBundleKey).toBe("string");
+      await seedClaudeTranscript(root, workspace, "11111111-1111-4111-8111-111111111111");
 
       const second = await execute({
         runId: "run-2",
@@ -1162,6 +1179,7 @@ describe("claude execute", () => {
           instructionsFilePath: instructionsPath,
           env: {
             PAPERCLIP_TEST_CAPTURE_PATH: capturePath2,
+            CLAUDE_CONFIG_DIR: path.join(root, ".claude"),
           },
           promptTemplate: "Follow the paperclip heartbeat.",
           paperclipSkillSync: {
@@ -1596,6 +1614,7 @@ describe("claude execute", () => {
       commandWriter: writePoisonedMessageIdClaudeCommand,
     });
     const logs: string[] = [];
+    await seedClaudeTranscript(root, workspace, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa");
     try {
       const result = await execute({
         runId: "run-poisoned-msgid",
@@ -1687,6 +1706,7 @@ describe("claude execute", () => {
     const { workspace, commandPath, capturePath, restore } = await setupExecuteEnv(root, {
       commandWriter: writeAlwaysPoisonedMessageIdClaudeCommand,
     });
+    await seedClaudeTranscript(root, workspace, "aaaaaaaa-0000-4000-8000-000000000004");
     try {
       const result = await execute({
         runId: "run-poisoned-retry",

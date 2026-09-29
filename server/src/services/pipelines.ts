@@ -1,8 +1,9 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
 import { and, asc, desc, eq, inArray, isNotNull, isNull, ne, notInArray, or, sql } from "drizzle-orm";
 import { alias } from "drizzle-orm/pg-core";
 import type { Db } from "@paperclipai/db";
+import { assertCaseWorkReviewer, caseWorkReviewResult, syncCaseWorkOutcome } from "./pipeline-case-work.js";
 import {
   agents,
   documents,
@@ -16,6 +17,7 @@ import {
   pipelineCaseDocuments,
   pipelineCaseEvents,
   pipelineCaseIssueLinks,
+  pipelineCaseWork,
   pipelineCases,
   pipelineStages,
   pipelineTransitions,
@@ -51,6 +53,8 @@ import { assertAssignableAgent } from "./agent-assignability.js";
 import { authorizationService } from "./authorization.js";
 import { visibleIssueCondition } from "./issue-visibility.js";
 import { finalizeSummarySlotsForTerminalIssue } from "./summary-slot-finalization.js";
+import { assertStageEvidenceTransition } from "./pipeline-stage-evidence.js";
+import { assertCaseSourceWriteAvailable, consumeSourceWritePublication } from "./workspace-source-write-guard.js";
 import {
   formatPipelineCaseOutputContextMarkdown,
   pipelineCaseOutputsService,
@@ -1082,6 +1086,7 @@ async function assertActorCanApproveStageExit(
   if (config.requireApproval !== true) return;
   const approver = config.approver ?? { kind: "any_human" };
   if (approver.kind === "linked_reviewer") {
+    if (actor.type === "agent") await assertCaseWorkReviewer(db, pipelineCase.companyId, pipelineCase.id, actor.agentId, actor.runId);
     // Resolved at decision time: the assignee of the case's newest non-retired review-role link.
     const reviewLink = await db
       .select({ assigneeAgentId: issues.assigneeAgentId })
@@ -3165,8 +3170,9 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
     },
   ) {
     if (input.fields !== undefined) assertJsonSize(input.fields, "fields");
-    const { case: existing, stage } = await getCaseWithStageOrThrow(tx, input.companyId, input.caseId);
+    const { case: existing, stage } = await getCaseWithStageForUpdateOrThrow(tx, input.companyId, input.caseId);
     const current = await assertLeaseAvailable(tx, existing, input.actor, input.leaseToken);
+    await assertCaseSourceWriteAvailable(tx, input.companyId, input.caseId);
     if (input.expectedVersion !== undefined && current.version !== input.expectedVersion) {
       throw conflict("Pipeline case version conflict", conflictDetailsForCase(current, stage));
     }
@@ -3191,7 +3197,10 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
     const patch: Partial<typeof pipelineCases.$inferInsert> = {
       updatedAt: nowDate(),
     };
-    if (materialChanged) patch.version = current.version + 1;
+    if (materialChanged || (current.stageEvidenceId !== null && (parentCaseChanged || workspaceRefChanged))) {
+      patch.version = current.version + 1;
+      patch.stageEvidenceId = null;
+    }
     if (titleChanged) patch.title = input.title;
     if (summaryChanged) patch.summary = input.summary;
     if (fieldsChanged) patch.fields = input.fields;
@@ -3267,6 +3276,10 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
       automationLedgers?: Array<typeof pipelineAutomationExecutions.$inferSelect>;
       autoAdvanceVisitedStageIds?: Set<string>;
       skipChildrenTerminalGate?: boolean;
+      evidenceId?: string | null;
+      // Internal only: public transition inputs never populate this field.
+      reviewDecision?: PipelineReviewDecision;
+      revisionPublication?: { pluginKey: string };
     },
   ) {
     if (input.transitionClass === "auto" && input.actor.type !== "system") {
@@ -3275,6 +3288,7 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
     const { case: existing, stage: fromStage, pipeline } = await getCaseWithStageForUpdateOrThrow(tx, input.companyId, input.caseId);
     if (pipeline.archivedAt) throw unprocessable("Pipeline is archived", { code: "pipeline_archived" });
     const current = await assertLeaseAvailable(tx, existing, input.actor, input.leaseToken);
+    await assertCaseSourceWriteAvailable(tx, input.companyId, input.caseId);
     if (current.version !== input.expectedVersion) {
       throw conflict("Pipeline case version conflict", conflictDetailsForCase(current, fromStage));
     }
@@ -3283,8 +3297,16 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
       ? await getStageOrThrow(tx, current.pipelineId, input.toStageId)
       : await getStageByKeyOrThrow(tx, current.pipelineId, input.toStageKey ?? "");
     assertStageEnabled(toStage, "transition");
-    if (fromStage.id !== toStage.id) {
+    let evidence: Awaited<ReturnType<typeof assertStageEvidenceTransition>> = null;
+    if (input.revisionPublication) {
+      const policy = fromStage.config.revisionPublication as { producerPluginKey?: string; reopenToStageKey?: string } | undefined;
+      if (input.actor.type !== "system" || policy?.producerPluginKey !== input.revisionPublication.pluginKey
+        || policy?.reopenToStageKey !== toStage.key || toStage.kind !== "working") {
+        throw new HttpError(403, "Revision publication is not configured for this producer and destination");
+      }
+    } else if (fromStage.id !== toStage.id) {
       await assertActorCanApproveStageExit(tx, current, fromStage, input.actor);
+      evidence = await assertStageEvidenceTransition(tx, current, fromStage, toStage, input);
       await assertStageTransitionGates(tx, current, fromStage, { skipChildrenTerminalGate: input.skipChildrenTerminalGate });
       await assertLatestReviewApprovalStillCurrent(tx, current, fromStage, toStage, {
         allowWorkflowVersionDrift: input.transitionClass === "auto" && input.reason === "children_terminal",
@@ -3324,6 +3346,7 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
       .set({
         stageId: toStage.id,
         version: current.version + 1,
+        stageEvidenceId: null,
         terminalKind: enteringTerminal,
         terminalAt: enteringTerminal ? nowDate() : null,
         pendingSuggestion: input.suggestionId === current.pendingSuggestion?.id ? null : current.pendingSuggestion,
@@ -3354,6 +3377,7 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
         suggestionId: input.suggestionId ?? null,
         reason: input.reason ?? null,
         transitionClass: input.transitionClass ?? "manual",
+        ...(evidence ? { evidence } : {}),
       },
     });
     if (forcedTransition) {
@@ -3387,6 +3411,7 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
         terminalChildDelta: isTerminal ? 1 : -1,
       });
     }
+    await syncCaseWorkOutcome(tx, updated);
     if (!wasTerminal && updated.terminalKind === "done") {
       await handleBlockersResolved(tx, input.companyId, current.id);
     }
@@ -3402,7 +3427,7 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
         visitedStageIds: input.autoAdvanceVisitedStageIds,
       });
     }
-    return { case: updated, event, automationLedger: ledger };
+    return { case: updated, event, automationLedger: ledger, evidence };
   }
 
   // A case can enter an auto-advance stage after its children are already
@@ -3511,6 +3536,53 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
 
   const service = {
     resolveBreakdownTarget,
+
+    /** Host-only publication port; reopening is never an approval decision. */
+    async publishRevision(input: { companyId: string; caseId: string; producerPluginId: string; producerPluginKey: string;
+      expectedVersion: number; baseRevisionId: string | null; requestKey: string; revisionId: string; contentDigest: string; reason: string; sourceWriteId?: string }) {
+      const requestDigest = createHash("sha256").update(JSON.stringify({ expectedVersion: input.expectedVersion,
+        baseRevisionId: input.baseRevisionId, requestKey: input.requestKey, revisionId: input.revisionId,
+        contentDigest: input.contentDigest, reason: input.reason, sourceWriteId: input.sourceWriteId })).digest("hex");
+      const automationLedgers: Array<typeof pipelineAutomationExecutions.$inferSelect> = [];
+      const result = await db.transaction(async (tx) => {
+        const { case: current, stage } = await getCaseWithStageForUpdateOrThrow(tx, input.companyId, input.caseId);
+        const [work] = await tx.select().from(pipelineCaseWork).where(eq(pipelineCaseWork.caseId, current.id)).for("update");
+        if (!work || work.producerPluginId !== input.producerPluginId || work.producerPluginKey !== input.producerPluginKey) {
+          throw new HttpError(403, "Only the case's preparation plugin can publish its source revision");
+        }
+        const [prior] = await tx.select().from(pipelineCaseEvents).where(and(eq(pipelineCaseEvents.caseId, current.id),
+          sql`${pipelineCaseEvents.payload}->'revisionPublication'->>'requestKey' = ${input.requestKey}`)).limit(1);
+        if (prior) {
+          const receipt = prior.payload.revisionPublication as { requestDigest: string; version: number };
+          if (receipt.requestDigest !== requestDigest) throw conflict("Publication key has different content", { code: "request_conflict" });
+          return { caseId: current.id, version: receipt.version, eventId: prior.id };
+        }
+        if (current.version !== input.expectedVersion || work.sourceRevisionId !== input.baseRevisionId) {
+          throw conflict("Publication base changed", { code: "publication_conflict", caseVersion: current.version, revisionId: work.sourceRevisionId });
+        }
+        if (work.sourceRevisionId === input.revisionId || work.sourceContentDigest === input.contentDigest) {
+          throw conflict("No source change to publish; request another review of the current revision", { code: "source_unchanged" });
+        }
+        const policy = stage.config.revisionPublication as { producerPluginKey?: string; reopenToStageKey?: string } | undefined;
+        if (policy?.producerPluginKey !== input.producerPluginKey || !policy.reopenToStageKey) {
+          throw new HttpError(403, "Revision publication is not configured on this stage");
+        }
+        await consumeSourceWritePublication(tx, current, work, input);
+        await tx.update(pipelineCaseWork).set({ sourceRevisionId: input.revisionId, sourceContentDigest: input.contentDigest,
+          updatedAt: nowDate() }).where(eq(pipelineCaseWork.id, work.id));
+        const transition = await transitionCaseInTransaction(tx, { companyId: input.companyId, caseId: current.id,
+          toStageKey: policy.reopenToStageKey, expectedVersion: current.version, actor: { type: "system" },
+          reason: input.reason, revisionPublication: { pluginKey: input.producerPluginKey }, automationLedgers });
+        const event = await writeCaseEvent(tx, { companyId: input.companyId, caseId: current.id, type: "updated", actor: { type: "system" },
+          payload: { revisionPublication: { requestKey: input.requestKey, requestDigest, revisionId: input.revisionId,
+            contentDigest: input.contentDigest, baseRevisionId: input.baseRevisionId, version: transition.case.version,
+            ...(input.sourceWriteId ? { sourceWriteId: input.sourceWriteId } : {}),
+            producerPluginId: input.producerPluginId, producerPluginKey: input.producerPluginKey } } });
+        return { caseId: current.id, version: transition.case.version, eventId: event.id };
+      });
+      await executeAutomationLedgers(automationLedgers, { type: "system" });
+      return result;
+    },
 
     async createPipeline(input: {
       companyId: string;
@@ -4010,6 +4082,9 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
             .then((rows) => rows[0] ?? null);
         if (!stage) throw unprocessable("Pipeline has no stages", { code: "validation" });
         assertStageEnabled(stage, "ingest");
+        if (stage.config.requireApprovedEntryFromStageKey !== undefined) {
+          throw conflict("New cases cannot skip a required review", { code: "review_decision_required" });
+        }
         validateAddFormFieldsForStage(stage, input.fields ?? {});
 
         const [inserted] = await tx
@@ -4488,6 +4563,7 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
       toStageId?: string;
       toStageKey?: string;
       expectedVersion: number;
+      evidenceId?: string | null;
       leaseToken?: string | null;
       actor: PipelineActor;
       transitionClass?: "manual" | "suggested" | "auto";
@@ -4497,7 +4573,8 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
       skipChildrenTerminalGate?: boolean;
     }) {
       const automationLedgers: Array<typeof pipelineAutomationExecutions.$inferSelect> = [];
-      const result = await db.transaction((tx) => transitionCaseInTransaction(tx, { ...input, automationLedgers }));
+      const result = await db.transaction((tx) => transitionCaseInTransaction(tx, { ...input, automationLedgers,
+        reviewDecision: undefined, revisionPublication: undefined }));
       const automationExecutions = await executeAutomationLedgers(automationLedgers, { type: "system" });
       if (result.automationLedger) {
         return {
@@ -4945,17 +5022,20 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
         parentCaseId?: string | null;
       };
       expectedVersion: number;
+      evidenceId?: string | null;
       leaseToken?: string | null;
       actor: PipelineActor;
     }) {
       const automationLedgers: Array<typeof pipelineAutomationExecutions.$inferSelect> = [];
       const result = await db.transaction(async (tx) => {
-        const detail = await getCaseWithStageOrThrow(tx, input.companyId, input.caseId);
+        const detail = await getCaseWithStageForUpdateOrThrow(tx, input.companyId, input.caseId);
         if (detail.stage.kind !== "review") {
           throw unprocessable("Pipeline case is not in a review stage", { code: "validation" });
         }
         const config = reviewConfigForStage(detail.stage);
         await assertActorCanApproveStageExit(tx, detail.case, detail.stage, input.actor);
+        const preparation = input.actor.type === "agent"
+          ? await caseWorkReviewResult(tx, input.companyId, input.caseId, input.actor.agentId, input.actor.runId) : null;
         const reasonRequired =
           (input.decision === "request_changes" && config.requireRequestChangesReason !== false) ||
           (input.decision === "reject" && config.requireRejectReason !== false);
@@ -4990,6 +5070,8 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
           reason: input.reason,
           actor: input.actor,
           automationLedgers,
+          evidenceId: input.evidenceId,
+          reviewDecision: input.decision,
         });
         // The decision records what it was decided ON, so a reader never has to
         // pair this event with the case's fields at some later version. The head
@@ -5022,6 +5104,8 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
             approvedTransitionVersion: input.decision === "approve" ? transitioned.case.version : null,
             // Every decision, not only `approve`: the version it was taken against.
             decidedCaseVersion: expectedVersion,
+            ...(preparation ?? {}),
+            ...(transitioned.evidence ? { evidence: transitioned.evidence } : {}),
             decidedHeadSha: typeof decidedHeadShaRaw === "string" && /^[0-9a-f]{40}$/.test(decidedHeadShaRaw) ? decidedHeadShaRaw : null,
             decidedVerdictKind: typeof decidedVerdictKindRaw === "string" && decidedVerdictKindRaw.length > 0 ? decidedVerdictKindRaw : null,
           },

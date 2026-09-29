@@ -41,3 +41,11 @@ test('findExistingComment: returns null when no signed comment exists', async ()
 
   assert.equal(comment, null);
 });
+
+test('findExistingComment: reuses the fork workflow comment and ignores a forged user signature', async () => {
+  const comment = await findExistingComment(async () => ([
+    { id: 1, user: { login: 'someone-else' }, body: '— commitperclip' },
+    { id: 2, user: { login: 'github-actions[bot]' }, body: 'Checked.\n\n— commitperclip' },
+  ]), 'token', 'example/fork', 4);
+  assert.equal(comment.id, 2);
+});

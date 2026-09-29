@@ -2630,6 +2630,7 @@ export function PipelineItemDetailView({ pipelineId, caseId }: { pipelineId: str
       return pipelinesApi.transitionCase(caseId, {
         toStageKey: selectedMoveStage.key,
         expectedVersion: detail.case.version,
+        evidenceId: detail.case.stageEvidenceId,
         reason: `Manual board override from item page: moved from ${detail.stage.name} to ${selectedMoveStage.name}.`,
         force: true,
       });
@@ -2685,6 +2686,7 @@ export function PipelineItemDetailView({ pipelineId, caseId }: { pipelineId: str
         decision,
         reason: reviewDecisionNote.trim() || null,
         expectedVersion: detail.case.version,
+        evidenceId: detail.case.stageEvidenceId,
       });
     },
     onSuccess: async (_result, variables) => {
@@ -4414,6 +4416,7 @@ export function GeneratedField({
 type ReviewQueueKind = "suggestion" | "review" | "headsUp";
 
 export interface ReviewQueueRow {
+  evidenceId?: string | null;
   id: string;
   caseId: string;
   pipelineId: string;
@@ -4493,6 +4496,7 @@ export function buildReviewQueueRows({
       kind: "review",
       createdAt: entry.case.updatedAt ?? entry.case.createdAt ?? null,
       expectedVersion: entry.review.expectedVersion ?? entry.case.version ?? null,
+      evidenceId: entry.case.stageEvidenceId,
       suggestionId: null,
       requireRejectReason: entry.review.requireRejectReason !== false,
       requireRequestChangesReason: entry.review.requireRequestChangesReason !== false,
@@ -4528,6 +4532,7 @@ export function buildReviewQueueRows({
     const existing = rows.get(id);
     if (existing) {
       existing.fields = entry.case.fields ?? null;
+      existing.evidenceId = entry.case.stageEvidenceId;
       if (existing.expectedVersion === null && typeof entry.case.version === "number") {
         existing.expectedVersion = entry.case.version;
       }
@@ -4546,6 +4551,7 @@ export function buildReviewQueueRows({
       kind: "review",
       createdAt: entry.case.updatedAt ?? entry.case.createdAt ?? null,
       expectedVersion: typeof entry.case.version === "number" ? entry.case.version : null,
+      evidenceId: entry.case.stageEvidenceId,
       suggestionId: null,
       requireRejectReason: entry.reviewConfig?.requireRejectReason !== false,
       requireRequestChangesReason: entry.reviewConfig?.requireRequestChangesReason !== false,
@@ -4905,6 +4911,7 @@ export function ReviewQueue() {
         decision: decision === "request_changes" ? "request_changes" : "approve",
         reason: note || null,
         expectedVersion: row.expectedVersion,
+        evidenceId: row.evidenceId,
       });
     },
     onMutate: ({ row }) => {
@@ -4948,7 +4955,7 @@ export function ReviewQueue() {
       if (reviewRows.length > 0) {
         const items = reviewRows.map((row) => {
           if (row.expectedVersion === null) throw new Error("This item is not ready for a decision.");
-          return { caseId: row.caseId, decision: "approve" as const, expectedVersion: row.expectedVersion };
+          return { caseId: row.caseId, decision: "approve" as const, expectedVersion: row.expectedVersion, evidenceId: row.evidenceId };
         });
         tasks.push(
           pipelinesApi.bulkReviewCases(selectedCompanyId, { items }).then((response) => {

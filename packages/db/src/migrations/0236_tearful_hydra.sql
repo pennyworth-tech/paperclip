@@ -1,0 +1,2 @@
+ALTER TABLE "pipeline_case_work" ADD COLUMN "source_write_id" uuid;--> statement-breakpoint
+ALTER TABLE "pipeline_case_work" ADD CONSTRAINT "pipeline_case_work_source_write_id_workspace_operations_id_fk" FOREIGN KEY ("source_write_id") REFERENCES "public"."workspace_operations"("id") ON DELETE no action ON UPDATE no action;

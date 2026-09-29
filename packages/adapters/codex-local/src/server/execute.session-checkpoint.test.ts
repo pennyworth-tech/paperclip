@@ -153,7 +153,7 @@ describe("codex_local session checkpointing", () => {
         ...runtimeOverrides,
       },
       config: {
-        outputInactivityTimeoutMs: null,
+        outputInactivityTimeoutMs: null as number | null,
         cwd: workspace,
         env: { OPENAI_API_KEY: "test-key" },
       },

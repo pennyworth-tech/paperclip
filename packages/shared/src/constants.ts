@@ -1329,6 +1329,8 @@ export const PLUGIN_CAPABILITIES = [
   "projects.read",
   "project.workspaces.read",
   "execution.workspaces.read",
+  "execution.workspaces.inspect",
+  "execution.workspaces.edit",
   "issues.read",
   "issue.relations.read",
   "issue.subtree.read",
@@ -1378,8 +1380,11 @@ export const PLUGIN_CAPABILITIES = [
   // case; record a review decision attributed to an authenticated agent run
   // (the host re-verifies the run belongs to that agent and company).
   "pipeline.cases.read",
+  "pipeline.cases.write",
+  "pipeline.cases.work.write",
   "pipeline.cases.links.write",
   "pipeline.cases.review",
+  "pipeline.cases.evidence.write",
   // Case documents (the merge dossier and friends). A plugin write is a
   // system-actor write: no agent run backs it, so it carries no run id.
   "pipeline.cases.documents.read",

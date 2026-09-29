@@ -11,6 +11,7 @@ import {
   issues as issuesTable,
   pipelineCaseEvents,
   pipelineCaseIssueLinks,
+  pipelineCaseWork,
   pipelineCases,
   pipelineStages,
   pluginLogs,
@@ -37,6 +38,9 @@ import { companyService } from "./companies.js";
 import { agentService } from "./agents.js";
 import { projectService } from "./projects.js";
 import { executionWorkspaceService } from "./execution-workspaces.js";
+import { workspaceRevisionInspectionService } from "./workspace-revision-inspection.js";
+import { workspaceSourceWritingService } from "./workspace-source-writing.js";
+import { environmentRuntimeService } from "./environment-runtime.js";
 import { issueService } from "./issues.js";
 import { issueThreadInteractionService } from "./issue-thread-interactions.js";
 import { goalService } from "./goals.js";
@@ -46,6 +50,9 @@ import { budgetService } from "./budgets.js";
 import { issueApprovalService } from "./issue-approvals.js";
 import { approvalService } from "./approvals.js";
 import { pipelineService } from "./pipelines.js";
+import { publishStageEvidence } from "./pipeline-stage-evidence.js";
+import { pluginPipelineAuthoring } from "./plugin-pipeline-authoring.js";
+import { withCaseWorkWake } from "./pipeline-case-work.js";
 import {
   parsePipelineCaseDocumentInput,
   parsePipelineDocumentKey,
@@ -761,6 +768,10 @@ export function buildHostServices(
   });
   const projects = projectService(db);
   const executionWorkspaces = executionWorkspaceService(db);
+  const workspaceRuntime = environmentRuntimeService(db, { pluginWorkerManager: options.pluginWorkerManager });
+  const revisionInspection = workspaceRevisionInspectionService(db, { pluginId, pluginKey }, workspaceRuntime);
+  const sourceWriting = workspaceSourceWritingService(db, { pluginId, pluginKey,
+    requireHumanMember: (companyId, userId) => requireActiveHumanMember(companyId, userId) }, workspaceRuntime);
   const issues = issueService(db);
   const documents = documentService(db);
   const goals = goalService(db);
@@ -1899,6 +1910,21 @@ export function buildHostServices(
     },
 
     executionWorkspaces: {
+      async editSources(params) {
+        const companyId = ensureCompanyId(params.companyId);
+        await ensurePluginAvailableForCompany(companyId);
+        return sourceWriting.edit(params.workspaceId, companyId, params.input);
+      },
+      async abortSourceEdit(params) {
+        const companyId = ensureCompanyId(params.companyId);
+        await ensurePluginAvailableForCompany(companyId);
+        return sourceWriting.abort(params.workspaceId, companyId, params.input);
+      },
+      async inspectRevision(params) {
+        const companyId = ensureCompanyId(params.companyId);
+        await ensurePluginAvailableForCompany(companyId);
+        return revisionInspection.inspect(params.workspaceId, companyId, params.input);
+      },
       async get(params) {
         const companyId = ensureCompanyId(params.companyId);
         await ensurePluginAvailableForCompany(companyId);
@@ -1997,6 +2023,7 @@ export function buildHostServices(
         );
         const issue = (await issues.create(companyId, {
           ...(issueInput as any),
+          idempotencyKey: params.idempotencyKey ? `plugin:${pluginId}:${params.idempotencyKey}` : undefined,
           originKind: normalizedOriginKind,
           originId: params.originId ?? null,
           originRunId: params.originRunId ?? actorRunId ?? null,
@@ -2238,6 +2265,7 @@ export function buildHostServices(
       async requestWakeup(params) {
         const companyId = ensureCompanyId(params.companyId);
         await ensurePluginAvailableForCompany(companyId);
+        return withCaseWorkWake(db, { companyId, issueId: params.issueId, pluginId, expected: params.expectedCaseWork }, async () => {
         const issue = requireInCompany("Issue", await issues.getById(params.issueId), companyId);
         if (!issue.assigneeAgentId) {
           throw unprocessable("Issue has no assigned agent to wake", { code: "no_assignee" });
@@ -2282,7 +2310,7 @@ export function buildHostServices(
             pluginKey,
             contextSource,
           },
-          idempotencyKey: params.idempotencyKey ?? null,
+          idempotencyKey: params.expectedCaseWork ? `case-work:${params.expectedCaseWork.caseId}:${params.expectedCaseWork.turn}` : params.idempotencyKey ?? null,
           requestedByActorType: "system",
           requestedByActorId: pluginId,
           contextSnapshot: {
@@ -2290,6 +2318,7 @@ export function buildHostServices(
             taskId: issue.id,
             wakeReason: params.reason ?? "plugin_issue_wakeup_requested",
             source: contextSource,
+            caseWorkTurn: params.expectedCaseWork ?? null,
             pluginId,
             pluginKey,
           },
@@ -2313,12 +2342,16 @@ export function buildHostServices(
           },
         });
         return { queued: Boolean(run), runId: run?.id ?? null };
+        }, (execution) => ({ queued: execution.runIds.length > 0, runId: execution.runIds.at(-1) ?? null }));
       },
       async requestWakeups(params) {
         const companyId = ensureCompanyId(params.companyId);
         await ensurePluginAvailableForCompany(companyId);
         const results = [];
         for (const issueId of [...new Set(params.issueIds)]) {
+          const [caseWork] = await db.select({ id: pipelineCaseWork.id }).from(pipelineCaseWork)
+            .where(and(eq(pipelineCaseWork.companyId, companyId), eq(pipelineCaseWork.issueId, issueId)));
+          if (caseWork) throw unprocessable("Preparation tasks require a wake with the expected case turn", { code: "case_turn_required" });
           const issue = requireInCompany("Issue", await issues.getById(issueId), companyId);
           if (!issue.assigneeAgentId) {
             throw new Error("Issue has no assigned agent to wake");
@@ -2816,6 +2849,13 @@ export function buildHostServices(
     },
 
     pipelines: {
+      ...pluginPipelineAuthoring(db, { pluginId, pluginKey, ensureCompany: ensurePluginAvailableForCompany }),
+      async publishEvidence(params) {
+        const companyId = ensureCompanyId(params.companyId);
+        await ensurePluginAvailableForCompany(companyId);
+        return publishStageEvidence(db, { companyId, caseId: params.caseId,
+          producerPluginId: pluginId, producerPluginKey: pluginKey, evidence: params.evidence });
+      },
       async getCase(params) {
         const companyId = ensureCompanyId(params.companyId);
         await ensurePluginAvailableForCompany(companyId);
@@ -2841,6 +2881,7 @@ export function buildHostServices(
           companyId: row.case.companyId,
           pipelineId: row.case.pipelineId,
           caseKey: row.case.caseKey,
+          stageEvidenceId: row.case.stageEvidenceId,
           title: row.case.title,
           summary: row.case.summary,
           fields: row.case.fields,
@@ -2952,6 +2993,7 @@ export function buildHostServices(
           ...(params.fields !== undefined ? { edits: { fields: params.fields } } : {}),
           expectedVersion: params.expectedVersion,
           actor: { type: "agent", agentId: params.actorAgentId, runId: params.actorRunId },
+          evidenceId: params.evidenceId,
         });
         return {
           caseId: result.case.id,
