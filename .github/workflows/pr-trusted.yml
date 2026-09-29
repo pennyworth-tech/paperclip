@@ -530,8 +530,20 @@ jobs:
         if: matrix.group == 'general-workspaces-b'
         run: |
           sudo apt-get update
-          sudo apt-get install -y bubblewrap
-          bwrap --ro-bind / / --unshare-pid --unshare-ipc --unshare-uts -- /bin/true
+          sudo apt-get install -y bubblewrap apparmor
+          # Ubuntu restricts unprivileged user namespaces. Give only this CI
+          # sandbox executable permission; keep the system restriction enabled.
+          sudo install -m 755 /usr/bin/bwrap /usr/local/bin/paperclip-ci-bwrap
+          sudo tee /etc/apparmor.d/paperclip-ci-bwrap >/dev/null <<'PROFILE'
+          abi <abi/4.0>,
+          include <tunables/global>
+          profile paperclip-ci-bwrap /usr/local/bin/paperclip-ci-bwrap flags=(unconfined) {
+            userns,
+          }
+          PROFILE
+          sudo apparmor_parser -r /etc/apparmor.d/paperclip-ci-bwrap
+          /usr/local/bin/paperclip-ci-bwrap --ro-bind / / --unshare-pid --unshare-ipc --unshare-uts -- /bin/true
+          echo 'PAPERCLIP_TEST_BWRAP_COMMAND=/usr/local/bin/paperclip-ci-bwrap' >> "$GITHUB_ENV"
 
       - name: Run grouped general test suites
         run: |

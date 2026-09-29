@@ -1105,6 +1105,7 @@ describe("runChildProcess — child env allowlist boundary", () => {
           {
             cwd: workspace,
             localProcessSandbox: {
+              command: process.env.PAPERCLIP_TEST_BWRAP_COMMAND,
               workspaceDir: workspace,
               filesystemScope: "workspace",
               homeDir: "/sandbox-home",
