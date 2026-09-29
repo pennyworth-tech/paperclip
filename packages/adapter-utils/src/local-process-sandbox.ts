@@ -49,9 +49,11 @@ interface NetworkAllowlistProxy {
 }
 
 const SYSTEM_READ_PATHS = [
+  // The fresh root's /bin, /sbin and /lib aliases point into /usr. Mount
+  // their targets first so bind mounts can resolve them on merged-/usr Linux.
+  "/usr",
   "/bin",
   "/sbin",
-  "/usr",
   "/lib",
   "/lib64",
   "/etc/ca-certificates",
