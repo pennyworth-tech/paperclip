@@ -6,12 +6,10 @@ import type { PluginWorkspaceRevisionRequest } from "@paperclipai/plugin-sdk";
 import { conflict, forbidden, notFound, unprocessable } from "../errors.js";
 import type { EnvironmentRuntimeService } from "./environment-runtime.js";
 import { readWorkspaceProgramPlacement, runRemoteWorkspaceProgram, runUnleasedWorkspaceProgram, workspaceProgramCopyRoot, workspaceProgramDirectory } from "./workspace-program-environment.js";
+import { sameWorkspaceRepository } from "./workspace-repository.js";
+export { sameWorkspaceRepository } from "./workspace-repository.js";
 
 type ContextDb = Db | Parameters<Parameters<Db["transaction"]>[0]>[0];
-export function sameWorkspaceRepository(metadata: string | null, repositorySsh: string) {
-  return metadata?.replace(/^https:\/\/github\.com\//, "git@github.com:").replace(/\.git$/, "") === repositorySsh.replace(/\.git$/, "");
-}
-
 export async function readWorkspaceRevisionBinding(db: ContextDb, producer: { pluginId: string; pluginKey: string },
   workspaceId: string, companyId: string, input: PluginWorkspaceRevisionRequest, options: { ignoreVersion?: boolean; forUpdate?: boolean } = {}) {
   const query = db.select({ workspace: executionWorkspaces, case: pipelineCases, work: pipelineCaseWork, issue: issues })

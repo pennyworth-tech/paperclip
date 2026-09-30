@@ -1,8 +1,10 @@
 import type { PluginWorkspaceRevisionRequest } from "@paperclipai/plugin-sdk";
 import { inspectOpenSpecTree } from "./workspace-openspec-tree.js";
+import { sameWorkspaceRepository } from "./workspace-repository.js";
 
 /** Serialized and executed inside the resolved workspace environment, never in the plugin. */
-function inspectCommittedOpenSpec(input: PluginWorkspaceRevisionRequest, inspectTree: typeof inspectOpenSpecTree) {
+function inspectCommittedOpenSpec(input: PluginWorkspaceRevisionRequest, inspectTree: typeof inspectOpenSpecTree,
+  sameRepository: typeof sameWorkspaceRepository) {
   const fs = require("node:fs") as typeof import("node:fs");
   const cp = require("node:child_process") as typeof import("node:child_process");
   const maxBytes = 8 * 1024 * 1024;
@@ -23,8 +25,7 @@ function inspectCommittedOpenSpec(input: PluginWorkspaceRevisionRequest, inspect
     if (git(["symbolic-ref", "--short", "HEAD"]).trim() !== input.branch) fail("branch_mismatch");
     if (git(["rev-parse", "HEAD"]).trim() !== input.commitSha) fail("revision_conflict");
     const remoteUrl = git(["config", "--get", "remote.origin.url"]).trim();
-    const httpsUrl = input.repositorySsh.replace(/^git@github\.com:/, "https://github.com/");
-    if (![input.repositorySsh, httpsUrl, httpsUrl.replace(/\.git$/, "")].includes(remoteUrl)) fail("repository_mismatch");
+    if (!sameRepository(remoteUrl, input.repositorySsh)) fail("repository_mismatch");
     // Check before status: a repository-owned clean/process filter can execute
     // while Git checks worktree contents and inherit the runtime credential.
     const localConfig = git(["config", "--show-scope", "--get-regexp", "^(credential\\..*|http\\..*|core\\.askpass|filter\\..*\\.(clean|process))$"], true);
@@ -52,4 +53,4 @@ function inspectCommittedOpenSpec(input: PluginWorkspaceRevisionRequest, inspect
 // functions. Provide the same harmless helper when the server is bundled.
 export const workspaceRevisionInspectionProgram = "const __name=(fn,name)=>Object.defineProperty(fn,'name',{value:name,configurable:true}); ("
   + inspectCommittedOpenSpec.toString() + ")(JSON.parse(require('node:fs').readFileSync(0,'utf8')), "
-  + inspectOpenSpecTree.toString() + ")";
+  + inspectOpenSpecTree.toString() + ", " + sameWorkspaceRepository.toString() + ")";

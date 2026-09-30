@@ -68,6 +68,9 @@ provider as managed checkouts. Credentials are passed only to the verification
 process environment; they are not stored in repository configuration or inspection
 receipts. Repository-owned credential helpers, HTTP overrides, executable Git
 filters, and remote rewrites are rejected before worktree or remote checks.
+Copied verification workspaces retain the same origin and transport. The
+editSources API still requires the canonical SSH origin; HTTPS inspection support does
+not change that separate source-writing API.
 
 ### Mobile-friendly preview (`pnpm dev:mobile`)
 
