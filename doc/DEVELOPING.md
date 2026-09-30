@@ -66,7 +66,13 @@ Committed workspace revision inspection preserves the workspace's existing GitHu
 SSH or HTTPS origin. HTTPS verification uses the same company Git credential
 provider as managed checkouts. Credentials are passed only to the verification
 process environment; they are not stored in repository configuration or inspection
-receipts. Repository-owned credential helpers, HTTP overrides, executable Git
+receipts. The host validates the actual origin and repository configuration in a
+credential-free preflight before resolving company credentials; SSH verification
+does not resolve a GitHub token. A reacquired remote copy preserves the canonical
+workspace's origin and uses that same preflight in its staged directory. Source
+editing accepts the same SSH and HTTPS origins and preserves the canonical
+remote; publication still uses the request's canonical SSH repository identity.
+Repository-owned credential helpers, HTTP overrides, executable Git
 filters, and remote rewrites are rejected before worktree or remote checks.
 
 ### Mobile-friendly preview (`pnpm dev:mobile`)

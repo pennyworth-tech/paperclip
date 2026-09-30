@@ -91,6 +91,10 @@ suite("committed Git and native OpenSpec inspection", () => {
     expect(await inspect()).toMatchObject({ ok: true, result: { commitSha: baseline, remoteCommitSha: baseline } });
     expect(git("config", "--get", "remote.origin.url")).toBe(url);
   });
+  it("rejects an origin changed after credential preflight", async () => {
+    vi.stubEnv("PAPERCLIP_WORKSPACE_INSPECTION_ORIGIN", "https://github.com/fixture/spec.git");
+    expect(await inspect()).toMatchObject({ ok: false, code: "repository_mismatch" });
+  });
   it.each(["https://github.com/other/spec.git", "https://user:token@github.com/fixture/spec.git", "https://github.com/fixture/spec.git?ref=other", "https://github.com.evil.test/fixture/spec.git"])("rejects mismatched or credentialed origin %s", async (url) => {
     git("remote", "set-url", "origin", url);
     expect(await inspect()).toMatchObject({ ok: false, code: "repository_mismatch" });
