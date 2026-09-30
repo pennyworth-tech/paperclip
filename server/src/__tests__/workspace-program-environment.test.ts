@@ -27,7 +27,7 @@ function fixture(driver: Environment["driver"] = "sandbox") {
   const lease = { id: randomUUID(), companyId, environmentId: environment.id, executionWorkspaceId: workspaceId, issueId,
     heartbeatRunId: null, status: "active", releasedAt: null, expiresAt: null, provider: driver === "sandbox" ? "kubernetes" : driver,
     metadata: { driver, remoteCwd: "/connection-root", workspaceRealization: record } } as EnvironmentLease;
-  const release = vi.fn(async () => lease), execute = vi.fn(async () => ({ exitCode: 0, stdout: '{"ok":true}' }));
+  const release = vi.fn(async () => lease), execute = vi.fn(async (_command: unknown) => ({ exitCode: 0, stdout: '{"ok":true}' }));
   const runtime = { getDriver: vi.fn(() => ({ releaseRunLease: release, realizeWorkspace: vi.fn() })),
     acquireRunLease: vi.fn(async () => ({ environment, lease })), realizeWorkspace: vi.fn(async () => ({ cwd: record.authoritativeRoot,
       metadata: { workspaceRealization: record } })), execute } as unknown as EnvironmentRuntimeService;
@@ -120,6 +120,24 @@ describe("case workspace environment ownership and placement", () => {
 });
 
 describe("fixed programs on realized case workspaces", () => {
+  it.each(["active", "unleased", "copy"])("runs credential-free preflight in the same %s sandbox placement before passing auth", async (kind) => {
+    const f = fixture();
+    if (kind === "copy") {
+      const record = { ...f.record, mode: "copy", authoritativeRoot: "/host/mirror", local: { ...f.record.local, path: "/host/mirror" } };
+      f.binding.workspace.metadata!.workspaceRealization = record;
+      vi.mocked(f.runtime.realizeWorkspace).mockResolvedValue({ cwd: "/connection-root", metadata: { workspaceRealization: record } });
+    }
+    const env = vi.fn(async (execute: (program: string) => Promise<unknown>) => {
+      await execute("preflight"); return { PAPERCLIP_GIT_TOKEN: "fixture-token" };
+    });
+    await executeWorkspaceRevisionProgram(kind === "active" ? database([{ lease: f.lease, environment: f.environment }]) : database([], []),
+      f.runtime, f.binding, "inspection", {}, { env });
+    const commands = f.execute.mock.calls.map(([command]) => command as unknown as { args: string[]; cwd: string; env?: Record<string, string> });
+    expect(commands[0]).toMatchObject({ args: ["-e", "preflight"], env: undefined });
+    expect(commands[1]).toMatchObject({ args: ["-e", "inspection"], cwd: commands[0]!.cwd, env: { PAPERCLIP_GIT_TOKEN: "fixture-token" } });
+    expect(f.runtime.acquireRunLease).toHaveBeenCalledTimes(kind === "active" ? 0 : 1);
+    expect(f.release).toHaveBeenCalledTimes(kind === "active" ? 0 : 1);
+  });
   it("passes host-owned credentials only through the local child environment", async () => {
     const program = "const input=JSON.parse(require('node:fs').readFileSync(0,'utf8')); process.stdout.write(JSON.stringify({authenticated:process.env.PAPERCLIP_GIT_TOKEN==='fixture-token',input}));";
     const result = await runLocalWorkspaceProgram(process.cwd(), program, { value: "request" }, 5000, { PAPERCLIP_GIT_TOKEN: "fixture-token" });

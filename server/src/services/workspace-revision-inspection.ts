@@ -7,6 +7,9 @@ import { conflict, unprocessable } from "../errors.js";
 import type { EnvironmentRuntimeService } from "./environment-runtime.js";
 import { createGitRemoteAuthProvider } from "./git-credentials.js";
 import { workspaceRevisionInspectionProgram } from "./workspace-revision-inspection-program.js";
+import { workspaceRevisionOriginProgram } from "./workspace-revision-origin.js";
+import { sameWorkspaceRepository } from "./workspace-repository.js";
+import type { WorkspaceProgramEnv } from "./workspace-program-environment.js";
 import { executeWorkspaceRevisionProgram, readWorkspaceRevisionBinding, runLocalWorkspaceProgram } from "./workspace-revision-context.js";
 export { sameWorkspaceRepository } from "./workspace-revision-context.js";
 
@@ -30,21 +33,34 @@ export function workspaceRevisionInspectionService(db: Db, producer: { pluginId:
       const input = parsed.data;
       const readBinding = () => readWorkspaceRevisionBinding(db, producer, workspaceId, companyId, input);
       const binding = await readBinding();
-      // Resolve the same company credential used for managed checkouts, only
-      // after workspace ownership is established. Never put it in the request,
-      // program text, repository configuration, or inspection receipt.
-      const auth = await createGitRemoteAuthProvider(db, companyId, {
-        issueId: binding.issue.id, heartbeatRunId: binding.issue.checkoutRunId,
-      })(input.repositorySsh.replace(/^git@github\.com:/, "https://github.com/"));
-      let env: Record<string, string> | undefined;
-      if (auth) {
-        env = { ...auth.env, GIT_CONFIG_COUNT: String(auth.configArgs.length / 2) };
-        for (let i = 0; i < auth.configArgs.length; i += 2) {
-          const config = auth.configArgs[i + 1]!, separator = config.indexOf("=");
-          env[`GIT_CONFIG_KEY_${i / 2}`] = config.slice(0, separator);
-          env[`GIT_CONFIG_VALUE_${i / 2}`] = config.slice(separator + 1);
+      const env: WorkspaceProgramEnv = async (execute) => {
+        // Validate the actual origin and unsafe repository config without a
+        // credential, inside the same placement used for the full inspection.
+        const preflight = await execute(workspaceRevisionOriginProgram);
+        let receipt: { ok: boolean; remoteUrl?: string; code?: string };
+        try { receipt = JSON.parse(preflight.stdout); }
+        catch { throw unprocessable("Invalid workspace preflight receipt", { code: "source_inspection_failed" }); }
+        if (preflight.exitCode !== 0 || !receipt.ok || typeof receipt.remoteUrl !== "string"
+          || !sameWorkspaceRepository(receipt.remoteUrl, input.repositorySsh)) {
+          throw unprocessable("Source preflight failed", { code: /^[a-z][a-z0-9_]*$/.test(receipt.code ?? "") ? receipt.code : "source_inspection_failed" });
         }
-      }
+        const resolved: Record<string, string> = { PAPERCLIP_WORKSPACE_INSPECTION_ORIGIN: receipt.remoteUrl };
+        if (!receipt.remoteUrl.startsWith("https://")) return resolved;
+        const current = await readBinding();
+        if (current.issue.checkoutRunId !== binding.issue.checkoutRunId) throw conflict("Checkout changed during inspection", { code: "source_inspection_stale" });
+        const auth = await createGitRemoteAuthProvider(db, companyId, {
+          issueId: binding.issue.id, heartbeatRunId: binding.issue.checkoutRunId,
+        })(receipt.remoteUrl);
+        if (auth) {
+          Object.assign(resolved, auth.env, { GIT_CONFIG_COUNT: String(auth.configArgs.length / 2) });
+          for (let i = 0; i < auth.configArgs.length; i += 2) {
+            const config = auth.configArgs[i + 1]!, separator = config.indexOf("=");
+            resolved[`GIT_CONFIG_KEY_${i / 2}`] = config.slice(0, separator);
+            resolved[`GIT_CONFIG_VALUE_${i / 2}`] = config.slice(separator + 1);
+          }
+        }
+        return resolved;
+      };
       const execution = await executeWorkspaceRevisionProgram(db, runtime, binding, workspaceRevisionInspectionProgram, input, { env });
       let response: { ok: boolean; code?: string; result?: Omit<PluginWorkspaceRevisionInspection,
         "workspaceId" | "caseId" | "caseVersion" | "workTurn" | "inspectedAt" | "inspectionDigest"> };
