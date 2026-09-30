@@ -16,7 +16,15 @@ function editOpenSpec(input: SourceEditProgramInput, inspectTree: typeof inspect
   const root = process.cwd(), maxBytes = 8 * 1024 * 1024;
   const hash = (value: string) => crypto.createHash("sha256").update(value).digest("hex");
   const fail = (code: string, detail?: string): never => { throw Object.assign(new Error(code), { detail }); };
-  const env = { ...process.env, GIT_OPTIONAL_LOCKS: "0", GIT_NO_REPLACE_OBJECTS: "1", GIT_TERMINAL_PROMPT: "0", OPENSPEC_TELEMETRY: "0", DO_NOT_TRACK: "1" };
+  const env: NodeJS.ProcessEnv = { ...process.env, GIT_OPTIONAL_LOCKS: "0", GIT_NO_REPLACE_OBJECTS: "1", GIT_TERMINAL_PROMPT: "0", OPENSPEC_TELEMETRY: "0", DO_NOT_TRACK: "1" };
+  // Git credentials are needed only by remote Git operations, never by the
+  // OpenSpec CLI, renderer, local Git hooks, or the durable recovery bundle.
+  const networkAuth: Record<string, string> = {};
+  for (const key of Object.keys(env)) {
+    if (key === "PAPERCLIP_GIT_TOKEN" || /^GIT_CONFIG_(?:COUNT|KEY_\d+|VALUE_\d+)$/.test(key)) {
+      networkAuth[key] = env[key]!; delete env[key]; delete process.env[key];
+    }
+  }
   const command = (name: string, args: string[], cwd = root, stdin?: string, extraEnv: Record<string, string> = {}) => {
     const result = cp.spawnSync(name, args, { cwd, input: stdin, env: { ...env, ...extraEnv }, encoding: "utf8", timeout: 90_000, maxBuffer: maxBytes, windowsHide: true });
     if (result.error || result.status !== 0) fail(name === "git" ? "git_operation_failed" : "edit_validation_failed",
@@ -46,8 +54,14 @@ function editOpenSpec(input: SourceEditProgramInput, inspectTree: typeof inspect
     git(["check-ref-format", "refs/heads/" + input.branch]);
     if (fs.realpathSync(git(["rev-parse", "--show-toplevel"]).trim()) !== fs.realpathSync(root)) fail("workspace_root_mismatch");
     if (git(["symbolic-ref", "--short", "HEAD"]).trim() !== input.branch) fail("branch_mismatch");
-    if (!matchesRepository(git(["config", "--get", "remote.origin.url"]).trim(), input.repositorySsh)) fail("repository_mismatch");
+    const remoteUrl = git(["config", "--get", "remote.origin.url"]).trim();
+    if (!matchesRepository(remoteUrl, input.repositorySsh)
+      || (env.PAPERCLIP_WORKSPACE_EDIT_ORIGIN && env.PAPERCLIP_WORKSPACE_EDIT_ORIGIN !== remoteUrl)) fail("repository_mismatch");
+    const localConfig = cp.spawnSync("git", ["config", "--show-scope", "--get-regexp", "^(credential\\..*|http\\..*|core\\.askpass|filter\\..*\\.(clean|process))$"], { cwd: root, env, encoding: "utf8" });
+    if (localConfig.error || ![0, 1].includes(localConfig.status ?? -1)) fail("git_operation_failed");
+    if (localConfig.stdout.split(/\r?\n/).some((line) => /^(local|worktree)\s/.test(line))) fail("git_transport_override");
     const transport = cp.spawnSync("git", ["config", "--get-regexp", "^(core\\.sshcommand|url\\..*\\.(insteadof|pushinsteadof)|remote\\.origin\\.(proxy|pushurl))$"], { cwd: root, env, encoding: "utf8" });
+    if (transport.error || ![0, 1].includes(transport.status ?? -1)) fail("git_operation_failed");
     if (transport.stdout?.trim()) fail("git_transport_override");
     const requestDigest = hash(JSON.stringify({ operationId: input.operationId, commitSha: input.commitSha,
       repositorySsh: input.repositorySsh, branch: input.branch, changeId: input.changeId,
@@ -344,7 +358,8 @@ function editOpenSpec(input: SourceEditProgramInput, inspectTree: typeof inspect
     }
     if (input.mode === "apply") {
       const remote = () => {
-        const line = git(["ls-remote", "--exit-code", input.repositorySsh, "refs/heads/" + input.branch]).trim();
+        if (git(["config", "--get", "remote.origin.url"]).trim() !== remoteUrl) fail("repository_mismatch");
+        const line = git(["ls-remote", "--exit-code", remoteUrl, "refs/heads/" + input.branch], root, undefined, networkAuth).trim();
         const [sha, ref] = line.split("\t");
         if (!/^[a-f0-9]{40}$/.test(sha ?? "") || ref !== "refs/heads/" + input.branch) fail("remote_revision_conflict");
         return sha;
@@ -365,8 +380,9 @@ function editOpenSpec(input: SourceEditProgramInput, inspectTree: typeof inspect
           "process.exit(rows.length===1&&rows[0].length===4&&rows[0][1]===" + JSON.stringify(journal.commitSha) +
           "&&rows[0][2]===" + JSON.stringify("refs/heads/" + input.branch) + "&&rows[0][3]===" + JSON.stringify(input.commitSha) + "?0:1);\n", 0o700);
         journal.pushAttempted = true; save();
-        git(["-c", "core.hooksPath=" + hooks, "push", "--porcelain", input.repositorySsh,
-          journal.commitSha! + ":refs/heads/" + input.branch], candidate);
+        if (git(["config", "--get", "remote.origin.url"]).trim() !== remoteUrl) fail("repository_mismatch");
+        git(["-c", "core.hooksPath=" + hooks, "push", "--porcelain", remoteUrl,
+          journal.commitSha! + ":refs/heads/" + input.branch], candidate, undefined, networkAuth);
       }
       if (remote() !== journal.commitSha) fail("remote_revision_conflict");
     }
