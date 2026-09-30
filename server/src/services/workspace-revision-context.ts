@@ -5,12 +5,11 @@ import { executionWorkspaces, issues, pipelineCases, pipelineCaseWork } from "@p
 import type { PluginWorkspaceRevisionRequest } from "@paperclipai/plugin-sdk";
 import { conflict, forbidden, notFound, unprocessable } from "../errors.js";
 import type { EnvironmentRuntimeService } from "./environment-runtime.js";
-import { readWorkspaceProgramPlacement, runRemoteWorkspaceProgram, runUnleasedWorkspaceProgram, workspaceProgramCopyRoot, workspaceProgramDirectory } from "./workspace-program-environment.js";
+import { executeWorkspaceProgramWithEnv, readWorkspaceProgramPlacement, runRemoteWorkspaceProgram, runUnleasedWorkspaceProgram, workspaceProgramCopyRoot, workspaceProgramDirectory, type WorkspaceProgramEnv } from "./workspace-program-environment.js";
+import { sameWorkspaceRepository } from "./workspace-repository.js";
+export { sameWorkspaceRepository } from "./workspace-repository.js";
 
 type ContextDb = Db | Parameters<Parameters<Db["transaction"]>[0]>[0];
-export function sameWorkspaceRepository(metadata: string | null, repositorySsh: string) {
-  return metadata?.replace(/^https:\/\/github\.com\//, "git@github.com:").replace(/\.git$/, "") === repositorySsh.replace(/\.git$/, "");
-}
 
 export async function readWorkspaceRevisionBinding(db: ContextDb, producer: { pluginId: string; pluginKey: string },
   workspaceId: string, companyId: string, input: PluginWorkspaceRevisionRequest, options: { ignoreVersion?: boolean; forUpdate?: boolean } = {}) {
@@ -49,7 +48,7 @@ export function runLocalWorkspaceProgram(cwd: string, program: string, input: un
 /** The program is host-owned, never a plugin-supplied command or executable. */
 export async function executeWorkspaceRevisionProgram(db: Db, runtime: EnvironmentRuntimeService,
   binding: Awaited<ReturnType<typeof readWorkspaceRevisionBinding>>, program: string, input: unknown,
-  options: { deadline?: number; env?: Record<string, string> } = {}) {
+  options: { deadline?: number; env?: WorkspaceProgramEnv } = {}) {
   const deadline = Math.min(options.deadline ?? Infinity, Date.now() + 180_000);
   const placement = await readWorkspaceProgramPlacement(db, binding);
   if (placement.environment.driver !== "local") {
@@ -62,7 +61,8 @@ export async function executeWorkspaceRevisionProgram(db: Db, runtime: Environme
     return { ...result, ...(copyRestoreCwd ? { copyRestoreCwd } : {}) };
   }
   if (["local_fs", "git_worktree"].includes(binding.workspace.providerType) && binding.workspace.cwd) {
-    return runLocalWorkspaceProgram(binding.workspace.cwd, program, input, deadline - Date.now(), options.env);
+    return executeWorkspaceProgramWithEnv((program, env) =>
+      runLocalWorkspaceProgram(binding.workspace.cwd!, program, input, deadline - Date.now(), env), program, options.env);
   }
   throw conflict("The workspace's execution environment is unavailable", { code: "workspace_environment_unavailable" });
 }

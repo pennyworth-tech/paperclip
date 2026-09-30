@@ -31,6 +31,15 @@ function executionReceipt(result: { stdout: string; exitCode: number | null; tim
   return { stdout: result.stdout, exitCode: result.timedOut ? null : result.exitCode };
 }
 
+type ProgramExecution = { stdout: string; exitCode: number | null };
+export type WorkspaceProgramEnv = Record<string, string> | ((execute: (program: string) => Promise<ProgramExecution>) => Promise<Record<string, string> | undefined>);
+/** Resolve credentials only after a credential-free command in this same placement. */
+export async function executeWorkspaceProgramWithEnv(execute: (program: string, env?: Record<string, string>) => Promise<ProgramExecution>,
+  program: string, env?: WorkspaceProgramEnv) {
+  const resolved = typeof env === "function" ? await env((preflight) => execute(preflight)) : env;
+  return execute(program, resolved);
+}
+
 /** An active checkout owns its own lease. Another run's lease, or an orphaned
  * environment, cannot turn a remote workspace into a host-local operation. */
 export function selectWorkspaceProgramLease(binding: Binding, rows: LeaseRow[], now = new Date()): LeaseRow | null {
@@ -175,16 +184,17 @@ export async function workspaceProgramRunner(db: Db, runtime: EnvironmentRuntime
 
 export async function runRemoteWorkspaceProgram(db: Db, runtime: EnvironmentRuntimeService, binding: Binding,
   environment: Environment, lease: EnvironmentLease, cwd: string, program: string, input: unknown,
-  deadline = Date.now() + 180_000, env?: Record<string, string>) {
+  deadline = Date.now() + 180_000, env?: WorkspaceProgramEnv) {
   const runner = await workspaceProgramRunner(db, runtime, binding, environment, lease, deadline);
-  return executionReceipt(await runner.execute({ command: "node", args: ["-e", program], cwd, stdin: JSON.stringify(input), env }));
+  return executeWorkspaceProgramWithEnv(async (program, env) =>
+    executionReceipt(await runner.execute({ command: "node", args: ["-e", program], cwd, stdin: JSON.stringify(input), env })), program, env);
 }
 
 /** Reacquire the case's environment. Copy realizations stage a private pinned
  * snapshot; in-place realizations retain the recorded authoritative directory. */
 export async function runUnleasedWorkspaceProgram(db: Db, runtime: EnvironmentRuntimeService, binding: Binding,
   placement: Awaited<ReturnType<typeof readWorkspaceProgramPlacement>>, program: string, input: unknown,
-  deadline = Date.now() + 180_000, env?: Record<string, string>) {
+  deadline = Date.now() + 180_000, env?: WorkspaceProgramEnv) {
   if (deadline - Date.now() < 1000) throw conflict("The workspace execution deadline has expired", { code: "workspace_environment_unavailable" });
   const previous = object(binding.workspace.metadata?.workspaceRealization);
   if (!["in_place", "copy"].includes(String(previous.mode)) || previous.environmentId !== placement.environment.id) {
@@ -234,7 +244,8 @@ export async function runUnleasedWorkspaceProgram(db: Db, runtime: EnvironmentRu
           if (!next) throw conflict("The acquired workspace lease disappeared", { code: "workspace_environment_unavailable" });
           lease = next;
         },
-        execute: async (cwd) => executionReceipt(await runner.execute({ command: "node", args: ["-e", program], cwd, stdin: JSON.stringify(input), env })),
+        execute: async (cwd) => executeWorkspaceProgramWithEnv(async (program, env) =>
+          executionReceipt(await runner.execute({ command: "node", args: ["-e", program], cwd, stdin: JSON.stringify(input), env })), program, env),
       });
       // An acknowledged terminal command no longer owns these private files.
       // On uncertain completion, leave them to lease/provider cleanup instead.

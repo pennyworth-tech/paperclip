@@ -1,9 +1,10 @@
 import type { SourceEditProgramInput, SourceEditRecovery } from "./workspace-source-edit-recovery.js";
 import { inspectOpenSpecTree } from "./workspace-openspec-tree.js";
 import { readSourceEditInspection, type SourceEditInspection } from "./workspace-source-edit-inspection.js";
+import { sameWorkspaceRepository } from "./workspace-repository.js";
 
 /** Host-owned program. No command, executable, arbitrary path, or Git option is supplied by the caller. */
-function editOpenSpec(input: SourceEditProgramInput, inspectTree: typeof inspectOpenSpecTree, readInspection: typeof readSourceEditInspection) {
+function editOpenSpec(input: SourceEditProgramInput, inspectTree: typeof inspectOpenSpecTree, readInspection: typeof readSourceEditInspection, matchesRepository: typeof sameWorkspaceRepository) {
   const fs = require("node:fs") as typeof import("node:fs");
   const os = require("node:os") as typeof import("node:os");
   const path = require("node:path") as typeof import("node:path");
@@ -45,7 +46,7 @@ function editOpenSpec(input: SourceEditProgramInput, inspectTree: typeof inspect
     git(["check-ref-format", "refs/heads/" + input.branch]);
     if (fs.realpathSync(git(["rev-parse", "--show-toplevel"]).trim()) !== fs.realpathSync(root)) fail("workspace_root_mismatch");
     if (git(["symbolic-ref", "--short", "HEAD"]).trim() !== input.branch) fail("branch_mismatch");
-    if (git(["config", "--get", "remote.origin.url"]).trim() !== input.repositorySsh) fail("repository_mismatch");
+    if (!matchesRepository(git(["config", "--get", "remote.origin.url"]).trim(), input.repositorySsh)) fail("repository_mismatch");
     const transport = cp.spawnSync("git", ["config", "--get-regexp", "^(core\\.sshcommand|url\\..*\\.(insteadof|pushinsteadof)|remote\\.origin\\.(proxy|pushurl))$"], { cwd: root, env, encoding: "utf8" });
     if (transport.stdout?.trim()) fail("git_transport_override");
     const requestDigest = hash(JSON.stringify({ operationId: input.operationId, commitSha: input.commitSha,
@@ -456,4 +457,4 @@ function editOpenSpec(input: SourceEditProgramInput, inspectTree: typeof inspect
 
 export const workspaceSourceEditProgram = "const __name=(fn,name)=>Object.defineProperty(fn,'name',{value:name,configurable:true}); ("
   + editOpenSpec.toString() + ")(JSON.parse(require('node:fs').readFileSync(0,'utf8')), "
-  + inspectOpenSpecTree.toString() + ", " + readSourceEditInspection.toString() + ")";
+  + inspectOpenSpecTree.toString() + ", " + readSourceEditInspection.toString() + ", " + sameWorkspaceRepository.toString() + ")";
