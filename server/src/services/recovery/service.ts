@@ -27,6 +27,8 @@ import {
   issueRelations,
   issueThreadInteractions,
   issues,
+  pipelineCaseIssueLinks,
+  pipelineCases,
 } from "@paperclipai/db";
 import { parseObject, asBoolean, asNumber } from "../../adapters/utils.js";
 import { runningProcesses } from "../../adapters/index.js";
@@ -4404,6 +4406,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       approvalRows,
       recoveryIssueRows,
       recoveryActionRows,
+      caseLinkRows,
     ] = await Promise.all([
       issueRowsPromise,
       db
@@ -4517,6 +4520,22 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
               ),
             );
       }),
+      db
+        .select({
+          id: pipelineCases.id,
+          companyId: pipelineCaseIssueLinks.companyId,
+          issueId: pipelineCaseIssueLinks.issueId,
+        })
+        .from(pipelineCaseIssueLinks)
+        .innerJoin(pipelineCases, eq(pipelineCaseIssueLinks.caseId, pipelineCases.id))
+        .where(
+          and(
+            eq(pipelineCaseIssueLinks.role, "origin"),
+            isNull(pipelineCaseIssueLinks.retiredAt),
+            isNull(pipelineCases.retiredAt),
+            isNull(pipelineCases.terminalKind),
+          ),
+        ),
     ]);
 
     const openRecoveryIssues = recoveryIssueRows.flatMap((row) => {
@@ -4585,6 +4604,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       pendingInteractions: interactionRows,
       pendingApprovals: approvalRows,
       openRecoveryIssues: openRecoveryIssues.concat(healthyRecoveryActions),
+      activePipelineCaseLinks: caseLinkRows.map((row) => ({ ...row, status: "active" })),
       now: new Date(),
     });
   }
