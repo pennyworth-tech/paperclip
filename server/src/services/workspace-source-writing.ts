@@ -11,6 +11,7 @@ import { lockEvidenceCase } from "./pipeline-stage-evidence.js";
 import { executeWorkspaceRevisionProgram, readWorkspaceRevisionBinding, runLocalWorkspaceProgram } from "./workspace-revision-context.js";
 import { workspaceEditAbortSchema, workspaceEditRequestSchema } from "./workspace-source-edit.js";
 import { workspaceSourceEditProgram } from "./workspace-source-edit-program.js";
+import { workspaceSourceEditAuthEnv } from "./workspace-source-edit-auth.js";
 import { runDurableSourceEdit, type SourceEditCheckpoint, type SourceEditProgramInput } from "./workspace-source-edit-recovery.js";
 import { assertWorkspaceSourceWriteAvailable, lockSourceWorkspace, SOURCE_WRITE_PHASE, type SourceWriteDb } from "./workspace-source-write-guard.js";
 
@@ -154,8 +155,18 @@ export function workspaceSourceWritingService(db: Db, producer: Producer, runtim
     const { metadata, leaseToken, binding } = reservation;
     try {
       const deadline = Date.now() + 180_000;
-      const execute = (request: SourceEditProgramInput) =>
-        executeWorkspaceRevisionProgram(db, runtime, binding!, workspaceSourceEditProgram, request, { deadline });
+      const execute = (request: SourceEditProgramInput) => {
+        const env = request.mode === "apply" ? workspaceSourceEditAuthEnv(db, companyId, input.repositorySsh, async () => {
+          const current = await readWorkspaceRevisionBinding(db, producer, workspaceId, companyId,
+            { ...input, expectedTurn: metadata!.reservedTurn }, { ignoreVersion: true });
+          if (current.work.sourceWriteId !== input.operationId || current.work.sourceRevisionId !== input.commitSha
+            || current.issue.id !== binding!.issue.id || current.issue.checkoutRunId !== binding!.issue.checkoutRunId) {
+            throw conflict("The source writer changed during preflight", { code: "operation_lease_lost" });
+          }
+          return { issueId: current.issue.id, heartbeatRunId: current.issue.checkoutRunId, responsibleUserId: input.actorUserId };
+        }) : undefined;
+        return executeWorkspaceRevisionProgram(db, runtime, binding!, workspaceSourceEditProgram, request, { deadline, env });
+      };
       // Previously started operations retain their workspace journal protocol;
       // absence of a new checkpoint must not be mistaken for proof of no push.
       const execution = metadata!.recoveryProtocol === "openspec-source-candidate/v1"

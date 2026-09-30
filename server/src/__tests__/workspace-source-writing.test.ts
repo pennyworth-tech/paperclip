@@ -7,6 +7,8 @@ import type { PluginWorkspaceEditRequest } from "@paperclipai/plugin-sdk";
 import type { EnvironmentRuntimeService } from "../services/environment-runtime.js";
 import { workspaceSourceWritingService } from "../services/workspace-source-writing.js";
 import * as workspacePrograms from "../services/workspace-revision-context.js";
+import * as gitCredentials from "../services/git-credentials.js";
+import { workspaceSourceEditOriginProgram } from "../services/workspace-source-edit-auth.js";
 import { sourceEditCandidateRequestDigest } from "../services/workspace-source-edit-recovery.js";
 import { pipelineService } from "../services/pipelines.js";
 import { pipelineCaseWorkService } from "../services/pipeline-case-work.js";
@@ -70,12 +72,14 @@ suite("native source writer and one preparation task", () => {
       }
       return reply(input, input.mode);
     });
-    const editor = workspaceSourceWritingService(db, producer, { execute } as unknown as EnvironmentRuntimeService);
+    const preflight = vi.fn(async () => ({ exitCode: 0, stdout: JSON.stringify({ ok: true, remoteUrl: request.repositorySsh }) }));
+    const editor = workspaceSourceWritingService(db, producer, { execute: (args: { args?: string[]; stdin?: string; cwd?: string }) =>
+      args.args?.includes(workspaceSourceEditOriginProgram) ? preflight() : execute(args) } as unknown as EnvironmentRuntimeService);
     const readCase = async () => (await db.select().from(pipelineCases).where(eq(pipelineCases.id, row.id)))[0]!;
     const publish = async (caseVersion: number, patch = {}) => pipeline.publishRevision({ companyId, caseId: row.id,
       producerPluginId: producer.pluginId, producerPluginKey: producer.pluginKey, expectedVersion: caseVersion, baseRevisionId: base,
       requestKey: "source:" + request.operationId, sourceWriteId: request.operationId, revisionId: next, contentDigest: digest, reason: "Publish verified source", ...patch });
-    return { companyId, project: project!, author: author!, workspace: workspace!, issue: issue!, row, pipeline, work, request, reply, execute, editor, readCase, publish };
+    return { companyId, project: project!, author: author!, workspace: workspace!, issue: issue!, row, pipeline, work, request, reply, execute, preflight, editor, readCase, publish };
   }
 
   it("previews without reserving a writer, changing assignment, or invalidating the case", async () => {
@@ -84,6 +88,25 @@ suite("native source writer and one preparation task", () => {
     expect(await f.work.get(f.companyId, f.row.id)).toMatchObject({ issueId: f.issue.id, turn: 0, sourceWriteId: null, sourceRevisionId: base });
     expect((await f.readCase()).version).toBe(f.row.version);
     expect(await db.select().from(workspaceOperations).where(eq(workspaceOperations.id, f.request.operationId))).toHaveLength(0);
+  });
+  it("resolves company HTTPS publication auth after preflight and the native reservation, without persisting the token", async () => {
+    const f = await seed(), url = "https://github.com/fixture/spec";
+    f.preflight.mockResolvedValue({ exitCode: 0, stdout: JSON.stringify({ ok: true, remoteUrl: url }) });
+    const auth = vi.fn(async () => gitCredentials.buildGitAuthInvocation({ token: "fixture-source-token", source: "company_secret", secretName: "GITHUB_TOKEN" }));
+    const provider = vi.spyOn(gitCredentials, "createGitRemoteAuthProvider").mockReturnValue(auth);
+    try {
+      await f.editor.edit(f.workspace.id, f.companyId, { ...f.request, mode: "preview" });
+      expect(provider).not.toHaveBeenCalled(); expect(f.preflight).not.toHaveBeenCalled();
+      const receipt = await f.editor.edit(f.workspace.id, f.companyId, f.request);
+      expect(f.preflight.mock.invocationCallOrder[0]).toBeLessThan(provider.mock.invocationCallOrder[0]!);
+      expect(provider).toHaveBeenCalledWith(db, f.companyId, { issueId: f.issue.id, heartbeatRunId: null, responsibleUserId: actor.userId });
+      expect(auth).toHaveBeenCalledWith(url);
+      const calls = f.execute.mock.calls as unknown as [{ env?: Record<string, string>; stdin?: string }][];
+      expect(calls[1]![0].env?.PAPERCLIP_GIT_TOKEN).toBeUndefined(); // prepare
+      expect(calls[2]![0].env).toMatchObject({ PAPERCLIP_GIT_TOKEN: "fixture-source-token", PAPERCLIP_WORKSPACE_EDIT_ORIGIN: url });
+      const [operation] = await db.select().from(workspaceOperations).where(eq(workspaceOperations.id, f.request.operationId));
+      expect(JSON.stringify([receipt, operation, calls.map(([args]) => args.stdin)])).not.toContain("fixture-source-token");
+    } finally { provider.mockRestore(); }
   });
   it("parks the same task and blocks native handoff, approval, checkout, workspace cleanup and unrelated publication", async () => {
     const f = await seed(), receipt = await f.editor.edit(f.workspace.id, f.companyId, f.request);

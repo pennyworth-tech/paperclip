@@ -2,7 +2,7 @@ import type { PluginWorkspaceRevisionRequest } from "@paperclipai/plugin-sdk";
 import { sameWorkspaceRepository } from "./workspace-repository.js";
 
 /** Credential-free preflight, serialized into the authoritative workspace. */
-export function readWorkspaceRevisionOrigin(input: PluginWorkspaceRevisionRequest, matches: typeof sameWorkspaceRepository) {
+export function readWorkspaceRevisionOrigin(input: PluginWorkspaceRevisionRequest, matches: typeof sameWorkspaceRepository, checkRevision = true) {
   const fs = require("node:fs") as typeof import("node:fs");
   const cp = require("node:child_process") as typeof import("node:child_process");
   const fail = (code: string): never => { throw new Error(code); };
@@ -19,7 +19,7 @@ export function readWorkspaceRevisionOrigin(input: PluginWorkspaceRevisionReques
   git(["check-ref-format", "refs/heads/" + input.branch]);
   if (fs.realpathSync(git(["rev-parse", "--show-toplevel"]).trim()) !== fs.realpathSync(process.cwd())) fail("workspace_root_mismatch");
   if (git(["symbolic-ref", "--short", "HEAD"]).trim() !== input.branch) fail("branch_mismatch");
-  if (git(["rev-parse", "HEAD"]).trim() !== input.commitSha) fail("revision_conflict");
+  if (checkRevision && git(["rev-parse", "HEAD"]).trim() !== input.commitSha) fail("revision_conflict");
   const remoteUrl = git(["config", "--get", "remote.origin.url"]).trim();
   if (!matches(remoteUrl, input.repositorySsh)) fail("repository_mismatch");
   // Before status or checkout: repository-owned filters can execute during them.

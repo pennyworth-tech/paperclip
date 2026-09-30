@@ -11,6 +11,8 @@ import { runDurableSourceEdit, type SourceEditCheckpoint, type SourceEditProgram
 import { stageWorkspaceProgramCopy, withWorkspaceProgramCopy } from "../services/workspace-program-copy.js";
 import type { CommandManagedRuntimeRunner } from "@paperclipai/adapter-utils/command-managed-runtime";
 import { workspaceEditAbortSchema, workspaceEditRequestSchema } from "../services/workspace-source-edit.js";
+import { buildGitAuthInvocation } from "../services/git-credentials.js";
+import { workspaceSourceEditOriginProgram } from "../services/workspace-source-edit-auth.js";
 
 const originalPath = process.env.PATH ?? "";
 const gitBinary = execFileSync("which", ["git"], { encoding: "utf8" }).trim();
@@ -68,7 +70,7 @@ suite("confined source editing with real Git and OpenSpec validation", { timeout
       signal: error?.signal ?? null, pid: child.pid ?? null, startedAt: null }));
     child.stdin?.on("error", () => {}); child.stdin?.end(request.stdin);
   }) };
-  const copySession = () => {
+  const copySession = (publicationEnv?: Record<string, string>) => {
     let checkpoint: SourceEditCheckpoint = {};
     const execute = vi.fn(async (request: SourceEditProgramInput): Promise<WorkspaceProgramExecution> => stageWorkspaceProgramCopy({
       cwd: repo, request, remoteDirectory: path.join(root, "copy-" + randomUUID()), leaseId: randomUUID(), provider: "test-command-runner",
@@ -78,7 +80,14 @@ suite("confined source editing with real Git and OpenSpec validation", { timeout
         expect(execFileSync(gitBinary, ["rev-parse", "--is-shallow-repository"], { cwd, encoding: "utf8" }).trim()).toBe("true");
         await expect(fs.stat(path.join(cwd, "workspace-secrets.env"))).rejects.toMatchObject({ code: "ENOENT" });
       },
-      execute: async (cwd) => runner.execute({ command: process.execPath, args: ["-e", workspaceSourceEditProgram], cwd, stdin: JSON.stringify(request) }),
+      execute: async (cwd) => {
+        if (request.mode === "apply" && publicationEnv) {
+          const preflight = await runner.execute({ command: process.execPath, args: ["-e", workspaceSourceEditOriginProgram], cwd, stdin: JSON.stringify(request) });
+          expect(JSON.parse(preflight.stdout)).toEqual({ ok: true, remoteUrl: publicationEnv.PAPERCLIP_WORKSPACE_EDIT_ORIGIN });
+        }
+        return runner.execute({ command: process.execPath, args: ["-e", workspaceSourceEditProgram], cwd, stdin: JSON.stringify(request),
+          env: request.mode === "apply" ? publicationEnv : undefined });
+      },
     }));
     const restore = vi.fn(async (request: SourceEditProgramInput, cwd: string) => {
       expect(checkpoint.copyPublication?.commitSha).toBe(checkpoint.recovery!.commitSha);
@@ -99,14 +108,15 @@ suite("confined source editing with real Git and OpenSpec validation", { timeout
     // .git/shallow must fail publication instead of accidentally passing on a
     // tiny fixture whose entire history fits in the transfer.
     for (let i = 0; i < 4; i++) { await write("unrelated.txt", "Older history " + i); commit(); }
-    // Redirect only the SSH coordinate. Push rejection, objects, refs, the local
+    // Redirect only the expected repository transport. Push rejection, objects, refs, the local
     // index, Markdown parsing, and CLI validation run for real.
     await fs.writeFile(path.join(bin, "git"), "#!/usr/bin/env node\n" +
       "const cp=require('node:child_process'),fs=require('node:fs'),path=require('node:path');const args=process.argv.slice(2);" +
       "const push=args.includes('push'),query=args.includes('ls-remote'),network=push||query;" +
       "if(network&&process.env.SOURCE_TEST_NO_NETWORK)process.exit(79);" +
+      "if(network&&process.env.SOURCE_TEST_REQUIRE_AUTH){const credential=cp.spawnSync(" + JSON.stringify(gitBinary) + ",['credential','fill'],{input:'protocol=https\\nhost=github.com\\n\\n',encoding:'utf8'});if(credential.status!==0||!credential.stdout.includes('password=fixture-source-token'))process.exit(78);}" +
       "if(push&&args.some(arg=>arg.startsWith('--force')||arg.startsWith('+')))process.exit(74);" +
-      "if(network){const expected=query?(process.env.SOURCE_TEST_INSPECTION_ORIGIN||" + JSON.stringify(remote) + "):" + JSON.stringify(remote) + ";if(!args.includes(expected))process.exit(12);args[args.indexOf(expected)]=" + JSON.stringify(bare) + ";}" +
+      "if(network){const expected=process.env.SOURCE_TEST_ORIGIN||process.env.SOURCE_TEST_INSPECTION_ORIGIN||" + JSON.stringify(remote) + ";if(!args.includes(expected))process.exit(12);args[args.indexOf(expected)]=" + JSON.stringify(bare) + ";}" +
       "if(query&&process.env.SOURCE_TEST_BEFORE_PUSH){fs.writeFileSync(" + JSON.stringify(path.join(repo, "unrelated.txt")) + ",process.env.SOURCE_TEST_BEFORE_PUSH);}" +
       "if(push&&process.env.SOURCE_TEST_PUSH_RACE){const parent=cp.execFileSync(" + JSON.stringify(gitBinary) + ",['rev-parse','HEAD^'],{encoding:'utf8'}).trim();" +
       "cp.execFileSync(" + JSON.stringify(gitBinary) + ",['push'," + JSON.stringify(bare) + ",parent+':refs/heads/" + branch + "'],{stdio:'pipe'});}" +
@@ -121,6 +131,7 @@ suite("confined source editing with real Git and OpenSpec validation", { timeout
     for (const command of ["openspec", "python3"]) {
       const executable = execFileSync("which", [command], { encoding: "utf8" }).trim();
       await fs.writeFile(path.join(bin, command), "#!/usr/bin/env node\nif(process.env.SOURCE_TEST_NO_SOURCE_TOOLS)process.exit(79);" +
+        "if(process.env.SOURCE_TEST_REQUIRE_AUTH&&(process.env.PAPERCLIP_GIT_TOKEN||process.env.GIT_CONFIG_COUNT))process.exit(78);" +
         "const result=require('node:child_process').spawnSync(" + JSON.stringify(executable) + ",process.argv.slice(2),{stdio:'inherit'});process.exit(result.status??1);", { mode: 0o700 });
     }
     const artifacts = [["research", "research.md"], ["elaboration-proposal", "proposal.md"], ["elaboration-specs", "specs/**/*.md"],
@@ -163,12 +174,43 @@ suite("confined source editing with real Git and OpenSpec validation", { timeout
     expect(git("config", "--get", "remote.origin.url")).toBe(url); expect(git("rev-parse", "HEAD")).toBe(baseline);
   });
   it.each(["https://github.com/fixture/spec.git", "https://github.com/fixture/spec"])("previews and publishes edits from HTTPS origin %s", async (url) => {
-    git("remote", "set-url", "origin", url);
+    git("remote", "set-url", "origin", url); vi.stubEnv("SOURCE_TEST_ORIGIN", url);
     const request = input(); expect(await execute(request)).toMatchObject({ ok: true, result: { published: false } });
+    const auth = buildGitAuthInvocation({ token: "fixture-source-token", source: "company_secret", secretName: "GITHUB_TOKEN" });
+    for (const [key, value] of Object.entries(auth.env)) vi.stubEnv(key, value);
+    vi.stubEnv("SOURCE_TEST_REQUIRE_AUTH", "1"); vi.stubEnv("GIT_CONFIG_COUNT", String(auth.configArgs.length / 2));
+    for (let i = 0; i < auth.configArgs.length; i += 2) {
+      const config = auth.configArgs[i + 1]!, separator = config.indexOf("=");
+      vi.stubEnv(`GIT_CONFIG_KEY_${i / 2}`, config.slice(0, separator)); vi.stubEnv(`GIT_CONFIG_VALUE_${i / 2}`, config.slice(separator + 1));
+    }
     const result = await execute({ ...request, mode: "apply" });
-    expect(result).toMatchObject({ ok: true, result: { published: true } });
+    expect(result, JSON.stringify(result)).toMatchObject({ ok: true, result: { published: true } });
     expect(remoteHead()).toBe(result.result.commitSha); expect(git("rev-parse", "HEAD")).toBe(result.result.commitSha);
     expect(git("config", "--get", "remote.origin.url")).toBe(url); expect(git("status", "--porcelain")).toBe("");
+    expect(JSON.stringify(result)).not.toContain("fixture-source-token");
+    expect(await fs.readFile(path.join(repo, ".git/config"), "utf8")).not.toContain("fixture-source-token");
+    expect(await fs.readFile(path.join(repo, ".git/paperclip-source-edits", request.operationId, "receipt.json"), "utf8")).not.toContain("fixture-source-token");
+  });
+  it("publishes a durable HTTPS copy and restores the canonical workspace without credentials or network", async () => {
+    const url = "https://github.com/fixture/spec", request = input({ mode: "apply" });
+    git("remote", "set-url", "origin", url); vi.stubEnv("SOURCE_TEST_ORIGIN", url); vi.stubEnv("SOURCE_TEST_REQUIRE_AUTH", "1");
+    const auth = buildGitAuthInvocation({ token: "fixture-source-token", source: "company_secret", secretName: "GITHUB_TOKEN" });
+    const env: Record<string, string> = { ...auth.env, PAPERCLIP_WORKSPACE_EDIT_ORIGIN: url, GIT_CONFIG_COUNT: String(auth.configArgs.length / 2) };
+    for (let i = 0; i < auth.configArgs.length; i += 2) {
+      const config = auth.configArgs[i + 1]!, separator = config.indexOf("=");
+      env[`GIT_CONFIG_KEY_${i / 2}`] = config.slice(0, separator); env[`GIT_CONFIG_VALUE_${i / 2}`] = config.slice(separator + 1);
+    }
+    const session = copySession(env);
+    const result = await runDurableSourceEdit(request, false, {}, session);
+    expect(result.exitCode, result.stdout).toBe(0);
+    const receipt = JSON.parse(result.stdout).result;
+    expect(receipt.published).toBe(true); expect(remoteHead()).toBe(receipt.commitSha); expect(git("rev-parse", "HEAD")).toBe(receipt.commitSha);
+    expect(git("config", "--get", "remote.origin.url")).toBe(url); expect(git("status", "--porcelain")).toBe("");
+    expect(session.restore).toHaveBeenCalledTimes(1);
+    expect(JSON.stringify([session.checkpoint(), receipt])).not.toContain("fixture-source-token");
+    vi.stubEnv("SOURCE_TEST_NO_NETWORK", "1"); vi.stubEnv("SOURCE_TEST_NO_SOURCE_TOOLS", "1");
+    const resumed = await runDurableSourceEdit(request, false, session.checkpoint(), session);
+    expect(resumed.exitCode, resumed.stdout).toBe(0); expect(session.execute).toHaveBeenCalledTimes(2);
   });
   it.each(["https://github.com/other/spec.git", "https://user:token@github.com/fixture/spec.git", "https://github.com/fixture/spec.git?ref=other", "https://github.com.evil.test/fixture/spec.git"])("refuses a copy of mismatched origin %s before transport", async (url) => {
     git("remote", "set-url", "origin", url); const use = vi.fn();
