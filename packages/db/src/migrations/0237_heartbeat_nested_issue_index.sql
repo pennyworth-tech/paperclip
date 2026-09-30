@@ -1,0 +1,2 @@
+-- paperclip:migration-safety-ignore large-create-index-not-concurrently: Drizzle runs startup migrations in a transaction, so CONCURRENTLY is unavailable. This index completes both branches of the issue secret-redaction lookup and replaces repeated full JSONB scans with indexed lookups. Live deployments may prebuild the same named index concurrently before applying the migration.
+CREATE INDEX IF NOT EXISTS "heartbeat_runs_company_ctx_nested_issue_idx" ON "heartbeat_runs" USING btree ("company_id",("context_snapshot" -> 'paperclipIssue' ->> 'id'));

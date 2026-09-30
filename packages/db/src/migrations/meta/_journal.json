@@ -1646,6 +1646,13 @@
       "when": 1790638229173,
       "tag": "0236_tearful_hydra",
       "breakpoints": true
+    },
+    {
+      "idx": 237,
+      "version": "7",
+      "when": 1790736604693,
+      "tag": "0237_heartbeat_nested_issue_index",
+      "breakpoints": true
     }
   ]
 }
