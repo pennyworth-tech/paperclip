@@ -62,6 +62,13 @@ pnpm dev:stop --data-dir ./tmp/paperclip-dev
 
 Issue execution may also use project execution workspace policies and workspace runtime services for per-project worktrees, preview servers, and managed dev commands. Configure those through the project workspace/runtime surfaces rather than starting long-running unmanaged processes when a task needs a reusable service.
 
+Committed workspace revision inspection preserves the workspace's existing GitHub
+SSH or HTTPS origin. HTTPS verification uses the same company Git credential
+provider as managed checkouts. Credentials are passed only to the verification
+process environment; they are not stored in repository configuration or inspection
+receipts. Repository-owned credential helpers, HTTP overrides, executable Git
+filters, and remote rewrites are rejected before worktree or remote checks.
+
 ### Mobile-friendly preview (`pnpm dev:mobile`)
 
 The vite dev server serves an unbundled module graph. This is fast to reload on a local machine but too heavy for phones and tablets on slow links (airplane wifi, mobile data, distant tailnet peers). `pnpm dev:mobile` builds the UI once and serves the small production bundle on port `3101` via `vite preview`, proxying `/api` requests to the dev API on `3100`.

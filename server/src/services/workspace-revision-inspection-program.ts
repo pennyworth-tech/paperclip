@@ -22,12 +22,18 @@ function inspectCommittedOpenSpec(input: PluginWorkspaceRevisionRequest, inspect
     if (fs.realpathSync(git(["rev-parse", "--show-toplevel"]).trim()) !== fs.realpathSync(process.cwd())) fail("workspace_root_mismatch");
     if (git(["symbolic-ref", "--short", "HEAD"]).trim() !== input.branch) fail("branch_mismatch");
     if (git(["rev-parse", "HEAD"]).trim() !== input.commitSha) fail("revision_conflict");
-    if (git(["status", "--porcelain=v1", "-z", "--untracked-files=all"])) fail("workspace_dirty");
-    if (git(["config", "--get", "remote.origin.url"]).trim() !== input.repositorySsh) fail("repository_mismatch");
+    const remoteUrl = git(["config", "--get", "remote.origin.url"]).trim();
+    const httpsUrl = input.repositorySsh.replace(/^git@github\.com:/, "https://github.com/");
+    if (![input.repositorySsh, httpsUrl, httpsUrl.replace(/\.git$/, "")].includes(remoteUrl)) fail("repository_mismatch");
+    // Check before status: a repository-owned clean/process filter can execute
+    // while Git checks worktree contents and inherit the runtime credential.
+    const localConfig = git(["config", "--show-scope", "--get-regexp", "^(credential\\..*|http\\..*|core\\.askpass|filter\\..*\\.(clean|process))$"], true);
+    if (localConfig.split(/\r?\n/).some((line) => /^(local|worktree)\s/.test(line))) fail("git_transport_override");
     // Reject repository shell commands, rewrites, and proxies before Git can
-    // replace the declared SSH transport or execute a repository-owned command.
+    // replace the verified remote or execute a repository-owned command.
     if (git(["config", "--get-regexp", "^(core\\.sshcommand|url\\..*\\.(insteadof|pushinsteadof)|remote\\.origin\\.(proxy|pushurl))$"], true).trim()) fail("git_transport_override");
-    const remoteLine = git(["ls-remote", "--exit-code", input.repositorySsh, "refs/heads/" + input.branch]).trim().split(/\r?\n/);
+    if (git(["status", "--porcelain=v1", "-z", "--untracked-files=all"])) fail("workspace_dirty");
+    const remoteLine = git(["ls-remote", "--exit-code", remoteUrl, "refs/heads/" + input.branch]).trim().split(/\r?\n/);
     if (remoteLine.length !== 1 || remoteLine[0] !== input.commitSha + "\trefs/heads/" + input.branch) fail("remote_revision_conflict");
     const snapshot = inspectTree(input, process.cwd());
     if (git(["rev-parse", "HEAD"]).trim() !== input.commitSha || git(["symbolic-ref", "--short", "HEAD"]).trim() !== input.branch

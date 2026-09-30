@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import type { Db } from "@paperclipai/db";
 import type { Environment, EnvironmentLease } from "@paperclipai/shared";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { executeWorkspaceRevisionProgram, type readWorkspaceRevisionBinding } from "../services/workspace-revision-context.js";
+import { executeWorkspaceRevisionProgram, runLocalWorkspaceProgram, type readWorkspaceRevisionBinding } from "../services/workspace-revision-context.js";
 import { assertWorkspaceProgramEnvironment, readWorkspaceProgramPlacement, runRemoteWorkspaceProgram,
   runUnleasedWorkspaceProgram, selectWorkspaceProgramLease, workspaceProgramDirectory } from "../services/workspace-program-environment.js";
 import type { EnvironmentRuntimeService } from "../services/environment-runtime.js";
@@ -120,6 +120,18 @@ describe("case workspace environment ownership and placement", () => {
 });
 
 describe("fixed programs on realized case workspaces", () => {
+  it("passes host-owned credentials only through the local child environment", async () => {
+    const program = "const input=JSON.parse(require('node:fs').readFileSync(0,'utf8')); process.stdout.write(JSON.stringify({authenticated:process.env.PAPERCLIP_GIT_TOKEN==='fixture-token',input}));";
+    const result = await runLocalWorkspaceProgram(process.cwd(), program, { value: "request" }, 5000, { PAPERCLIP_GIT_TOKEN: "fixture-token" });
+    expect(JSON.parse(result.stdout)).toEqual({ authenticated: true, input: { value: "request" } });
+    expect(result.stdout).not.toContain("fixture-token");
+  });
+  it.each([true, false])("passes host credentials to the authoritative sandbox (active lease: %s)", async (active) => {
+    const f = fixture(), env = { PAPERCLIP_GIT_TOKEN: "fixture-token" };
+    const db = active ? database([{ lease: f.lease, environment: f.environment }]) : database([], []);
+    await executeWorkspaceRevisionProgram(db, f.runtime, f.binding, "fixed-program", { value: "request" }, { env });
+    expect(f.execute).toHaveBeenCalledWith(expect.objectContaining({ env, stdin: '{"value":"request"}' }));
+  });
   it("uses the authoritative in-place root and the staged SSH run path for copies", () => {
     const f = fixture("ssh"); f.lease.heartbeatRunId = "run-1";
     expect(workspaceProgramDirectory(f.binding, f.environment, f.lease)).toBe("/persistent/spec-case");
