@@ -71,7 +71,8 @@ export type IssueReviewPathFactKind =
   | "human_reviewer"
   | "active_run"
   | "queued_wake"
-  | "recovery";
+  | "recovery"
+  | "pipeline_case";
 
 export interface IssueReviewPathFact {
   kind: IssueReviewPathFactKind;
@@ -126,6 +127,7 @@ export interface IssueGraphLivenessInput {
   pendingInteractions?: IssueLivenessWaitingPathInput[];
   pendingApprovals?: IssueLivenessWaitingPathInput[];
   openRecoveryIssues?: IssueLivenessWaitingPathInput[];
+  activePipelineCaseLinks?: IssueLivenessWaitingPathInput[];
   now?: Date | string;
 }
 
@@ -277,7 +279,7 @@ export function classifyIssueReviewPaths(
 
   const appendWaitingPaths = (
     entries: IssueLivenessWaitingPathInput[],
-    kind: "interaction" | "approval" | "recovery",
+    kind: "interaction" | "approval" | "recovery" | "pipeline_case",
   ) => {
     for (const entry of entries) {
       if (entry.companyId !== issue.companyId || entry.issueId !== issue.id) continue;
@@ -293,6 +295,10 @@ export function classifyIssueReviewPaths(
   appendWaitingPaths(input.pendingInteractions ?? [], "interaction");
   appendWaitingPaths(input.pendingApprovals ?? [], "approval");
   appendWaitingPaths(input.openRecoveryIssues ?? [], "recovery");
+  // An issue linked as the origin of an active pipeline case is under that
+  // pipeline's review: the case's automations own the next action until the
+  // link retires or the case reaches a terminal stage.
+  appendWaitingPaths(input.activePipelineCaseLinks ?? [], "pipeline_case");
 
   return paths;
 }

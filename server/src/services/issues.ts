@@ -35,6 +35,8 @@ import {
   issueThreadInteractions,
   issues,
   labels,
+  pipelineCaseIssueLinks,
+  pipelineCases,
   projectWorkspaces,
   projects,
   workspaceOperations,
@@ -3248,6 +3250,8 @@ function reviewPathLabel(kind: IssueReviewAttentionPath["kind"], detail?: string
       return detail ? `Queued ${detail.replaceAll("_", " ")} wake` : "Queued review wake";
     case "recovery":
       return "Open review recovery";
+    case "pipeline_case":
+      return "Active pipeline case";
   }
 }
 
@@ -3277,7 +3281,7 @@ async function listIssueReviewAttentionMap(
   }
   if (reviewIssues.length === 0) return result;
 
-  const [agentRows, activeRunRows, wakeRows, interactionRows, approvalRows, recoveryActionRows, recoveryIssueRows] = await Promise.all([
+  const [agentRows, activeRunRows, wakeRows, interactionRows, approvalRows, recoveryActionRows, recoveryIssueRows, caseLinkRows] = await Promise.all([
     dbOrTx
       .select({
         id: agents.id,
@@ -3397,6 +3401,24 @@ async function listIssueReviewAttentionMap(
         visibleIssueCondition(),
         notInArray(issues.status, ["done", "cancelled"]),
       )),
+    dbOrTx
+      .select({
+        id: pipelineCases.id,
+        companyId: pipelineCaseIssueLinks.companyId,
+        issueId: pipelineCaseIssueLinks.issueId,
+        createdAt: pipelineCaseIssueLinks.createdAt,
+      })
+      .from(pipelineCaseIssueLinks)
+      .innerJoin(pipelineCases, eq(pipelineCaseIssueLinks.caseId, pipelineCases.id))
+      .where(and(
+        eq(pipelineCaseIssueLinks.companyId, companyId),
+        eq(pipelineCases.companyId, companyId),
+        eq(pipelineCaseIssueLinks.role, "origin"),
+        isNull(pipelineCaseIssueLinks.retiredAt),
+        isNull(pipelineCases.retiredAt),
+        isNull(pipelineCases.terminalKind),
+        inArray(pipelineCaseIssueLinks.issueId, reviewIds),
+      )),
   ]);
 
   const recoveryPaths = [
@@ -3446,6 +3468,8 @@ async function listIssueReviewAttentionMap(
     pendingInteractions: interactionRows,
     pendingApprovals: approvalRows,
     openRecoveryIssues: recoveryPaths,
+    activePipelineCaseLinks: (caseLinkRows as Array<{ id: string; companyId: string; issueId: string; createdAt: Date }>)
+      .map((row) => ({ ...row, status: "active" })),
     now: new Date(),
   };
   const findingsByIssueId = new Map(
@@ -4166,7 +4190,7 @@ async function listIssueBlockedInboxAttentionMap(
   const graphIssueIds = graphIssues.map((issue) => issue.id);
   const issuesById = new Map<string, IssueRow>(graphIssues.map((issue) => [issue.id, issue]));
 
-  const [activeRunRows, wakeRows, scheduledRetryRows, interactionRows, approvalRows, handoffMap] = await Promise.all([
+  const [activeRunRows, wakeRows, scheduledRetryRows, interactionRows, approvalRows, caseLinkRows, handoffMap] = await Promise.all([
     graphIssueIds.length === 0
       ? Promise.resolve([])
       : dbOrTx
@@ -4265,6 +4289,26 @@ async function listIssueBlockedInboxAttentionMap(
             inArray(approvals.status, [...BLOCKED_INBOX_PENDING_APPROVAL_STATUSES]),
             inArray(issueApprovals.issueId, graphIssueIds),
           )),
+    graphIssueIds.length === 0
+      ? Promise.resolve([])
+      : dbOrTx
+          .select({
+            id: pipelineCases.id,
+            companyId: pipelineCaseIssueLinks.companyId,
+            issueId: pipelineCaseIssueLinks.issueId,
+            createdAt: pipelineCaseIssueLinks.createdAt,
+          })
+          .from(pipelineCaseIssueLinks)
+          .innerJoin(pipelineCases, eq(pipelineCaseIssueLinks.caseId, pipelineCases.id))
+          .where(and(
+            eq(pipelineCaseIssueLinks.companyId, companyId),
+            eq(pipelineCases.companyId, companyId),
+            eq(pipelineCaseIssueLinks.role, "origin"),
+            isNull(pipelineCaseIssueLinks.retiredAt),
+            isNull(pipelineCases.retiredAt),
+            isNull(pipelineCases.terminalKind),
+            inArray(pipelineCaseIssueLinks.issueId, graphIssueIds),
+          )),
     listSuccessfulRunHandoffMapForIssues(dbOrTx, companyId, rowIssueIds, { hydrateLiveness: false }),
   ]);
 
@@ -4331,6 +4375,8 @@ async function listIssueBlockedInboxAttentionMap(
     pendingInteractions,
     pendingApprovals,
     openRecoveryIssues,
+    activePipelineCaseLinks: (caseLinkRows as Array<{ id: string; companyId: string; issueId: string; createdAt: Date }>)
+      .map((row) => ({ ...row, status: "active" })),
     now: new Date(),
   });
   const findingByIssueId = new Map<string, IssueLivenessFinding>();
