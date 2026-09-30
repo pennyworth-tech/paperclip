@@ -79,15 +79,15 @@ ARG PAPERCLIP_BUILD_COMMIT=""
 # versions on its own — every specifier is pinned — so CI stamps it only to
 # force a deliberate rebuild of the layer.
 ARG CLI_TOOLS_CACHE_EPOCH=""
-# Harness versions, resolved on 2026-09-19 and frozen (BAC-4671 tasks 4.2/4.3).
+# Harness versions, refreshed on 2026-09-30 and frozen (BAC-4671 tasks 4.2/4.3).
 # Every specifier used to be `@latest`, which meant the versions in the serving
 # image were whatever the layer last resolved — unknown, and one cache-buster
 # edit upgraded all five at once. That is the shape of the 2026-08-11 incident,
 # where a claude CLI that auto-updated through a shim took the fleet down.
 # Bumping a harness is now a reviewable one-line diff.
-ARG CLAUDE_VERSION=2.1.278
-ARG CODEX_VERSION=0.155.1
-ARG OPENCODE_VERSION=1.18.31
+ARG CLAUDE_VERSION=2.1.285
+ARG CODEX_VERSION=0.159.2
+ARG OPENCODE_VERSION=1.18.33
 ARG GEMINI_VERSION=0.60.0
 ARG KIMI_VERSION=2.0.2
 # `@fission-ai/openspec` is the real package. The bare `openspec` name on npm

@@ -40,6 +40,14 @@ function globalNpmSpecifiers(source: string): string[] {
 }
 
 describe("harness version pinning", () => {
+  it.each([
+    ["CLAUDE_VERSION", "2.1.285"],
+    ["CODEX_VERSION", "0.159.2"],
+    ["OPENCODE_VERSION", "1.18.33"],
+  ])("pins %s to the validated fleet version", (arg, version) => {
+    expect(dockerfile).toMatch(new RegExp(`^ARG ${arg}=${version.replaceAll(".", "\\.")}$`, "m"));
+  });
+
   it("installs no harness at a floating @latest", () => {
     // Floating specifiers meant the versions in the serving image were whatever
     // the layer last resolved, and one cache-buster edit upgraded all of them at
