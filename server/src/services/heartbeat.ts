@@ -106,7 +106,7 @@ import { trackAgentFirstHeartbeat } from "@paperclipai/shared/telemetry";
 import { getTelemetryClient } from "../telemetry.js";
 import { companySkillService } from "./company-skills.js";
 import { budgetService, type BudgetEnforcementScope } from "./budgets.js";
-import { caseWorkRunClaimCondition, isCaseWorkRunCurrent } from "./pipeline-case-work-execution.js";
+import { caseWorkRunClaimCondition, hasActiveCaseWorkContinuation, isCaseWorkRunCurrent } from "./pipeline-case-work-execution.js";
 import { withSourceWriteClaimGuard } from "./workspace-source-write-guard.js";
 import { secretService, type MissingRuntimeBinding } from "./secrets.js";
 import { resolveDefaultAgentWorkspaceDir, resolveManagedProjectWorkspaceDir } from "../home-paths.js";
@@ -9630,6 +9630,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       budgetBlock,
       pauseHold,
       activeRoutineContinuation,
+      activeCaseWorkContinuation,
     ] = await Promise.all([
       issue
         ? db
@@ -9769,6 +9770,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           .limit(1)
           .then((rows) => rows[0] ?? null)
         : Promise.resolve(null),
+      issue ? hasActiveCaseWorkContinuation(db, issue.companyId, issue.id) : Promise.resolve(false),
     ]);
 
     const decision = decideSuccessfulRunHandoff({
@@ -9788,6 +9790,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       hasOpenRecoveryIssue: Boolean(openRecoveryIssue),
       hasPauseHold: Boolean(pauseHold),
       hasActiveRoutineContinuation: Boolean(activeRoutineContinuation),
+      hasActiveCaseWorkContinuation: activeCaseWorkContinuation,
       budgetBlocked: Boolean(budgetBlock),
       idempotentWakeExists: Boolean(existingWake),
     });
@@ -13149,7 +13152,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
     if (!await isCaseWorkRunCurrent(db, run.companyId, issueId, run.agentId, context)) {
       return { stale: true, errorCode: "issue_preparation_turn_changed",
-        reason: "Cancelled because the preparation turn changed or its wake lacks the current turn binding",
+        reason: "Cancelled before execution because this wake is not bound to the current preparation turn",
         details: { issueId } };
     }
 

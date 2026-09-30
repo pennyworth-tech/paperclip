@@ -124,6 +124,7 @@ export type SuccessfulRunHandoffDecision =
 const SUCCESSFUL_RUN_HANDOFF_VALID_PATH_SKIP_REASONS = new Set([
   "issue has execution policy state",
   "active routine continuation owns the next action",
+  "active case-work continuation owns the next action",
   "issue already has an active execution path",
   "issue already has a queued or deferred wake",
   "pending interaction or approval owns the next action",
@@ -449,6 +450,7 @@ export function decideSuccessfulRunHandoff(input: {
   hasOpenRecoveryIssue: boolean;
   hasPauseHold: boolean;
   hasActiveRoutineContinuation: boolean;
+  hasActiveCaseWorkContinuation: boolean;
   budgetBlocked: boolean;
   idempotentWakeExists: boolean;
 }): SuccessfulRunHandoffDecision {
@@ -466,6 +468,9 @@ export function decideSuccessfulRunHandoff(input: {
   if (!agent) return { kind: "skip", reason: "agent not found" };
   if (issue.companyId !== run.companyId || agent.companyId !== run.companyId) {
     return { kind: "skip", reason: "company scope mismatch" };
+  }
+  if (input.hasActiveCaseWorkContinuation) {
+    return { kind: "skip", reason: "active case-work continuation owns the next action" };
   }
   if (issue.assigneeAgentId !== run.agentId) {
     return { kind: "skip", reason: "issue is no longer assigned to the source run agent" };

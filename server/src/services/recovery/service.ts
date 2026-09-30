@@ -32,6 +32,7 @@ import {
 } from "@paperclipai/db";
 import { parseObject, asBoolean, asNumber } from "../../adapters/utils.js";
 import { runningProcesses } from "../../adapters/index.js";
+import { hasActiveCaseWorkContinuation } from "../pipeline-case-work-execution.js";
 import { visibleIssueCondition } from "../issue-visibility.js";
 import { forbidden, notFound } from "../../errors.js";
 import { logger } from "../../middleware/logger.js";
@@ -3626,6 +3627,11 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         ? participantAgentId
         : issue.assigneeAgentId;
       if (!agentId) {
+        result.skipped += 1;
+        continue;
+      }
+
+      if (await hasActiveCaseWorkContinuation(db, issue.companyId, issue.id)) {
         result.skipped += 1;
         continue;
       }

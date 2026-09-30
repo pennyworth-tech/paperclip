@@ -5,7 +5,7 @@ import { agents, agentWakeupRequests, companies, createDb, heartbeatRuns, issues
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { pipelineService } from "../services/pipelines.js";
 import { pipelineCaseWorkService, withCaseWorkWake } from "../services/pipeline-case-work.js";
-import { caseWorkRunClaimCondition, isCaseWorkRunCurrent } from "../services/pipeline-case-work-execution.js";
+import { caseWorkRunClaimCondition, hasActiveCaseWorkContinuation, isCaseWorkRunCurrent } from "../services/pipeline-case-work-execution.js";
 import { issueService } from "../services/issues.js";
 import { pluginPipelineAuthoring } from "../services/plugin-pipeline-authoring.js";
 import { buildHostServices } from "../services/plugin-host-services.js";
@@ -344,11 +344,37 @@ suite("one durable preparation task per pipeline case", () => {
     expect(await isCaseWorkRunCurrent(db, f.companyId, ordinary!.id, f.author.id, {})).toBe(true);
   });
 
+  it("recognizes only live case-work continuations, including accepted results before handoff", async () => {
+    const f = await seed();
+    expect(await hasActiveCaseWorkContinuation(db, f.companyId, f.issue.id)).toBe(false);
+    await f.start();
+    expect(await hasActiveCaseWorkContinuation(db, f.companyId, f.issue.id)).toBe(true);
+    expect(await hasActiveCaseWorkContinuation(db, randomUUID(), f.issue.id)).toBe(false);
+    const run = await f.run(f.author.id);
+    expect(await hasActiveCaseWorkContinuation(db, f.companyId, f.issue.id)).toBe(true);
+    await f.release(run.id);
+    expect(await hasActiveCaseWorkContinuation(db, f.companyId, f.issue.id)).toBe(false);
+    await db.update(heartbeatRuns).set({ status: "running" }).where(eq(heartbeatRuns.id, run.id));
+    await db.update(issues).set({ checkoutRunId: run.id }).where(eq(issues.id, f.issue.id));
+    const result = await f.result(1, f.author.id, run.id);
+    await f.release(run.id);
+    expect(await hasActiveCaseWorkContinuation(db, f.companyId, f.issue.id)).toBe(true);
+    await f.work.handoff(f.companyId, f.row.id, { expectedTurn: 1, expectedAgentId: f.author.id, requestKey: "review",
+      role: "reviewer", agentId: f.reviewer.id, revisionId: "revision-1", priorResultId: result.id, reason: "Review" });
+    expect(await f.readIssue()).toMatchObject({ assigneeAgentId: f.reviewer.id });
+    expect(await hasActiveCaseWorkContinuation(db, f.companyId, f.issue.id)).toBe(true);
+    await db.update(pipelineCases).set({ terminalKind: "cancelled" }).where(eq(pipelineCases.id, f.row.id));
+    expect(await hasActiveCaseWorkContinuation(db, f.companyId, f.issue.id)).toBe(false);
+    await db.update(pipelineCases).set({ terminalKind: null, retiredAt: new Date() }).where(eq(pipelineCases.id, f.row.id));
+    expect(await hasActiveCaseWorkContinuation(db, f.companyId, f.issue.id)).toBe(false);
+  });
+
   it("keeps a native deferred wake pending instead of assuming it was lost", async () => {
     const f = await seed(); await f.start();
     await db.insert(agentWakeupRequests).values({ companyId: f.companyId, agentId: f.author.id, source: "assignment",
       status: "deferred_issue_execution", requestedByActorId: producer.pluginId, idempotencyKey: `case-work:${f.row.id}:1` });
     expect((await f.work.get(f.companyId, f.row.id))!.execution.state).toBe("pending");
+    expect(await hasActiveCaseWorkContinuation(db, f.companyId, f.issue.id)).toBe(true);
     await expect(f.work.handoff(f.companyId, f.row.id, { expectedTurn: 1, expectedAgentId: f.author.id, requestKey: "unsafe-retry",
       role: "author", agentId: f.author.id, revisionId: null, reason: "Guessing that the wake was lost" })).rejects.toMatchObject({ details: { code: "wake_pending" } });
     let called = false;
