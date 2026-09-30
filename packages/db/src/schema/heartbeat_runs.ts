@@ -152,6 +152,12 @@ export const heartbeatRuns = pgTable(
       sql`(${table.contextSnapshot} ->> 'issueId')`,
       table.createdAt.desc(),
     ),
+    // Both branches of the issue redaction lookup need expression indexes.
+    // An unindexed nested fallback makes the OR scan every run's JSONB context.
+    companyCtxNestedIssueIdx: index("heartbeat_runs_company_ctx_nested_issue_idx").on(
+      table.companyId,
+      sql`(${table.contextSnapshot} -> 'paperclipIssue' ->> 'id')`,
+    ),
     companyCtxTaskCreatedIdx: index("heartbeat_runs_company_ctx_task_created_idx").on(
       table.companyId,
       sql`(${table.contextSnapshot} ->> 'taskId')`,
