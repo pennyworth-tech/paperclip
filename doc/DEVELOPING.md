@@ -66,8 +66,8 @@ Committed workspace revision inspection preserves the workspace's existing GitHu
 SSH or HTTPS origin. HTTPS verification uses the same company Git credential
 provider as managed checkouts. Credentials are passed only to the verification
 process environment; they are not stored in repository configuration or inspection
-receipts. Repository-owned credential helpers, HTTP overrides, and remote rewrites
-are rejected before the remote branch is checked.
+receipts. Repository-owned credential helpers, HTTP overrides, executable Git
+filters, and remote rewrites are rejected before worktree or remote checks.
 
 ### Mobile-friendly preview (`pnpm dev:mobile`)
 

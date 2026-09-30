@@ -95,12 +95,23 @@ suite("committed Git and native OpenSpec inspection", () => {
     git("remote", "set-url", "origin", url);
     expect(await inspect()).toMatchObject({ ok: false, code: "repository_mismatch" });
   });
-  it.each(["credential.helper", "http.proxy", "http.sslVerify", "core.askpass"])("rejects repository-owned authentication setting %s", async (key) => {
+  it.each(["credential.helper", "http.proxy", "http.sslVerify", "core.askpass", "filter.fixture.clean", "filter.fixture.process"])("rejects repository-owned authentication or executable setting %s", async (key) => {
     const url = "https://github.com/fixture/spec.git";
     git("remote", "set-url", "origin", url); vi.stubEnv("INSPECTION_TEST_REMOTE_URL", url);
     git("config", "--local", key, "untrusted");
     try { expect(await inspect()).toMatchObject({ ok: false, code: "git_transport_override" }); }
     finally { git("config", "--local", "--unset-all", key); }
+  });
+  it("rejects a repository filter before status can expose the credential", async () => {
+    await write(".gitattributes", "payload.txt filter=fixture\n"); await write("payload.txt", "tracked\n"); commit();
+    const marker = path.join(root, "filter-credential.txt");
+    git("config", "--local", "filter.fixture.clean", "printf '%s' \"$PAPERCLIP_GIT_TOKEN\" > '" + marker + "'; cat");
+    await write("replacement.txt", "tracked\n"); await fs.rename(path.join(repo, "replacement.txt"), path.join(repo, "payload.txt"));
+    vi.stubEnv("PAPERCLIP_GIT_TOKEN", "fixture-token");
+    try {
+      expect(await inspect()).toMatchObject({ ok: false, code: "git_transport_override" });
+      await expect(fs.access(marker)).rejects.toMatchObject({ code: "ENOENT" });
+    } finally { git("config", "--local", "--unset-all", "filter.fixture.clean"); }
   });
   it("returns immutable blob bytes, the source commit, and actual CLI validation", async () => {
     const result = await inspect();
