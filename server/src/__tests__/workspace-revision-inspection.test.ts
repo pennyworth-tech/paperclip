@@ -14,14 +14,14 @@ const suite = cliAvailable ? describe : describe.skip;
 if (!cliAvailable) console.warn("Workspace CLI inspection tests need the installed OpenSpec CLI");
 const hash = (text: string) => createHash("sha256").update(text).digest("hex");
 describe("bounded workspace inspection input", () => {
-  it("accepts equivalent stored browser metadata while leaving Git transport SSH-only", () => {
+  it("accepts equivalent browser metadata for the canonical repository identity", () => {
     const repository = "git@github.com:fixture/spec.git";
     expect(sameWorkspaceRepository("https://github.com/fixture/spec", repository)).toBe(true);
     expect(sameWorkspaceRepository(repository, repository)).toBe(true);
     for (const value of [null, "https://github.com/other/spec.git", "https://github.com/fixture/spec.git?ref=other",
       "https://user:token@github.com/fixture/spec.git", "https://github.com.evil.test/fixture/spec.git"]) expect(sameWorkspaceRepository(value, repository)).toBe(false);
   });
-  it("does not accept commands, paths, mutable Git expressions, or HTTPS transports", () => {
+  it("does not accept commands, paths, mutable Git expressions, or noncanonical repository identities", () => {
     const input = { caseId: randomUUID(), expectedVersion: 1, expectedTurn: 0, commitSha: "a".repeat(40),
       repositorySsh: "git@github.com:fixture/spec.git", branch: "openspec/test", changeId: "test-spec" };
     expect(workspaceRevisionRequestSchema.safeParse(input).success).toBe(true);
@@ -54,7 +54,7 @@ suite("committed Git and native OpenSpec inspection", () => {
     await fs.writeFile(path.join(bin, "git"), "#!/usr/bin/env node\n" +
       "const cp=require('node:child_process');const args=process.argv.slice(2);" +
       "if(args.includes('ls-remote')){" +
-      "if(!args.includes(" + JSON.stringify(remote) + "))process.exit(12);" +
+      "if(!args.includes(process.env.INSPECTION_TEST_REMOTE_URL||" + JSON.stringify(remote) + "))process.exit(12);" +
       "const sha=process.env.INSPECTION_TEST_REMOTE_SHA||cp.execFileSync(" + JSON.stringify(gitBinary) + ",[\"rev-parse\",\"HEAD\"],{encoding:'utf8'}).trim();" +
       "process.stdout.write(sha+'\\trefs/heads/" + branch + "\\n');}else{" +
       "const r=cp.spawnSync(" + JSON.stringify(gitBinary) + ",args,{stdio:'inherit'});process.exit(r.status??1);}", { mode: 0o700 });
@@ -80,12 +80,28 @@ suite("committed Git and native OpenSpec inspection", () => {
     await write(changeRoot + "/review-deck.html", deck()); baseline = commit();
   }, 30_000);
   beforeEach(() => {
-    git("reset", "--hard", baseline); git("clean", "-fd");
+    git("reset", "--hard", baseline); git("clean", "-fd"); git("remote", "set-url", "origin", remote);
     vi.stubEnv("PATH", bin + path.delimiter + originalPath);
   });
   afterEach(() => { vi.unstubAllEnvs(); });
   afterAll(async () => { if (root) await fs.rm(root, { recursive: true, force: true }); });
 
+  it.each(["https://github.com/fixture/spec.git", "https://github.com/fixture/spec"])("uses the existing HTTPS origin %s", async (url) => {
+    git("remote", "set-url", "origin", url); vi.stubEnv("INSPECTION_TEST_REMOTE_URL", url);
+    expect(await inspect()).toMatchObject({ ok: true, result: { commitSha: baseline, remoteCommitSha: baseline } });
+    expect(git("config", "--get", "remote.origin.url")).toBe(url);
+  });
+  it.each(["https://github.com/other/spec.git", "https://user:token@github.com/fixture/spec.git", "https://github.com/fixture/spec.git?ref=other", "https://github.com.evil.test/fixture/spec.git"])("rejects mismatched or credentialed origin %s", async (url) => {
+    git("remote", "set-url", "origin", url);
+    expect(await inspect()).toMatchObject({ ok: false, code: "repository_mismatch" });
+  });
+  it.each(["credential.helper", "http.proxy", "http.sslVerify", "core.askpass"])("rejects repository-owned authentication setting %s", async (key) => {
+    const url = "https://github.com/fixture/spec.git";
+    git("remote", "set-url", "origin", url); vi.stubEnv("INSPECTION_TEST_REMOTE_URL", url);
+    git("config", "--local", key, "untrusted");
+    try { expect(await inspect()).toMatchObject({ ok: false, code: "git_transport_override" }); }
+    finally { git("config", "--local", "--unset-all", key); }
+  });
   it("returns immutable blob bytes, the source commit, and actual CLI validation", async () => {
     const result = await inspect();
     expect(result).toMatchObject({ ok: true, result: { commitSha: baseline, remoteCommitSha: baseline,

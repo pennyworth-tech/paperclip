@@ -34,10 +34,11 @@ export async function readWorkspaceRevisionBinding(db: ContextDb, producer: { pl
   return row;
 }
 
-export function runLocalWorkspaceProgram(cwd: string, program: string, input: unknown, timeoutMs = 180_000) {
+export function runLocalWorkspaceProgram(cwd: string, program: string, input: unknown, timeoutMs = 180_000, env?: Record<string, string>) {
   if (timeoutMs < 1000) throw conflict("The workspace execution deadline has expired", { code: "workspace_environment_unavailable" });
   return new Promise<{ stdout: string; exitCode: number | null }>((resolve, reject) => {
-    const child = execFile(process.execPath, ["-e", program], { cwd, timeout: timeoutMs, maxBuffer: 8 * 1024 * 1024, encoding: "utf8" }, (error, stdout) => {
+    const child = execFile(process.execPath, ["-e", program], { cwd, timeout: timeoutMs, maxBuffer: 8 * 1024 * 1024, encoding: "utf8",
+      env: env ? { ...process.env, ...env } : process.env }, (error, stdout) => {
       if (!stdout) { reject(unprocessable("Workspace execution did not return a receipt; resume the same operation", { code: "workspace_execution_unavailable" })); return; }
       resolve({ stdout, exitCode: error ? typeof error.code === "number" ? error.code : null : 0 });
     });
@@ -47,20 +48,21 @@ export function runLocalWorkspaceProgram(cwd: string, program: string, input: un
 
 /** The program is host-owned, never a plugin-supplied command or executable. */
 export async function executeWorkspaceRevisionProgram(db: Db, runtime: EnvironmentRuntimeService,
-  binding: Awaited<ReturnType<typeof readWorkspaceRevisionBinding>>, program: string, input: unknown, options: { deadline?: number } = {}) {
+  binding: Awaited<ReturnType<typeof readWorkspaceRevisionBinding>>, program: string, input: unknown,
+  options: { deadline?: number; env?: Record<string, string> } = {}) {
   const deadline = Math.min(options.deadline ?? Infinity, Date.now() + 180_000);
   const placement = await readWorkspaceProgramPlacement(db, binding);
   if (placement.environment.driver !== "local") {
-    if (!placement.lease) return runUnleasedWorkspaceProgram(db, runtime, binding, placement, program, input, deadline);
+    if (!placement.lease) return runUnleasedWorkspaceProgram(db, runtime, binding, placement, program, input, deadline, options.env);
     const copyRestoreCwd = workspaceProgramCopyRoot(binding, placement.lease);
     const edit = input as { mode?: string; recovery?: unknown };
     if (copyRestoreCwd && edit.mode === "apply" && !edit.recovery) throw conflict("This edit needs its original workspace journal", { code: "source_edit_legacy_copy_unavailable" });
     const result = await runRemoteWorkspaceProgram(db, runtime, binding, placement.environment, placement.lease,
-      workspaceProgramDirectory(binding, placement.environment, placement.lease), program, input, deadline);
+      workspaceProgramDirectory(binding, placement.environment, placement.lease), program, input, deadline, options.env);
     return { ...result, ...(copyRestoreCwd ? { copyRestoreCwd } : {}) };
   }
   if (["local_fs", "git_worktree"].includes(binding.workspace.providerType) && binding.workspace.cwd) {
-    return runLocalWorkspaceProgram(binding.workspace.cwd, program, input, deadline - Date.now());
+    return runLocalWorkspaceProgram(binding.workspace.cwd, program, input, deadline - Date.now(), options.env);
   }
   throw conflict("The workspace's execution environment is unavailable", { code: "workspace_environment_unavailable" });
 }

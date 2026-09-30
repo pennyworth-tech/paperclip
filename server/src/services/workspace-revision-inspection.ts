@@ -5,6 +5,7 @@ import { activityLog } from "@paperclipai/db";
 import type { PluginWorkspaceRevisionInspection } from "@paperclipai/plugin-sdk";
 import { conflict, unprocessable } from "../errors.js";
 import type { EnvironmentRuntimeService } from "./environment-runtime.js";
+import { createGitRemoteAuthProvider } from "./git-credentials.js";
 import { workspaceRevisionInspectionProgram } from "./workspace-revision-inspection-program.js";
 import { executeWorkspaceRevisionProgram, readWorkspaceRevisionBinding, runLocalWorkspaceProgram } from "./workspace-revision-context.js";
 export { sameWorkspaceRepository } from "./workspace-revision-context.js";
@@ -29,7 +30,22 @@ export function workspaceRevisionInspectionService(db: Db, producer: { pluginId:
       const input = parsed.data;
       const readBinding = () => readWorkspaceRevisionBinding(db, producer, workspaceId, companyId, input);
       const binding = await readBinding();
-      const execution = await executeWorkspaceRevisionProgram(db, runtime, binding, workspaceRevisionInspectionProgram, input);
+      // Resolve the same company credential used for managed checkouts, only
+      // after workspace ownership is established. Never put it in the request,
+      // program text, repository configuration, or inspection receipt.
+      const auth = await createGitRemoteAuthProvider(db, companyId, {
+        issueId: binding.issue.id, heartbeatRunId: binding.issue.checkoutRunId,
+      })(input.repositorySsh.replace(/^git@github\.com:/, "https://github.com/"));
+      let env: Record<string, string> | undefined;
+      if (auth) {
+        env = { ...auth.env, GIT_CONFIG_COUNT: String(auth.configArgs.length / 2) };
+        for (let i = 0; i < auth.configArgs.length; i += 2) {
+          const config = auth.configArgs[i + 1]!, separator = config.indexOf("=");
+          env[`GIT_CONFIG_KEY_${i / 2}`] = config.slice(0, separator);
+          env[`GIT_CONFIG_VALUE_${i / 2}`] = config.slice(separator + 1);
+        }
+      }
+      const execution = await executeWorkspaceRevisionProgram(db, runtime, binding, workspaceRevisionInspectionProgram, input, { env });
       let response: { ok: boolean; code?: string; result?: Omit<PluginWorkspaceRevisionInspection,
         "workspaceId" | "caseId" | "caseVersion" | "workTurn" | "inspectedAt" | "inspectionDigest"> };
       try { response = JSON.parse(execution.stdout); }
