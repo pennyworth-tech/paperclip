@@ -40,6 +40,11 @@ import {
   issueWorkProducts,
   issues,
   plugins,
+  pipelines,
+  pipelineStages,
+  pipelineCases,
+  pipelineCaseWork,
+  pipelineCaseWorkTurns,
   projects,
   projectWorkspaces,
   workspaceOperations,
@@ -405,6 +410,8 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     for (let attempt = 0; attempt < 5; attempt += 1) {
       await db.delete(issueComments);
       await db.delete(issueDocuments);
+      await db.delete(pipelineCases);
+      await db.delete(pipelines);
       try {
         await db.delete(issues);
         break;
@@ -454,6 +461,8 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       await db.delete(documentAnnotationAnchorSnapshots);
       await db.delete(documentAnnotationThreads);
       await db.delete(issueDocuments);
+      await db.delete(pipelineCases);
+      await db.delete(pipelines);
       await db.delete(documentRevisions);
       await db.delete(documents);
       await db.delete(companySecretBindings);
@@ -4203,6 +4212,51 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       .from(activityLog)
       .where(eq(activityLog.entityId, issueId));
     expect(activity.some((event) => event.action === "issue.successful_run_handoff_required")).toBe(true);
+  });
+
+  it.each(["not_requested", "pending"])("keeps a manual case-work handoff with the reviewer and resolves prior missing disposition (%s)", async (execution) => {
+    const { companyId, agentId, runId, issueId } = await seedQueuedIssueRunFixture();
+    const pluginId = randomUUID();
+    const [reviewer] = await db.insert(agents).values({ companyId, name: "Reviewer", status: "idle", adapterType: "process" }).returning();
+    const [pipeline] = await db.insert(pipelines).values({ companyId, key: "spec", name: "Spec" }).returning();
+    const [stage] = await db.insert(pipelineStages).values({ pipelineId: pipeline!.id, key: "draft", name: "Draft", kind: "working", position: 0 }).returning();
+    const [item] = await db.insert(pipelineCases).values({ companyId, pipelineId: pipeline!.id, stageId: stage!.id, caseKey: "spec", title: "Spec" }).returning();
+    await db.insert(pipelineCaseWork).values({ companyId, caseId: item!.id, issueId, producerPluginId: pluginId,
+      producerPluginKey: "test.spec", turn: 1, role: "author", agentId });
+    await db.update(issues).set({ originKind: "manual" }).where(eq(issues.id, issueId));
+    await db.update(heartbeatRuns).set({ contextSnapshot: { issueId, pluginId,
+      caseWorkTurn: { caseId: item!.id, turn: 1, agentId } } }).where(eq(heartbeatRuns.id, runId));
+    await db.insert(activityLog).values({ companyId, actorType: "system", actorId: "heartbeat",
+      action: "issue.successful_run_handoff_required", entityType: "issue", entityId: issueId, details: { sourceRunId: runId } });
+    mockAdapterExecute.mockImplementationOnce(async () => {
+      await db.insert(issueComments).values({ companyId, issueId, authorAgentId: agentId, createdByRunId: runId,
+        body: "Spec ready for the reviewer." });
+      // The case turn owns continuation even while the native issue still describes the outgoing author.
+      await db.update(pipelineCaseWork).set({ turn: 2, role: "reviewer", agentId: reviewer!.id }).where(eq(pipelineCaseWork.caseId, item!.id));
+      await db.insert(pipelineCaseWorkTurns).values({ companyId, caseId: item!.id, issueId, turn: 2,
+        requestKey: "review", requestDigest: "review", role: "reviewer", agentId: reviewer!.id });
+      if (execution === "pending") await db.insert(agentWakeupRequests).values({ companyId, agentId: reviewer!.id, source: "assignment",
+        status: "queued", requestedByActorId: pluginId, idempotencyKey: `case-work:${item!.id}:2`,
+        payload: { issueId, pluginId, caseWorkTurn: { caseId: item!.id, turn: 2, agentId: reviewer!.id } } });
+      return { exitCode: 0, signal: null, timedOut: false, errorMessage: null,
+        summary: "Spec ready for the reviewer.", provider: "test", model: "test-model" };
+    });
+    const heartbeat = heartbeatService(db);
+    await heartbeat.resumeQueuedRuns();
+    await waitForRunToSettle(heartbeat, runId, 5_000);
+    await heartbeat.waitForRunExecutionDrain(runId);
+    expect((await heartbeat.getRun(runId))?.status).toBe("succeeded");
+    const wakes = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, companyId));
+    expect(wakes.filter((wake) => wake.reason === "finish_successful_run_handoff")).toHaveLength(0);
+    expect(wakes.find((wake) => wake.agentId === reviewer!.id)?.status).toBe(execution === "pending" ? "queued" : undefined);
+    expect((await db.select().from(pipelineCaseWork).where(eq(pipelineCaseWork.caseId, item!.id)))[0])
+      .toMatchObject({ turn: 2, agentId: reviewer!.id, role: "reviewer" });
+    const events = await db.select().from(activityLog).where(eq(activityLog.entityId, issueId));
+    expect(events.find((event) => event.action === "issue.successful_run_handoff_resolved")?.details)
+      .toMatchObject({ resolvedBySkipReason: "active case-work continuation owns the next action" });
+    await heartbeat.reconcileStrandedAssignedIssues();
+    const recovered = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, companyId));
+    expect(recovered.filter((wake) => wake.reason === "issue_continuation_needed")).toHaveLength(0);
   });
 
   it("requeues a missing-disposition handoff when the previous corrective wake was cancelled", async () => {

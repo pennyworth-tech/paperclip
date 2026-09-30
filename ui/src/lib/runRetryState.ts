@@ -97,3 +97,35 @@ export function describeRunRetryState(run: RetryAwareRun): RunRetryStateSummary 
     retryOfRunId,
   };
 }
+
+const PRE_EXECUTION_SUPERSESSION_CODES = new Set([
+  "issue_preparation_turn_changed",
+  "issue_assignee_changed",
+  "issue_terminal_status",
+  "issue_not_in_progress",
+  "issue_execution_lock_changed",
+  "issue_review_participant_changed",
+  "issue_continuation_waiting_on_review",
+  "issue_dependencies_blocked",
+]);
+
+export function describeRunSupersession(run: {
+  status: string;
+  errorCode: string | null;
+  startedAt: string | Date | null;
+  exitCode: number | null;
+  logRef: string | null;
+  logBytes: number | null;
+  usageJson: Record<string, unknown> | null;
+  stdoutExcerpt: string | null;
+  stderrExcerpt: string | null;
+}) {
+  if (run.status !== "cancelled" || !run.errorCode || !PRE_EXECUTION_SUPERSESSION_CODES.has(run.errorCode)
+    || run.startedAt !== null || run.exitCode !== null || run.logRef !== null || run.logBytes !== null
+    || run.usageJson !== null || run.stdoutExcerpt !== null || run.stderrExcerpt !== null) return null;
+  return {
+    label: "Superseded before it started",
+    detail: "No action needed. The task lifecycle no longer permits this queued run.",
+    errorCode: run.errorCode,
+  };
+}

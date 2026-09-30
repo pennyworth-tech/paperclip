@@ -61,6 +61,7 @@ function decide(overrides: Partial<Parameters<typeof decideSuccessfulRunHandoff>
     hasOpenRecoveryIssue: false,
     hasPauseHold: false,
     hasActiveRoutineContinuation: false,
+    hasActiveCaseWorkContinuation: false,
     budgetBlocked: false,
     idempotentWakeExists: false,
     ...overrides,
@@ -259,6 +260,15 @@ describe("successful run handoff decision", () => {
   it("still queues for non-plugin origin kinds", () => {
     expect(decide({ issue: { ...issue, originKind: "manual" } as any }).kind).toBe("enqueue");
     expect(decide({ issue: { ...issue, originKind: null } as any }).kind).toBe("enqueue");
+  });
+
+  it("resolves missing disposition when a manual issue has a live case-work continuation", () => {
+    const decision = decide({
+      issue: { ...issue, originKind: "manual" },
+      hasActiveCaseWorkContinuation: true,
+    });
+    expect(decision).toEqual({ kind: "skip", reason: "active case-work continuation owns the next action" });
+    expect(isSuccessfulRunHandoffValidPathSkip(decision)).toBe(true);
   });
 
   describe("isPluginManagedIssueLifecycle", () => {

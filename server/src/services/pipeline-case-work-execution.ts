@@ -1,6 +1,6 @@
-import { and, eq, inArray, or, sql } from "drizzle-orm";
+import { and, eq, inArray, isNull, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { agentWakeupRequests, heartbeatRuns, issues, pipelineCaseWork } from "@paperclipai/db";
+import { agentWakeupRequests, heartbeatRuns, issues, pipelineCases, pipelines, pipelineCaseWork, pipelineCaseWorkResults, pipelineCaseWorkTurns } from "@paperclipai/db";
 import type { PluginCaseWorkExecution } from "@paperclipai/plugin-sdk";
 import { conflict } from "../errors.js";
 
@@ -44,6 +44,29 @@ export async function caseWorkExecution(tx: Tx, work: Work): Promise<PluginCaseW
     ))).orderBy(heartbeatRuns.createdAt).limit(101);
   const result = summarizeCaseWorkExecution(requests, runs);
   return requests.length > 100 || runs.length > 100 ? { ...result, state: "unknown" } : result;
+}
+
+/** Enrolment can retain a manual origin; the persisted turn owns its continuation. */
+export async function hasActiveCaseWorkContinuation(tx: Tx, companyId: string, issueId: string) {
+  const [work] = await tx.select({ work: pipelineCaseWork }).from(pipelineCaseWork)
+    .innerJoin(pipelineCases, and(eq(pipelineCases.id, pipelineCaseWork.caseId), eq(pipelineCases.companyId, companyId)))
+    .innerJoin(pipelines, and(eq(pipelines.id, pipelineCases.pipelineId), eq(pipelines.companyId, companyId)))
+    .innerJoin(pipelineCaseWorkTurns, and(eq(pipelineCaseWorkTurns.caseId, pipelineCaseWork.caseId),
+      eq(pipelineCaseWorkTurns.companyId, companyId), eq(pipelineCaseWorkTurns.issueId, issueId),
+      eq(pipelineCaseWorkTurns.turn, pipelineCaseWork.turn), eq(pipelineCaseWorkTurns.agentId, pipelineCaseWork.agentId)))
+    .where(and(eq(pipelineCaseWork.companyId, companyId), eq(pipelineCaseWork.issueId, issueId),
+      inArray(pipelineCaseWork.role, ["author", "editor", "reviewer"]), isNull(pipelineCaseWork.sourceWriteId),
+      isNull(pipelineCases.terminalKind), isNull(pipelineCases.retiredAt), isNull(pipelines.archivedAt))).limit(1);
+  if (!work) return false;
+  const execution = await caseWorkExecution(tx, work.work);
+  if (["active", "pending", "not_requested"].includes(execution.state)) return true;
+  if (execution.state !== "terminal") return false;
+  // An accepted result is a durable handoff input even before the plugin advances the turn.
+  const [result] = await tx.select({ id: pipelineCaseWorkResults.id }).from(pipelineCaseWorkResults).where(and(
+    eq(pipelineCaseWorkResults.companyId, companyId), eq(pipelineCaseWorkResults.caseId, work.work.caseId),
+    eq(pipelineCaseWorkResults.turn, work.work.turn), eq(pipelineCaseWorkResults.agentId, work.work.agentId!),
+  )).limit(1);
+  return Boolean(result);
 }
 
 /** The issue lock may have been cleared before a run actually ended. */

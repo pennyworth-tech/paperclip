@@ -61,7 +61,7 @@ import { readSourceResolvedWatchdogFold } from "../lib/source-resolved-watchdog-
 import { buildSameOriginWebSocketUrl } from "../lib/websocket-url";
 import { formatCents, formatDate, relativeTime, formatTokens, visibleRunCostUsd } from "../lib/utils";
 import { cn } from "../lib/utils";
-import { describeRunRetryState } from "../lib/runRetryState";
+import { describeRunRetryState, describeRunSupersession } from "../lib/runRetryState";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Tabs } from "@/components/ui/tabs";
@@ -3392,6 +3392,7 @@ function RunDetail({ run: initialRun, agentRouteId, adapterType, adapterConfig }
   const sessionId = run.sessionIdAfter || run.sessionIdBefore;
   const hasNonZeroExit = run.exitCode !== null && run.exitCode !== 0;
   const retryState = describeRunRetryState(run);
+  const supersession = describeRunSupersession(run);
 
   return (
     <div className="space-y-4 min-w-0">
@@ -3502,7 +3503,12 @@ function RunDetail({ run: initialRun, agentRouteId, adapterType, adapterConfig }
                 )}
               </div>
             )}
-            {run.error && (
+            {supersession ? (
+              <div className="text-xs text-muted-foreground">
+                <p>{supersession.label}. {supersession.detail}</p>
+                <p>{run.error} ({supersession.errorCode})</p>
+              </div>
+            ) : run.error && (
               <div className="text-xs">
                 <span className="text-red-600 dark:text-red-400">{run.error}</span>
                 {run.errorCode && <span className="text-muted-foreground ml-1">({run.errorCode})</span>}
