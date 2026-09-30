@@ -174,15 +174,17 @@ export async function workspaceProgramRunner(db: Db, runtime: EnvironmentRuntime
 }
 
 export async function runRemoteWorkspaceProgram(db: Db, runtime: EnvironmentRuntimeService, binding: Binding,
-  environment: Environment, lease: EnvironmentLease, cwd: string, program: string, input: unknown, deadline = Date.now() + 180_000) {
+  environment: Environment, lease: EnvironmentLease, cwd: string, program: string, input: unknown,
+  deadline = Date.now() + 180_000, env?: Record<string, string>) {
   const runner = await workspaceProgramRunner(db, runtime, binding, environment, lease, deadline);
-  return executionReceipt(await runner.execute({ command: "node", args: ["-e", program], cwd, stdin: JSON.stringify(input) }));
+  return executionReceipt(await runner.execute({ command: "node", args: ["-e", program], cwd, stdin: JSON.stringify(input), env }));
 }
 
 /** Reacquire the case's environment. Copy realizations stage a private pinned
  * snapshot; in-place realizations retain the recorded authoritative directory. */
 export async function runUnleasedWorkspaceProgram(db: Db, runtime: EnvironmentRuntimeService, binding: Binding,
-  placement: Awaited<ReturnType<typeof readWorkspaceProgramPlacement>>, program: string, input: unknown, deadline = Date.now() + 180_000) {
+  placement: Awaited<ReturnType<typeof readWorkspaceProgramPlacement>>, program: string, input: unknown,
+  deadline = Date.now() + 180_000, env?: Record<string, string>) {
   if (deadline - Date.now() < 1000) throw conflict("The workspace execution deadline has expired", { code: "workspace_environment_unavailable" });
   const previous = object(binding.workspace.metadata?.workspaceRealization);
   if (!["in_place", "copy"].includes(String(previous.mode)) || previous.environmentId !== placement.environment.id) {
@@ -232,7 +234,7 @@ export async function runUnleasedWorkspaceProgram(db: Db, runtime: EnvironmentRu
           if (!next) throw conflict("The acquired workspace lease disappeared", { code: "workspace_environment_unavailable" });
           lease = next;
         },
-        execute: async (cwd) => executionReceipt(await runner.execute({ command: "node", args: ["-e", program], cwd, stdin: JSON.stringify(input) })),
+        execute: async (cwd) => executionReceipt(await runner.execute({ command: "node", args: ["-e", program], cwd, stdin: JSON.stringify(input), env })),
       });
       // An acknowledged terminal command no longer owns these private files.
       // On uncertain completion, leave them to lease/provider cleanup instead.
@@ -245,7 +247,7 @@ export async function runUnleasedWorkspaceProgram(db: Db, runtime: EnvironmentRu
       if (result.exitCode === 0) leaseOutcome = "released";
       return result;
     }
-    return await runRemoteWorkspaceProgram(db, runtime, binding, current, lease, workspaceProgramDirectory(binding, current, lease), program, input, deadline);
+    return await runRemoteWorkspaceProgram(db, runtime, binding, current, lease, workspaceProgramDirectory(binding, current, lease), program, input, deadline, env);
   } finally {
     // Only this ad-hoc lease is ours to release. Never release an agent's active
     // lease or every lease for its heartbeat run.
