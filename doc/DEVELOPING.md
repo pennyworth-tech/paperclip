@@ -89,7 +89,10 @@ credential-free preflight before resolving company credentials; SSH verification
 does not resolve a GitHub token. A reacquired remote copy preserves the canonical
 workspace's origin and uses that same preflight in its staged directory. Source
 editing accepts the same SSH and HTTPS origins and preserves the canonical
-remote; publication still uses the request's canonical SSH repository identity.
+remote. Publication uses that actual origin, resolving the existing company Git
+credential for HTTPS only after a credential-free workspace preflight and a
+native writer recheck. The token is passed only to remote Git operations;
+preview, preparation, and restoration do not resolve or receive it.
 Repository-owned credential helpers, HTTP overrides, executable Git
 filters, and remote rewrites are rejected before worktree or remote checks.
 
