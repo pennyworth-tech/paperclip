@@ -9,14 +9,14 @@ export function inspectOpenSpecTree(input: Pick<PluginWorkspaceRevisionRequest, 
   const path = require("node:path") as typeof import("node:path");
   const crypto = require("node:crypto") as typeof import("node:crypto");
   const cp = require("node:child_process") as typeof import("node:child_process");
-  const maxBytes = 8 * 1024 * 1024;
+  const maxSpawnBytes = 8 * 1024 * 1024, maxRawBytes = 16 * 1024 * 1024;
   let temporary: string | undefined;
   const fail = (code: string): never => { throw new Error(code); };
-  const hash = (value: string) => crypto.createHash("sha256").update(value).digest("hex");
+  const hash = (value: string | Buffer) => crypto.createHash("sha256").update(value).digest("hex");
   const env = { ...process.env, GIT_OPTIONAL_LOCKS: "0", GIT_NO_REPLACE_OBJECTS: "1", GIT_TERMINAL_PROMPT: "0", OPENSPEC_TELEMETRY: "0", DO_NOT_TRACK: "1" };
   // A repository-local executable or shell string is never accepted as an inspection command.
   const run = (command: string, args: string[], cwd = root, optional = false, diagnostic = false) => {
-    const result = cp.spawnSync(command, args, { cwd, env, encoding: "utf8", timeout: 45_000, maxBuffer: maxBytes, windowsHide: true });
+    const result = cp.spawnSync(command, args, { cwd, env, encoding: "utf8", timeout: 45_000, maxBuffer: maxSpawnBytes, windowsHide: true });
     if (result.error || (result.status !== 0 && !optional && !(diagnostic && result.status === 1))) fail(command === "git" ? "git_inspection_failed" : "openspec_validation_failed");
     return result.status === 0 || diagnostic ? result.stdout : "";
   };
@@ -30,24 +30,54 @@ export function inspectOpenSpecTree(input: Pick<PluginWorkspaceRevisionRequest, 
     }
     let total = 0;
     const blobs = new Map<string, string>();
-    const read = (file: string) => {
-      if (blobs.has(file)) return blobs.get(file)!;
+    const binaryBlobs = new Map<string, Buffer>();
+    const readBytes = (file: string) => {
+      if (binaryBlobs.has(file)) return binaryBlobs.get(file)!;
       const entry = entries.get(file);
       if (!entry || !["100644", "100755"].includes(entry.mode)) fail("source_missing_or_symlink");
       const size = Number(git(["cat-file", "-s", entry!.oid]).trim());
-      if (!Number.isSafeInteger(size) || size < 0 || size > 5 * 1024 * 1024 || total + size > maxBytes) fail("source_size_limit");
-      const raw = cp.spawnSync("git", ["cat-file", "blob", entry!.oid], { cwd: root, env, timeout: 45_000, maxBuffer: maxBytes });
+      if (!Number.isSafeInteger(size) || size < 0 || size > 8 * 1024 * 1024 || total + size > maxRawBytes) fail("source_size_limit");
+      const raw = cp.spawnSync("git", ["cat-file", "blob", entry!.oid], { cwd: root, env, timeout: 45_000, maxBuffer: maxSpawnBytes });
       if (raw.status !== 0 || raw.error || raw.stdout.length !== size) fail("git_inspection_failed");
+      total += size; binaryBlobs.set(file, raw.stdout); return raw.stdout;
+    };
+    const read = (file: string) => {
+      if (blobs.has(file)) return blobs.get(file)!;
+      const raw = readBytes(file);
       let text: string;
-      try { text = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(raw.stdout); }
+      try { text = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(raw); }
       catch { return fail("source_not_utf8_text"); }
       if (text.includes("\0")) fail("source_not_utf8_text");
-      total += size; blobs.set(file, text); return text;
+      blobs.set(file, text); return text;
     };
+    const imagePath = (file: string) => file.startsWith(changeRoot + "/")
+      && /^images\/[A-Za-z0-9][A-Za-z0-9_.-]{0,99}\.(?:png|jpe?g|gif|webp)$/.test(file.slice(changeRoot.length + 1));
+    type BinaryFile = Extract<PluginWorkspaceRevisionInspection["files"][number], { binary: true }>;
+    const images = new Map<string, BinaryFile>();
+    let imageBytes = 0;
+    const readImage = (file: string): BinaryFile => {
+      if (images.has(file)) return images.get(file)!;
+      const entry = entries.get(file);
+      if (!entry || !["100644", "100755"].includes(entry.mode)) fail("source_missing_or_symlink");
+      const size = Number(git(["cat-file", "-s", entry!.oid]).trim());
+      if (size > 512 * 1024 || imageBytes + size > 3 * 1024 * 1024) fail("source_image_budget");
+      const raw = readBytes(file);
+      const mediaType = raw.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])) ? "image/png"
+        : raw.subarray(0, 3).equals(Buffer.from([0xff, 0xd8, 0xff])) ? "image/jpeg"
+        : ["GIF87a", "GIF89a"].some((magic) => raw.subarray(0, 6).equals(Buffer.from(magic))) ? "image/gif"
+        : raw.subarray(0, 4).equals(Buffer.from("RIFF")) && raw.subarray(8, 12).equals(Buffer.from("WEBP")) ? "image/webp" : null;
+      const extension = path.posix.extname(file);
+      if (!mediaType || mediaType !== ({ ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif", ".webp": "image/webp" } as Record<string, string>)[extension]) fail("source_image_invalid");
+      const receipt: BinaryFile = { path: file, sha256: hash(raw), binary: true, bytes: raw.length, mediaType: mediaType! };
+      imageBytes += raw.length; images.set(file, receipt); return receipt;
+    };
+    let admitImages = false;
     temporary = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-spec-inspect-"));
     const exportFile = (file: string) => {
       const target = path.join(temporary!, file);
-      fs.mkdirSync(path.dirname(target), { recursive: true }); fs.writeFileSync(target, read(file), { mode: 0o600 });
+      if (admitImages && imagePath(file)) readImage(file);
+      fs.mkdirSync(path.dirname(target), { recursive: true });
+      fs.writeFileSync(target, admitImages && imagePath(file) ? readBytes(file) : read(file), { mode: 0o600 });
     };
     // Let the CLI resolve the selected schema before exporting its outputs. This
     // avoids scanning unrelated changes or exporting supplementary deck variants.
@@ -67,12 +97,18 @@ export function inspectOpenSpecTree(input: Pick<PluginWorkspaceRevisionRequest, 
         || artifact.outputPath.split("/").some((part) => part === ".." || part === ".")) fail("artifact_graph_invalid");
     }
     const schemaRoot = "openspec/schemas/" + status.schemaName + "/";
+    // Only v3 opts into image provenance; existing v2 decks keep their source set.
+    if (entries.has(changeRoot + "/review-deck.html") && definitions.some((artifact) => path.posix.matchesGlob("review-deck.html", artifact.outputPath))) {
+      const payloads = [...read(changeRoot + "/review-deck.html").matchAll(/<script\s+id="review-data"\s+type="application\/json"\s*>([\s\S]*?)<\/script>/g)];
+      try { admitImages = payloads.length === 1 && JSON.parse(payloads[0]![1]!).templateVersion === "review-deck/v3"; }
+      catch { /* Deck verification reports malformed review data. */ }
+    }
     const snapshotPaths = new Set([...configuration, ...localSchemas.filter((file) => file.startsWith(schemaRoot))]);
     for (const file of entries.keys()) {
       if (!file.startsWith(changeRoot + "/")) continue;
       const relative = file.slice(changeRoot.length + 1);
       if (/^(research|proposal|design|tasks)\.md$/.test(relative) || /^specs\/[^/]+\/spec\.md$/.test(relative)
-        || definitions.some((artifact) => path.posix.matchesGlob(relative, artifact.outputPath))) snapshotPaths.add(file);
+        || (admitImages && imagePath(file)) || definitions.some((artifact) => path.posix.matchesGlob(relative, artifact.outputPath))) snapshotPaths.add(file);
     }
     if (snapshotPaths.size > 500) fail("source_size_limit");
     for (const file of snapshotPaths) exportFile(file);
@@ -87,7 +123,10 @@ export function inspectOpenSpecTree(input: Pick<PluginWorkspaceRevisionRequest, 
       || status.isComplete !== observed.every((artifact) => artifact.status === "done")) fail("openspec_validation_failed");
     const deckRequired = status.schemaName === "factory-pipeline-v2" || definitions.some((artifact) => artifact.outputPath === "review-deck.html");
     const paths = [...snapshotPaths].filter((file) => file !== changeRoot + "/review-deck.html");
-    const inputCommitSha = git(["log", "-1", "--format=%H", input.commitSha, "--", ...new Set([...paths, "openspec/config.yaml", changeRoot + "/.openspec.yaml",
+    // Deleted images no longer occur in snapshotPaths, but still identify a new input revision.
+    const deletedImages = admitImages ? git(["log", "--format=", "--name-only", "-z", "--diff-filter=D", input.commitSha,
+      "--", changeRoot + "/images/"]).split("\0").filter(imagePath) : [];
+    const inputCommitSha = git(["log", "-1", "--format=%H", input.commitSha, "--", ...new Set([...paths, ...deletedImages, "openspec/config.yaml", changeRoot + "/.openspec.yaml",
       ":(glob)" + changeRoot + "/specs/**/*.md", ":(glob)" + schemaRoot + "templates/*",
       ...definitions.filter((artifact) => artifact.outputPath !== "review-deck.html").map((artifact) => ":(glob)" + changeRoot + "/" + artifact.outputPath)])]).trim();
     if (!/^[a-f0-9]{40}$/.test(inputCommitSha)) fail("source_history_missing");
@@ -100,8 +139,8 @@ export function inspectOpenSpecTree(input: Pick<PluginWorkspaceRevisionRequest, 
       const payloads = [...html.matchAll(/<script\s+id="review-data"\s+type="application\/json"\s*>([\s\S]*?)<\/script>/g)];
       if (payloads.length !== 1) fail("review_data_missing");
       const model = JSON.parse(payloads[0]![1]!) as { templateVersion?: string; changeId?: string;
-        metadata?: { branch?: string; sha?: string; shaDirty?: boolean }; sources?: Array<{ path: string; sha256: string; text: string }> };
-      if (model.templateVersion !== "review-deck/v2" || model.changeId !== input.changeId || model.metadata?.branch !== input.branch
+        metadata?: { branch?: string; sha?: string; shaDirty?: boolean }; sources?: PluginWorkspaceRevisionInspection["files"] };
+      if (!["review-deck/v2", "review-deck/v3"].includes(model.templateVersion ?? "") || model.changeId !== input.changeId || model.metadata?.branch !== input.branch
         || model.metadata?.shaDirty !== false || !Array.isArray(model.sources) || model.sources.length < 1 || model.sources.length > 500) fail("review_binding_mismatch");
       const declared: string[] = [];
       for (const source of model.sources!) {
@@ -110,11 +149,17 @@ export function inspectOpenSpecTree(input: Pick<PluginWorkspaceRevisionRequest, 
         if (!(resolved.startsWith(changeRoot + "/") || resolved.startsWith(schemaRoot) || resolved === "openspec/config.yaml")) fail("source_path_escape");
         if (declared.includes(resolved)) fail("duplicate_source_path");
         if (!snapshotPaths.has(resolved)) fail("review_source_unexpected");
-        const text = read(resolved);
-        if (text !== source.text || hash(text) !== source.sha256) fail("source_bytes_mismatch");
+        if (admitImages && imagePath(resolved)) {
+          const receipt = readImage(resolved);
+          if (!("binary" in source) || source.binary !== true || "text" in source || "base64" in source || "payload" in source
+            || receipt.sha256 !== source.sha256 || receipt.bytes !== source.bytes || receipt.mediaType !== source.mediaType) fail("source_bytes_mismatch");
+        } else {
+          const text = read(resolved);
+          if (!("text" in source) || "binary" in source || text !== source.text || hash(text) !== source.sha256) fail("source_bytes_mismatch");
+        }
         declared.push(resolved);
       }
-      // Every canonical Markdown artifact and schema input must appear in the deck's manifest.
+      // Every admitted source and schema input must appear in the deck's manifest.
       for (const file of paths) if (!declared.includes(file)) fail("review_source_omitted");
       if (model.metadata?.sha !== inputCommitSha) fail("review_input_commit_mismatch");
     };
@@ -158,7 +203,8 @@ export function inspectOpenSpecTree(input: Pick<PluginWorkspaceRevisionRequest, 
       visiting.delete(id); return artifact.inputDigest;
     };
     for (const artifact of artifacts) inputs(artifact.id);
-    const files = [...snapshotPaths].sort().map((file) => ({ path: file, text: read(file), sha256: hash(read(file)) }));
+    const files = [...snapshotPaths].sort().map((file) => admitImages && imagePath(file)
+      ? readImage(file) : { path: file, text: read(file), sha256: hash(read(file)) });
     const manifest = files.filter((file) => file.path !== changeRoot + "/review-deck.html")
       .map((file) => ({ path: path.posix.relative(changeRoot, file.path), sha256: file.sha256 }))
       .sort((a, b) => a.path < b.path ? -1 : a.path > b.path ? 1 : 0);

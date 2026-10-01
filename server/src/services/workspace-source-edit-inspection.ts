@@ -3,7 +3,7 @@ import type { PluginWorkspaceRevisionInspection } from "@paperclipai/plugin-sdk"
 /** Bounded metadata, bound to the candidate commit message. File bytes travel in
  * the Git bundle and are re-read during recovery without invoking authoring tools. */
 export interface SourceEditInspection {
-  files: Array<{ path: string; sha256: string }>;
+  files: Array<{ path: string; sha256: string } | Extract<PluginWorkspaceRevisionInspection["files"][number], { binary: true }>>;
   cli: PluginWorkspaceRevisionInspection["cli"];
 }
 
@@ -24,14 +24,26 @@ export function readSourceEditInspection(raw: unknown, changeId: string, digest:
       || !["verified", "not_required"].includes(readiness.deck)))
     || (cli.status.schemaName === "factory-pipeline-v2" && readiness.deck === "not_required")) fail();
   const paths = new Set<string>(), root = "openspec/changes/" + changeId + "/", schema = "openspec/schemas/" + cli.status.schemaName + "/";
+  let imageBytes = 0;
   for (const file of value!.files) {
     if (!file || typeof file.path !== "string" || file.path.length > 1000 || !/^[A-Za-z0-9_./-]+$/.test(file.path)
       || file.path.split("/").some((part) => !part || part === "." || part === "..") || paths.has(file.path)
       || !(file.path.startsWith(root) || file.path.startsWith(schema) || file.path === "openspec/config.yaml")
       || !/^[a-f0-9]{64}$/.test(file.sha256)) fail();
+    if ("binary" in file) {
+      if (file.binary !== true || !file.path.startsWith(root)
+        || !/^images\/[A-Za-z0-9][A-Za-z0-9_.-]{0,99}\.(?:png|jpe?g|gif|webp)$/.test(file.path.slice(root.length))
+        || !Number.isSafeInteger(file.bytes) || file.bytes < 0 || file.bytes > 512 * 1024
+        || !["image/png", "image/jpeg", "image/gif", "image/webp"].includes(file.mediaType)
+        || "text" in file || "base64" in file || "payload" in file) fail();
+      imageBytes += file.bytes;
+      if (imageBytes > 3 * 1024 * 1024) fail();
+    }
     paths.add(file.path);
   }
-  const inspection: SourceEditInspection = { files: value!.files.map(({ path, sha256 }) => ({ path, sha256 })), cli };
+  const inspection: SourceEditInspection = { files: value!.files.map((file) => "binary" in file
+    ? { path: file.path, sha256: file.sha256, binary: true, bytes: file.bytes, mediaType: file.mediaType }
+    : { path: file.path, sha256: file.sha256 }), cli };
   const inspectionDigest = digest(JSON.stringify(inspection));
   return { inspection, inspectionDigest };
 }

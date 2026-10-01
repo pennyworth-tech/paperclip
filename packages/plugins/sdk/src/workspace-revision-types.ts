@@ -24,7 +24,12 @@ export interface PluginWorkspaceRevisionInspection {
   branch: string;
   changeId: string;
   remoteCommitSha: string;
-  files: Array<{ path: string; sha256: string; text: string }>;
+  /** Binary receipts carry provenance only; image payloads remain in Git and the deck. */
+  files: Array<
+    | { path: string; sha256: string; text: string }
+    | { path: string; sha256: string; binary: true; bytes: number;
+        mediaType: "image/png" | "image/jpeg" | "image/gif" | "image/webp" }
+  >;
   cli: { version: string; status: Record<string, unknown>; validation: Record<string, unknown>;
     /** Source inspection can succeed while authoring/validation is incomplete. */
     readiness?: { state: "draft" | "ready"; reasons: string[];
