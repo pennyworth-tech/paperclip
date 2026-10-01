@@ -1,0 +1,191 @@
+{
+  "request": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+      "ownerId": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 200
+      },
+      "generation": {
+        "type": "integer",
+        "minimum": 0,
+        "maximum": 9007199254740991
+      }
+    },
+    "required": [
+      "ownerId",
+      "generation"
+    ],
+    "additionalProperties": false
+  },
+  "interrupt": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+      "ownerId": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 200
+      },
+      "generation": {
+        "type": "integer",
+        "minimum": 0,
+        "maximum": 9007199254740991
+      },
+      "runIds": {
+        "minItems": 1,
+        "maxItems": 100,
+        "type": "array",
+        "items": {
+          "type": "string",
+          "format": "uuid",
+          "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+        }
+      },
+      "graceMs": {
+        "default": 2000,
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 30000
+      }
+    },
+    "required": [
+      "ownerId",
+      "generation",
+      "runIds",
+      "graceMs"
+    ],
+    "additionalProperties": false
+  },
+  "receipt": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+      "ownerId": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 200
+      },
+      "generation": {
+        "type": "integer",
+        "minimum": 0,
+        "maximum": 9007199254740991
+      },
+      "schemaVersion": {
+        "type": "number",
+        "const": 1
+      },
+      "hostId": {
+        "type": "string",
+        "format": "uuid",
+        "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+      },
+      "observedAt": {
+        "type": "string",
+        "format": "date-time",
+        "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d(?::[0-5]\\d(?:\\.\\d+)?)?(?:Z))$"
+      },
+      "quiescent": {
+        "type": "boolean"
+      },
+      "locallyQuiescent": {
+        "type": "boolean"
+      },
+      "pendingHostIds": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "runningCount": {
+        "type": "integer",
+        "minimum": 0,
+        "maximum": 9007199254740991
+      },
+      "queuedCount": {
+        "type": "integer",
+        "minimum": 0,
+        "maximum": 9007199254740991
+      },
+      "localProcessRunIds": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "processRunIds": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "inFlightExecutions": {
+        "type": "integer",
+        "minimum": 0,
+        "maximum": 9007199254740991
+      },
+      "lifecycleOperations": {
+        "type": "integer",
+        "minimum": 0,
+        "maximum": 9007199254740991
+      },
+      "suppressionAcknowledged": {
+        "type": "boolean"
+      },
+      "leaseIds": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "unknown": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "devcontainerIds": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "liveServiceIds": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "orphanCleanupCount": {
+        "type": "integer",
+        "minimum": 0,
+        "maximum": 9007199254740991
+      }
+    },
+    "required": [
+      "ownerId",
+      "generation",
+      "schemaVersion",
+      "hostId",
+      "observedAt",
+      "quiescent",
+      "locallyQuiescent",
+      "pendingHostIds",
+      "runningCount",
+      "queuedCount",
+      "localProcessRunIds",
+      "processRunIds",
+      "inFlightExecutions",
+      "lifecycleOperations",
+      "suppressionAcknowledged",
+      "leaseIds",
+      "unknown",
+      "devcontainerIds",
+      "liveServiceIds",
+      "orphanCleanupCount"
+    ],
+    "additionalProperties": false
+  }
+}

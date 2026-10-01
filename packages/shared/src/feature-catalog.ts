@@ -29,7 +29,7 @@ type ExperimentalSettings = z.infer<typeof instanceExperimentalSettingsSchema>;
  */
 export type InstanceFeatureKey = Exclude<
   {
-    [K in keyof ExperimentalSettings]: ExperimentalSettings[K] extends boolean ? K : never;
+    [K in keyof ExperimentalSettings]-?: ExperimentalSettings[K] extends boolean ? K : never;
   }[keyof ExperimentalSettings],
   // Server-managed operator state, not a configurable feature: the
   // drain flag is written only by the instance drain routes, so it is carved

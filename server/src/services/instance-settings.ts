@@ -31,6 +31,7 @@ import {
 } from "@paperclipai/shared";
 import { applyOperatorGeneralDefaults, stripOperatorGeneralEchoes } from "@paperclipai/shared";
 import { eq } from "drizzle-orm";
+import { conflict } from "../errors.js";
 import { getManagedInstanceConfig, type ManagedInstanceConfig } from "./managed-config.js";
 import { getOperatorSettingDefaults } from "./setting-defaults.js";
 
@@ -83,6 +84,7 @@ function stripServerManagedExperimentalPatchFields(
     worktreeRunExecutionActivationInstanceId: _ignoredActivationInstanceId,
     operatorDrainActive: _ignoredDrainActive,
     operatorDrainStartedAt: _ignoredDrainStartedAt,
+    operatorDrainControl: _ignoredDrainControl,
     ...patchable
   } = patch as Record<string, unknown>;
   return patchable as PatchInstanceExperimentalSettings;
@@ -220,6 +222,18 @@ function normalizeGeneralSettings(raw: unknown): InstanceGeneralSettings {
 }
 
 export function normalizeExperimentalSettings(raw: unknown): InstanceExperimentalSettings {
+  // Operational state must not disappear when an unrelated feature is malformed.
+  const stored = raw && typeof raw === "object" ? raw as Record<string, unknown> : {};
+  const drain = instanceExperimentalSettingsStorageSchema.pick({
+    operatorDrainActive: true,
+    operatorDrainStartedAt: true,
+    operatorDrainControl: true,
+  }).parse(stored);
+  const drainFields = {
+    operatorDrainActive: drain.operatorDrainActive,
+    operatorDrainStartedAt: drain.operatorDrainStartedAt,
+    ...(drain.operatorDrainControl ? { operatorDrainControl: drain.operatorDrainControl } : {}),
+  };
   const parsed = instanceExperimentalSettingsStorageSchema.safeParse(raw ?? {});
   if (parsed.success) {
     return {
@@ -265,8 +279,7 @@ export function normalizeExperimentalSettings(raw: unknown): InstanceExperimenta
       productivityReviewMaxCreationsPerOwnerPerSweep:
         parsed.data.productivityReviewMaxCreationsPerOwnerPerSweep ??
         DEFAULT_PRODUCTIVITY_REVIEW_MAX_CREATIONS_PER_OWNER_PER_SWEEP,
-      operatorDrainActive: parsed.data.operatorDrainActive ?? false,
-      operatorDrainStartedAt: parsed.data.operatorDrainStartedAt ?? null,
+      ...drainFields,
       issueGraphLivenessAutoRecoveryLookbackHours:
         parsed.data.issueGraphLivenessAutoRecoveryLookbackHours ??
         DEFAULT_ISSUE_GRAPH_LIVENESS_AUTO_RECOVERY_LOOKBACK_HOURS,
@@ -310,8 +323,7 @@ export function normalizeExperimentalSettings(raw: unknown): InstanceExperimenta
     enableProductivityReviewOwnerBurstCap: false,
     productivityReviewMaxCreationsPerOwnerPerSweep:
       DEFAULT_PRODUCTIVITY_REVIEW_MAX_CREATIONS_PER_OWNER_PER_SWEEP,
-    operatorDrainActive: false,
-    operatorDrainStartedAt: null,
+    ...drainFields,
     issueGraphLivenessAutoRecoveryLookbackHours:
       DEFAULT_ISSUE_GRAPH_LIVENESS_AUTO_RECOVERY_LOOKBACK_HOURS,
   };
@@ -418,6 +430,42 @@ export function instanceSettingsService(db: Db, options: InstanceSettingsService
     throw new Error("Failed to initialize instance settings row");
   }
 
+  function drainView(experimental: InstanceExperimentalSettings) {
+    const control = experimental.operatorDrainControl ?? { generation: 0, ownerId: null, hosts: {} };
+    return {
+      active: experimental.operatorDrainActive,
+      startedAt: experimental.operatorDrainStartedAt,
+      ownerId: control.ownerId,
+      generation: control.generation,
+      hostIds: Object.keys(control.hosts).sort(),
+      pendingHostIds: Object.entries(control.hosts).filter(([, host]) => !host.quiescent).map(([id]) => id).sort(),
+    };
+  }
+
+  async function writeExperimental<T>(change: (current: InstanceExperimentalSettings) => T) {
+    return db.transaction(async (tx) => {
+      await getOrCreateRow(tx);
+      const [row] = await tx.select().from(instanceSettings)
+        .where(eq(instanceSettings.singletonKey, DEFAULT_SINGLETON_KEY)).for("update");
+      const current = normalizeExperimentalSettings(row.experimental);
+      const before = JSON.stringify(current);
+      const result = change(current);
+      if (JSON.stringify(current) === before) return { result, row };
+      const [updated] = await tx.update(instanceSettings).set({
+        experimental: { ...current },
+        updatedAt: (options.now ?? (() => new Date()))(),
+      }).where(eq(instanceSettings.id, row.id)).returning();
+      return { result, row: updated };
+    });
+  }
+
+  function assertReleaseOwner(current: InstanceExperimentalSettings, input: { ownerId: string; generation: number }) {
+    const drain = drainView(current);
+    if (!drain.active || drain.ownerId !== input.ownerId || drain.generation !== input.generation) {
+      throw conflict("Release drain owner or generation changed", { code: "release_drain_conflict" });
+    }
+  }
+
   return {
     get: async (): Promise<InstanceSettings> => toInstanceSettings(await getOrCreateRow()),
 
@@ -479,18 +527,10 @@ export function instanceSettingsService(db: Db, options: InstanceSettingsService
     },
 
     updateExperimental: async (patch: PatchInstanceExperimentalSettings): Promise<InstanceSettings> => {
-      const current = await getOrCreateRow();
-      const nextExperimental = applyExperimentalSettingsPatch(current.experimental, patch, options);
-      const now = new Date();
-      const [updated] = await db
-        .update(instanceSettings)
-        .set({
-          experimental: { ...nextExperimental },
-          updatedAt: now,
-        })
-        .where(eq(instanceSettings.id, current.id))
-        .returning();
-      return toInstanceSettings(updated ?? current);
+      const { row } = await writeExperimental((current) => {
+        Object.assign(current, applyExperimentalSettingsPatch(current, patch, options));
+      });
+      return toInstanceSettings(row);
     },
 
     listCompanyIds: async (): Promise<string[]> =>
@@ -504,35 +544,83 @@ export function instanceSettingsService(db: Db, options: InstanceSettingsService
     // dedicated routes below are the only writers. Read through the plain
     // normalizer, not toExperimentalView: a cloud managed-config overlay must
     // never mask or force an operational drain state.
-    getOperatorDrain: async (): Promise<{ active: boolean; startedAt: string | null }> => {
-      const row = await getOrCreateRow();
-      const experimental = normalizeExperimentalSettings(row.experimental);
-      return {
-        active: experimental.operatorDrainActive === true,
-        startedAt: experimental.operatorDrainStartedAt ?? null,
-      };
+    getOperatorDrain: async () => drainView(normalizeExperimentalSettings((await getOrCreateRow()).experimental)),
+
+    observeOperatorDrain: async (hostId: string) => {
+      const { result } = await writeExperimental((current) => {
+        const control = current.operatorDrainControl ??= { generation: 0, ownerId: null, hosts: {} };
+        if (!current.operatorDrainActive || !control.hosts[hostId]) {
+          control.hosts[hostId] = { quiescent: false };
+        }
+        return drainView(current);
+      });
+      return result;
     },
 
-    setOperatorDrain: async (active: boolean): Promise<{ active: boolean; startedAt: string | null }> => {
-      const current = await getOrCreateRow();
-      const nextExperimental = normalizeExperimentalSettings(current.experimental);
-      const now = (options.now ?? (() => new Date()))();
-      const drain = active
-        ? { operatorDrainActive: true, operatorDrainStartedAt: now.toISOString() }
-        : { operatorDrainActive: false, operatorDrainStartedAt: null };
-      const [updated] = await db
-        .update(instanceSettings)
-        .set({
-          experimental: { ...nextExperimental, ...drain },
-          updatedAt: now,
-        })
-        .where(eq(instanceSettings.id, current.id))
-        .returning();
-      const persisted = normalizeExperimentalSettings((updated ?? current).experimental);
-      return {
-        active: persisted.operatorDrainActive === true,
-        startedAt: persisted.operatorDrainStartedAt ?? null,
-      };
+    setOperatorDrain: async (active: boolean) => {
+      const { result } = await writeExperimental((current) => {
+        const control = current.operatorDrainControl ??= { generation: 0, ownerId: null, hosts: {} };
+        if (!active && control.ownerId) {
+          throw conflict("A release-owned drain must be cleared by its owner", { code: "release_drain_conflict" });
+        }
+        if (current.operatorDrainActive !== active || control.ownerId) {
+          if (control.generation >= Number.MAX_SAFE_INTEGER) throw conflict("Drain generation exhausted");
+          control.generation += 1;
+        }
+        control.ownerId = null;
+        current.operatorDrainActive = active;
+        current.operatorDrainStartedAt = active ? (options.now ?? (() => new Date()))().toISOString() : null;
+        return drainView(current);
+      });
+      return result;
+    },
+
+    acquireReleaseDrain: async (input: { ownerId: string; generation: number }) => {
+      const { result } = await writeExperimental((current) => {
+        const control = current.operatorDrainControl ??= { generation: 0, ownerId: null, hosts: {} };
+        if (current.operatorDrainActive || control.generation !== input.generation) {
+          throw conflict("Drain is already active or generation changed", { code: "release_drain_conflict" });
+        }
+        if (control.generation >= Number.MAX_SAFE_INTEGER) throw conflict("Drain generation exhausted");
+        control.generation += 1;
+        control.ownerId = input.ownerId;
+        current.operatorDrainActive = true;
+        current.operatorDrainStartedAt = (options.now ?? (() => new Date()))().toISOString();
+        return drainView(current);
+      });
+      return result;
+    },
+
+    assertReleaseDrain: async (input: { ownerId: string; generation: number }) => {
+      const current = normalizeExperimentalSettings((await getOrCreateRow()).experimental);
+      assertReleaseOwner(current, input);
+      return drainView(current);
+    },
+
+    acknowledgeReleaseDrain: async (input: { ownerId: string; generation: number }, hostId: string) => {
+      const { result } = await writeExperimental((current) => {
+        assertReleaseOwner(current, input);
+        current.operatorDrainControl!.hosts[hostId] = { quiescent: true };
+        return drainView(current);
+      });
+      return result;
+    },
+
+    clearReleaseDrain: async (input: { ownerId: string; generation: number }) => {
+      const { result } = await writeExperimental((current) => {
+        assertReleaseOwner(current, input);
+        const drain = drainView(current);
+        if (drain.hostIds.length === 0 || drain.pendingHostIds.length > 0) {
+          throw conflict("Release drain has unverified hosts", { code: "release_drain_not_quiescent", pendingHostIds: drain.pendingHostIds });
+        }
+        current.operatorDrainActive = false;
+        current.operatorDrainStartedAt = null;
+        current.operatorDrainControl!.ownerId = null;
+        // A verified host registers again before doing any work after clear.
+        current.operatorDrainControl!.hosts = {};
+        return drainView(current);
+      });
+      return result;
     },
   };
 }

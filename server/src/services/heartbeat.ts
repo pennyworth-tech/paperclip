@@ -71,6 +71,16 @@ import {
   workspaceOperations,
 } from "@paperclipai/db";
 import { conflict, HttpError, notFound } from "../errors.js";
+import {
+  releaseDrainHostId,
+  releaseDrainOperationCount,
+  trackReleaseDrainOperation,
+  serializeReleaseDrainInterruption,
+  inspectReleaseDrainProcess,
+  inspectReleaseDrainResources,
+  releaseDrainReceiptSchema,
+  type ReleaseDrainRequest,
+} from "./release-drain-runtime.js";
 import { getStartupTraceContext, getStartupTracer } from "../instrumentation.js";
 import { createHostDuplexObservabilityRecorder } from "./duplex-observability-recorder.js";
 import type { DuplexAggregateByteLedger } from "@paperclipai/adapter-utils/duplex-aggregate-byte-ledger";
@@ -6930,28 +6940,19 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     }
     return cachedWorktreeRunExecutionOverride;
   };
-  // Operator drain: a DB-backed flag every instance sharing this
-  // database honors, so a deploy can hold scheduling on the still-serving and
-  // the staged revision alike before the new revision's boot logic runs. Same
-  // cache shape as the worktree override: a short TTL keeps the hot-path
-  // suppression checks off the DB, and a read failure keeps the prior value —
-  // defaulting to false mid-drain would let a booting revision start reaping
-  // during the drain, and defaulting to true would wedge an instance on a
-  // flaky DB. Sticky is the only safe direction.
-  const OPERATOR_DRAIN_CACHE_TTL_MS = 3_000;
-  let cachedOperatorDrain: { active: boolean; at: number } = { active: false, at: 0 };
+  // Never cache an inactive drain: every admission registers this boot under
+  // the same row lock used by acquire. A receipt acknowledges the process-wide
+  // fence, including scheduler service instances created before acquisition.
+  let acknowledgedDrainGeneration: number | null = null;
   const resolveOperatorDrainActive = async () => {
-    const now = Date.now();
-    if (now - cachedOperatorDrain.at < OPERATOR_DRAIN_CACHE_TTL_MS) {
-      return cachedOperatorDrain.active;
-    }
     try {
-      const drain = await instanceSettings.getOperatorDrain();
-      cachedOperatorDrain = { active: drain.active, at: now };
+      const drain = await instanceSettings.observeOperatorDrain(releaseDrainHostId);
+      acknowledgedDrainGeneration = drain.active ? drain.generation : null;
+      return drain.active;
     } catch {
-      // Keep the prior value; see the comment above.
+      acknowledgedDrainGeneration = null;
+      return true;
     }
-    return cachedOperatorDrain.active;
   };
   const getSchedulingSuppression = async () => {
     const envSuppression = resolveHeartbeatSchedulingSuppression(runtimeEnv, {
@@ -10599,6 +10600,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   }
 
   async function prepareHotRestartShutdown(signal: "SIGINT" | "SIGTERM", now = new Date()) {
+    return trackReleaseDrainOperation(async () => {
+      if (await resolveOperatorDrainActive()) return { mode: "release_drain" as const, skipDrain: true as const, activeRunIds: [] as string[] };
+      return prepareHotRestartShutdownUnfenced(signal, now);
+    });
+  }
+
+  async function prepareHotRestartShutdownUnfenced(signal: "SIGINT" | "SIGTERM", now = new Date()) {
     let intent: Awaited<ReturnType<typeof readHotRestartIntent>>;
     try {
       intent = await readHotRestartIntent();
@@ -10701,6 +10709,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   }
 
   async function reconcileHotRestartAdoption(now = new Date()) {
+    return trackReleaseDrainOperation(async () => {
+      if (await resolveOperatorDrainActive()) return { mode: "release_drain" as const, adoptedRunIds: [] as string[], finalizedWhileDownRunIds: [] as string[], lostRunIds: [] as string[], skippedRunIds: [] as string[] };
+      return reconcileHotRestartAdoptionUnfenced(now);
+    });
+  }
+
+  async function reconcileHotRestartAdoptionUnfenced(now = new Date()) {
     let intent: Awaited<ReturnType<typeof readHotRestartIntent>>;
     try {
       intent = await readHotRestartIntent();
@@ -10948,8 +10963,37 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     signal: "SIGINT" | "SIGTERM",
     now = new Date(),
     runIds: readonly string[] | null = null,
+    release?: ReleaseDrainRequest & { graceMs: number },
+  ) {
+    return trackReleaseDrainOperation(async () => {
+      if (release) await instanceSettings.assertReleaseDrain(release);
+      else if ((await instanceSettings.getOperatorDrain()).ownerId) {
+        return { interrupted: 0, interruptedRunIds: [] as string[], retryRunIds: [] as string[] };
+      }
+      return serializeReleaseDrainInterruption(async () => {
+        if (release) await instanceSettings.assertReleaseDrain(release);
+        else if ((await instanceSettings.getOperatorDrain()).ownerId) {
+          return { interrupted: 0, interruptedRunIds: [] as string[], retryRunIds: [] as string[] };
+        }
+        return drainRunningRunsForShutdownUnfenced(signal, now, runIds, release);
+      });
+    });
+  }
+
+  async function drainRunningRunsForShutdownUnfenced(
+    signal: "SIGINT" | "SIGTERM",
+    now: Date,
+    runIds: readonly string[] | null,
+    release?: ReleaseDrainRequest & { graceMs: number },
   ) {
     const selectedRunIds = runIds ? [...new Set(runIds)] : null;
+    if (release) {
+      if (!selectedRunIds?.length) throw conflict("Release interruption requires an explicit run selection");
+      const selected = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(inArray(heartbeatRuns.id, selectedRunIds));
+      if (selected.length !== selectedRunIds.length) {
+        throw conflict("Release interruption contains an unknown run", { code: "release_drain_unknown_process" });
+      }
+    }
     if (selectedRunIds?.length === 0) {
       return { interrupted: 0, interruptedRunIds: [], retryRunIds: [] };
     }
@@ -10963,47 +11007,79 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       .where(
         selectedRunIds
           ? and(
-            eq(heartbeatRuns.status, "running"),
+            release ? or(
+              eq(heartbeatRuns.status, "running"),
+              and(eq(heartbeatRuns.status, "interrupted"),
+                sql`${heartbeatRuns.resultJson} -> 'releaseDrain' ->> 'ownerId' = ${release.ownerId}`,
+                sql`${heartbeatRuns.resultJson} -> 'releaseDrain' ->> 'generation' = ${String(release.generation)}`),
+            ) : eq(heartbeatRuns.status, "running"),
             inArray(heartbeatRuns.id, selectedRunIds),
           )
           : eq(heartbeatRuns.status, "running"),
       );
 
+    if (release) {
+      // A database PID is not proof that this boot owns that OS process.
+      // Validate the entire selection before sending a signal to any run.
+      for (const { run } of activeRuns) {
+        const local = runningProcesses.get(run.id);
+        const previouslyInterruptedHere = run.status === "interrupted"
+          && parseObject(parseObject(run.resultJson).releaseDrain).hostId === releaseDrainHostId
+          && inspectReleaseDrainProcess(run.processPid) === "absent"
+          && inspectReleaseDrainProcess(run.processGroupId, true) === "absent";
+        if (!previouslyInterruptedHere && (!local?.child.pid || inspectReleaseDrainProcess(local.child.pid) === "unknown"
+          || inspectReleaseDrainProcess(local.processGroupId, true) === "unknown")) {
+          throw conflict("Cannot interrupt a run with unknown local ownership", { code: "release_drain_unknown_process", runId: run.id });
+        }
+      }
+    }
     const interruptedRunIds: string[] = [];
     const retryRunIds: string[] = [];
 
     for (const { run, agent } of activeRuns) {
       const running = runningProcesses.get(run.id);
-      try {
-        if (running) {
-          await terminateHeartbeatRunProcess({
-            pid: running.child.pid ?? run.processPid,
-            processGroupId: running.processGroupId ?? run.processGroupId,
-            graceMs: Math.max(1, running.graceSec) * 1000,
-          });
-        } else if (run.processPid || run.processGroupId) {
-          await terminateHeartbeatRunProcess({
-            pid: run.processPid,
-            processGroupId: run.processGroupId,
-          });
+      const terminate = async () => {
+        try {
+          if (running) {
+            await terminateHeartbeatRunProcess({
+              pid: running.child.pid ?? run.processPid,
+              processGroupId: running.processGroupId ?? run.processGroupId,
+              graceMs: release?.graceMs ?? Math.max(1, running.graceSec) * 1000,
+            });
+          } else if (run.processPid || run.processGroupId) {
+            await terminateHeartbeatRunProcess({
+              pid: run.processPid,
+              processGroupId: run.processGroupId,
+            });
+          }
+        } catch (error) {
+          if (!release) runningProcesses.delete(run.id);
+          throw error;
         }
-      } finally {
         runningProcesses.delete(run.id);
-      }
+      };
+      if (!release) await terminate();
 
       const message = `Interrupted by graceful server shutdown (${signal}); retry queued for restart recovery`;
-      const interruptedStatus = await setRunStatusIfRunning(run.id, "interrupted", {
+      const interruptedStatus = release && run.status === "interrupted"
+        ? { updated: true, run }
+        : await setRunStatusIfRunning(run.id, "interrupted", {
         finishedAt: now,
+        ...(release ? { processPid: running!.child.pid, processGroupId: running!.processGroupId } : {}),
         error: message,
         errorCode: "server_shutdown_interrupted",
         signal,
         resultJson: mergeRunStopMetadataForAgent(agent, "interrupted", {
-          resultJson: parseObject(run.resultJson),
+          resultJson: {
+            ...parseObject(run.resultJson),
+            ...(release ? { releaseDrain: { ...release, hostId: releaseDrainHostId } } : {}),
+          },
           errorCode: "server_shutdown_interrupted",
           errorMessage: message,
         }),
       });
       if (!interruptedStatus.updated || !interruptedStatus.run) continue;
+      if (release && running) await terminate();
       let interrupted = interruptedStatus.run;
       await setWakeupStatus(run.wakeupRequestId, "cancelled", {
         finishedAt: now,
@@ -11019,7 +11095,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         failureReason: interrupted.error ?? undefined,
       });
 
-      const retry = await enqueueProcessLossRetry(interrupted, agent, now);
+      const scheduled = release ? await scheduleBoundedRetryForRun(interrupted, agent, {
+        now, retryReason: "release_drain", wakeReason: "release_drain_retry",
+        maxAttempts: (interrupted.scheduledRetryAttempt ?? 0) + 1, delayMs: 0,
+      }) : null;
+      const retry = release
+        ? (scheduled?.outcome === "scheduled" ? scheduled.run : null)
+        : await enqueueProcessLossRetry(interrupted, agent, now);
       if (!retry) {
         await releaseIssueExecutionAndPromote(interrupted);
       } else {
@@ -11042,7 +11124,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       await finalizeAgentStatus(run.agentId, "interrupted", message, {
         wasFirstHeartbeat: timerClaimWasFirstHeartbeat(run),
       });
-      interruptedRunIds.push(interrupted.id);
+      if (run.status === "running") interruptedRunIds.push(interrupted.id);
     }
 
     if (interruptedRunIds.length > 0) {
@@ -11052,6 +11134,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       );
     }
 
+    if (release && selectedRunIds?.length) {
+      const retries = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
+        inArray(heartbeatRuns.retryOfRunId, selectedRunIds), eq(heartbeatRuns.scheduledRetryReason, "release_drain"),
+      ));
+      for (const retry of retries) if (!retryRunIds.includes(retry.id)) retryRunIds.push(retry.id);
+    }
     return {
       interrupted: interruptedRunIds.length,
       interruptedRunIds,
@@ -11556,7 +11644,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       };
     }
 
-    if (retryReason !== MAX_TURN_CONTINUATION_RETRY_REASON) {
+    if (retryReason !== MAX_TURN_CONTINUATION_RETRY_REASON && retryReason !== "release_drain") {
       const invokability = await getAgentInvokability(agent);
       if (!invokability.invokable) {
         await appendRunEvent(run, await nextRunEventSeq(run.id), {
@@ -11694,6 +11782,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         };
 
     const scheduleResult = await db.transaction(async (tx): Promise<ScheduledRetryTransactionResult> => {
+      if (retryReason === "release_drain") {
+        await tx.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(eq(heartbeatRuns.id, run.id)).for("update");
+        const [existing] = await tx.select().from(heartbeatRuns).where(and(
+          eq(heartbeatRuns.retryOfRunId, run.id), eq(heartbeatRuns.scheduledRetryReason, retryReason),
+        )).limit(1);
+        if (existing) return { outcome: "scheduled", run: existing, reusedExisting: true };
+      }
       if (retryReason === INTERACTION_CONTINUATION_INFRA_RETRY_REASON) {
         if (issueId) {
           await tx.execute(
@@ -11914,11 +12009,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           agentId: run.agentId,
           invocationSource: "automation",
           triggerDetail: "system",
-          status: "scheduled_retry",
+          status: retryReason === "release_drain" ? "queued" : "scheduled_retry",
           wakeupRequestId: wakeupRequest.id,
           contextSnapshot: retryContextSnapshot,
           responsibleUserId,
-          sessionIdBefore: sessionBefore,
+          sessionIdBefore: retryReason === "release_drain" ? (sessionBefore ?? run.sessionIdAfter ?? run.sessionIdBefore) : sessionBefore,
           retryOfRunId: run.id,
           scheduledRetryAt: schedule.dueAt,
           scheduledRetryAttempt: schedule.attempt,
@@ -12361,6 +12456,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   }
 
   async function promoteDueScheduledRetries(now = new Date()) {
+    return trackReleaseDrainOperation(async () => {
+      if (await resolveOperatorDrainActive()) return { promoted: 0, runIds: [] as string[] };
+      return promoteDueScheduledRetriesUnfenced(now);
+    });
+  }
+
+  async function promoteDueScheduledRetriesUnfenced(now = new Date()) {
     const cutoff = await getWorktreeExecutionCutoff();
     const dueRuns = await db
       .select()
@@ -13386,7 +13488,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         lastHeartbeatAt: new Date(),
         updatedAt: new Date(),
       })
-      .where(eq(agents.id, agentId))
+      .where(and(eq(agents.id, agentId), notInArray(agents.status, ["paused", "terminated"])))
       .returning()
       .then((rows) => rows[0] ?? null);
 
@@ -13732,7 +13834,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   // for that period between attempts. The sweep reads and writes the attempt
   // count in the lease metadata. It warns once when a lease reaches the attempt
   // cap and then stops the retries for that lease.
-  async function sweepPendingCleanupLeases(opts?: { backoffMs?: number }): Promise<{
+  async function sweepPendingCleanupLeases(opts?: { backoffMs?: number }) {
+    return trackReleaseDrainOperation(async () => {
+      if (await resolveOperatorDrainActive()) return { swept: 0, destroyed: 0, capped: 0 };
+      return sweepPendingCleanupLeasesUnfenced(opts);
+    });
+  }
+
+  async function sweepPendingCleanupLeasesUnfenced(opts?: { backoffMs?: number }): Promise<{
     swept: number;
     destroyed: number;
     capped: number;
@@ -13902,6 +14011,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   }
 
   async function reapOrphanedRuns(opts?: { staleThresholdMs?: number }) {
+    return trackReleaseDrainOperation(async () => {
+      if (await resolveOperatorDrainActive()) return { reaped: 0, runIds: [] as string[] };
+      return reapOrphanedRunsUnfenced(opts);
+    });
+  }
+
+  async function reapOrphanedRunsUnfenced(opts?: { staleThresholdMs?: number }) {
     const staleThresholdMs = opts?.staleThresholdMs ?? 0;
     const now = new Date();
 
@@ -14215,6 +14331,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   }
 
   async function resumeQueuedRuns() {
+    return trackReleaseDrainOperation(async () => {
+      if (await resolveOperatorDrainActive()) return undefined;
+      return resumeQueuedRunsUnfenced();
+    });
+  }
+
+  async function resumeQueuedRunsUnfenced() {
     if ((await getSchedulingSuppression()).suppressed) return;
     const cutoff = await getWorktreeExecutionCutoff();
 
@@ -14239,6 +14362,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   }
 
   async function sweepStaleIssueLocks() {
+    return trackReleaseDrainOperation(async () => {
+      if (await resolveOperatorDrainActive()) return { cleared: 0, issueIds: [] as string[], terminalizedRunIds: [] as string[] };
+      return sweepStaleIssueLocksUnfenced();
+    });
+  }
+
+  async function sweepStaleIssueLocksUnfenced() {
     return recovery.sweepStaleIssueLocks();
   }
 
@@ -14356,6 +14486,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   }
 
   async function startNextQueuedRunForAgent(agentId: string) {
+    return trackReleaseDrainOperation(async () => {
+      if (await resolveOperatorDrainActive()) return [];
+      return startNextQueuedRunForAgentUnfenced(agentId);
+    });
+  }
+
+  async function startNextQueuedRunForAgentUnfenced(agentId: string) {
     if ((await getSchedulingSuppression()).suppressed) return [];
     const cutoff = await getWorktreeExecutionCutoff();
 
@@ -20307,6 +20444,54 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     resolveSchedulingSuppression: getSchedulingSuppression,
     drainRunningRunsForShutdown,
     drainActiveRunExecutions,
+
+    verifyReleaseDrain: async (input: ReleaseDrainRequest) => {
+      await instanceSettings.assertReleaseDrain(input);
+      await resolveOperatorDrainActive();
+      const [runs, leases, resources] = await Promise.all([
+        db.select({ id: heartbeatRuns.id, status: heartbeatRuns.status, pid: heartbeatRuns.processPid, groupId: heartbeatRuns.processGroupId })
+          .from(heartbeatRuns).where(or(
+            inArray(heartbeatRuns.status, ["running", "queued"]),
+            sql`${heartbeatRuns.processPid} is not null`, sql`${heartbeatRuns.processGroupId} is not null`,
+          )),
+        db.select({ id: environmentLeases.id }).from(environmentLeases).where(or(
+          notInArray(environmentLeases.status, ["released", "expired", "failed"]),
+          eq(environmentLeases.cleanupStatus, "failed"),
+          and(
+            sql`${environmentLeases.providerLeaseId} is not null`,
+            sql`${environmentLeases.cleanupStatus} is distinct from 'success'`,
+          ),
+          and(
+            eq(environmentLeases.leasePolicy, "reuse_by_environment"),
+            ne(environmentLeases.status, "expired"),
+          ),
+        )),
+        inspectReleaseDrainResources(runtimeEnv),
+      ]);
+      const localProcessRunIds = [...runningProcesses.keys()].sort();
+      const processRunIds = runs.filter((run) =>
+        inspectReleaseDrainProcess(run.pid) !== "absent" || inspectReleaseDrainProcess(run.groupId, true) !== "absent",
+      ).map((run) => run.id);
+      const runningCount = runs.filter((run) => run.status === "running").length;
+      const inFlightExecutions = activeRunExecutions.size + activeRunExecutionPromises.size + activeWakeupPromises.size;
+      const lifecycleOperations = releaseDrainOperationCount();
+      const suppressionAcknowledged = acknowledgedDrainGeneration === input.generation;
+      const locallyQuiescent = suppressionAcknowledged && runningCount === 0 && localProcessRunIds.length === 0
+        && processRunIds.length === 0 && inFlightExecutions === 0 && lifecycleOperations === 0
+        && leases.length === 0 && resources.unknown.length === 0 && resources.devcontainerIds.length === 0
+        && resources.liveServiceIds.length === 0 && resources.orphanCleanupCount === 0;
+      const drain = locallyQuiescent
+        ? await instanceSettings.acknowledgeReleaseDrain(input, releaseDrainHostId)
+        : await instanceSettings.assertReleaseDrain(input);
+      return releaseDrainReceiptSchema.parse({
+        schemaVersion: 1, ...input, hostId: releaseDrainHostId, observedAt: new Date().toISOString(),
+        quiescent: locallyQuiescent && drain.pendingHostIds.length === 0,
+        locallyQuiescent, pendingHostIds: drain.pendingHostIds,
+        runningCount, queuedCount: runs.filter((run) => run.status === "queued").length,
+        localProcessRunIds, processRunIds, inFlightExecutions, lifecycleOperations,
+        suppressionAcknowledged, leaseIds: leases.map((lease) => lease.id), ...resources,
+      });
+    },
 
     // Instance-wide live-run counts for the operator drain surface.
     getOperatorDrainSnapshot: async () => {

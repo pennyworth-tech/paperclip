@@ -6,7 +6,9 @@ import {
   patchInstanceExperimentalSettingsSchema,
   patchInstanceGeneralSettingsSchema,
 } from "@paperclipai/shared";
-import { forbidden } from "../errors.js";
+import { conflict, forbidden } from "../errors.js";
+import { assertReleaseDrainIdentity } from "./release-drain-auth.js";
+import { releaseDrainRequestSchema, releaseDrainInterruptSchema, releaseDrainHostId } from "../services/release-drain-runtime.js";
 import { isCloudManagedInstance } from "../services/cloud-instance.js";
 import { getHiddenSettings } from "../services/settings-visibility.js";
 import { validate } from "../middleware/validate.js";
@@ -110,6 +112,43 @@ export function instanceSettingsRoutes(db: Db) {
     return { draining: drain.active, startedAt: drain.startedAt, ...snapshot };
   };
 
+  const logReleaseDrain = async (ownerId: string, action: string, details: Record<string, unknown>) => {
+    await Promise.all((await svc.listCompanyIds()).map((companyId) => logActivity(db, {
+      companyId, actorType: "system", actorId: `release:${ownerId}`,
+      action, entityType: "instance_settings", entityId: "drain", details,
+    })));
+  };
+
+  router.get("/instance/drain/release", async (req, res) => {
+    assertReleaseDrainIdentity(req);
+    res.json(await svc.getOperatorDrain());
+  });
+
+  router.post("/instance/drain/acquire", async (req, res) => {
+    const ownerId = assertReleaseDrainIdentity(req);
+    const input = releaseDrainRequestSchema.parse(req.body);
+    const drain = await svc.acquireReleaseDrain(input);
+    await svc.observeOperatorDrain(releaseDrainHostId);
+    await logReleaseDrain(ownerId, "instance.release_drain.acquired", drain);
+    res.json(drain);
+  });
+
+  router.post("/instance/drain/verify", async (req, res) => {
+    assertReleaseDrainIdentity(req);
+    const input = releaseDrainRequestSchema.parse(req.body);
+    res.json(await heartbeat.verifyReleaseDrain(input));
+  });
+
+  router.post("/instance/drain/clear", async (req, res) => {
+    const ownerId = assertReleaseDrainIdentity(req);
+    const input = releaseDrainRequestSchema.parse(req.body);
+    const receipt = await heartbeat.verifyReleaseDrain(input);
+    if (!receipt.quiescent) throw conflict("Release drain is not quiescent", { code: "release_drain_not_quiescent", receipt });
+    const drain = await svc.clearReleaseDrain(input);
+    await logReleaseDrain(ownerId, "instance.release_drain.cleared", drain);
+    res.json(drain);
+  });
+
   router.get("/instance/drain", async (req, res) => {
     assertBoardOrgAccess(req);
     res.json(await drainStateView());
@@ -140,7 +179,16 @@ export function instanceSettingsRoutes(db: Db) {
   // like the graceful-shutdown path, retries queued. Call it AFTER the bounded
   // drain wait, before staging the new revision.
   router.post("/instance/drain/interrupt", async (req, res) => {
+    if (req.body?.ownerId !== undefined || req.body?.generation !== undefined || req.header("authorization")?.startsWith("Release ")) {
+      const ownerId = assertReleaseDrainIdentity(req);
+      const input = releaseDrainInterruptSchema.parse(req.body);
+      const drainResult = await heartbeat.drainRunningRunsForShutdown("SIGTERM", new Date(), input.runIds, input);
+      await logReleaseDrain(ownerId, "instance.release_drain.interrupted", { ...input, ...drainResult });
+      res.json({ ...(await drainStateView()), ...drainResult });
+      return;
+    }
     assertCanManageInstanceSettings(req);
+    if ((await svc.getOperatorDrain()).ownerId) throw conflict("Release drain identity required for interruption");
     const drainResult = await heartbeat.drainRunningRunsForShutdown("SIGTERM");
     await logInstanceDrainActivity(db, "instance.drain.interrupted", req, svc, {
       interrupted: drainResult.interrupted,
