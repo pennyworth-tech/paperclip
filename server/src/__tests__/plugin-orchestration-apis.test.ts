@@ -1425,7 +1425,7 @@ describeEmbeddedPostgres("plugin orchestration APIs", () => {
     it("links a review issue, reads it back, and lets only the linked assignee decide", async () => {
       const seeded = await seedLinkedReviewerCase();
       const { companyId, caseId } = seeded;
-      const services = buildHostServices(db, "plugin-record-id", "backlit.operations", createEventBusStub());
+      const services = buildHostServices(db, "plugin-record-id", "example.operations", createEventBusStub());
       const runA = await seeded.runFor(seeded.reviewerAId);
       const runB = await seeded.runFor(seeded.reviewerBId);
 
@@ -1509,7 +1509,7 @@ describeEmbeddedPostgres("plugin orchestration APIs", () => {
     it("refuses a forged actorAgentId whose run belongs to another agent", async () => {
       const seeded = await seedLinkedReviewerCase();
       const { companyId, caseId } = seeded;
-      const services = buildHostServices(db, "plugin-record-id", "backlit.operations", createEventBusStub());
+      const services = buildHostServices(db, "plugin-record-id", "example.operations", createEventBusStub());
       await services.pipelines.createReviewLink({ caseId, companyId, issueId: seeded.reviewIssueId });
       const runB = await seeded.runFor(seeded.reviewerBId);
 
@@ -1539,7 +1539,7 @@ describeEmbeddedPostgres("plugin orchestration APIs", () => {
     it("refuses a missing actor or unknown case with structured codes", async () => {
       const seeded = await seedLinkedReviewerCase();
       const { companyId, caseId } = seeded;
-      const services = buildHostServices(db, "plugin-record-id", "backlit.operations", createEventBusStub());
+      const services = buildHostServices(db, "plugin-record-id", "example.operations", createEventBusStub());
       const runA = await seeded.runFor(seeded.reviewerAId);
 
       await expect(services.pipelines.reviewCase({
@@ -1573,7 +1573,7 @@ describeEmbeddedPostgres("plugin orchestration APIs", () => {
     it("writes a case document as the system, with no agent run behind it", async () => {
       const seeded = await seedLinkedReviewerCase();
       const { companyId, caseId } = seeded;
-      const services = buildHostServices(db, "plugin-record-id", "backlit.operations", createEventBusStub());
+      const services = buildHostServices(db, "plugin-record-id", "example.operations", createEventBusStub());
 
       await expect(services.pipelines.getDocument({ caseId, companyId, key: "merge-dossier" })).resolves.toBeNull();
 
@@ -1624,9 +1624,9 @@ describeEmbeddedPostgres("plugin orchestration APIs", () => {
 
     it("gates the pipeline bridge methods on their capabilities", async () => {
       const seeded = await seedLinkedReviewerCase();
-      const services = buildHostServices(db, "plugin-record-id", "backlit.operations", createEventBusStub());
+      const services = buildHostServices(db, "plugin-record-id", "example.operations", createEventBusStub());
       const runA = await seeded.runFor(seeded.reviewerAId);
-      const denied = createHostClientHandlers({ pluginId: "backlit.operations", capabilities: ["pipeline.cases.read"], services });
+      const denied = createHostClientHandlers({ pluginId: "example.operations", capabilities: ["pipeline.cases.read"], services });
       await expect(denied["pipelines.cases.review"]({
         caseId: seeded.caseId,
         companyId: seeded.companyId,
@@ -1699,7 +1699,7 @@ describe("plugin http.fetch binary request bodies", () => {
     try {
       await callWorker("1", "initialize", {
         manifest: {
-          id: "backlit.fetch-test",
+          id: "example.fetch-test",
           apiVersion: 1,
           version: "1.0.0",
           displayName: "Fetch test",
