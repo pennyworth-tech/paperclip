@@ -824,7 +824,7 @@ describe("SidebarCompanyMenu", () => {
       expect(mockCloudApi.listStacks).not.toHaveBeenCalled();
       await openMenu("Open Acme Labs organization switcher");
 
-      expect(document.body.textContent).toContain("Switch organization");
+      expect(document.body.textContent).toContain("Organizations");
       expect(document.body.textContent).toContain("Acme Labs");
       expect(document.body.textContent).toContain("Strata");
       expect(document.body.textContent).toContain("Anachronist Wiki");
