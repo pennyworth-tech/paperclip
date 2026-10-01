@@ -1,3 +1,4 @@
+import type { PluginWorkspaceRevisionInspection } from "@paperclipai/plugin-sdk";
 import type { SourceEditProgramInput, SourceEditRecovery } from "./workspace-source-edit-recovery.js";
 import { inspectOpenSpecTree } from "./workspace-openspec-tree.js";
 import { readSourceEditInspection, type SourceEditInspection } from "./workspace-source-edit-inspection.js";
@@ -13,8 +14,8 @@ function editOpenSpec(input: SourceEditProgramInput, inspectTree: typeof inspect
   // Execute only the reviewed, dependency-free renderer shipped in this release.
   // Python isolated mode prevents imports from the repository or PYTHONPATH.
   const rendererHash = "7585fbb9f5ec0543fc97f46fdf9ebe3fca1bcec42db4861449f3a62129243926";
-  const root = process.cwd(), maxBytes = 8 * 1024 * 1024;
-  const hash = (value: string) => crypto.createHash("sha256").update(value).digest("hex");
+  const root = process.cwd(), maxBytes = 8 * 1024 * 1024, maxRawBytes = 16 * 1024 * 1024;
+  const hash = (value: string | Buffer) => crypto.createHash("sha256").update(value).digest("hex");
   const fail = (code: string, detail?: string): never => { throw Object.assign(new Error(code), { detail }); };
   const env: NodeJS.ProcessEnv = { ...process.env, GIT_OPTIONAL_LOCKS: "0", GIT_NO_REPLACE_OBJECTS: "1", GIT_TERMINAL_PROMPT: "0", OPENSPEC_TELEMETRY: "0", DO_NOT_TRACK: "1" };
   // Git credentials are needed only by remote Git operations, never by the
@@ -45,6 +46,7 @@ function editOpenSpec(input: SourceEditProgramInput, inspectTree: typeof inspect
       || !Array.isArray(input.files) || input.files.length < 1 || input.files.length > 50 || Buffer.byteLength(JSON.stringify(input.files)) > 4_000_000) fail("invalid_edit_request");
     const seen = new Set<string>();
     for (const file of input.files) {
+      if (typeof file?.path === "string" && /^images\/[A-Za-z0-9][A-Za-z0-9_.-]{0,99}\.(?:png|jpe?g|gif|webp)$/.test(file.path)) fail("edit_path_not_markdown");
       if (!file || typeof file.path !== "string" || !editable(file.path) || seen.has(file.path) || (file.baseSha256 !== null && !/^[a-f0-9]{64}$/.test(file.baseSha256))
         || (file.text !== null && (typeof file.text !== "string" || file.text.includes("\0") || Buffer.byteLength(file.text) > 1_000_000))
         || (file.baseSha256 === null && file.text === null)) fail("invalid_edit_path");
@@ -209,7 +211,7 @@ function editOpenSpec(input: SourceEditProgramInput, inspectTree: typeof inspect
     for (const [file, entry] of entries) {
       if (!["100644", "100755"].includes(entry.mode)) fail("source_missing_or_symlink", file);
       const size = Number(git(["cat-file", "-s", entry.oid]).trim());
-      if (!Number.isSafeInteger(size) || size > 5_000_000 || total + size > maxBytes) fail("source_size_limit");
+      if (!Number.isSafeInteger(size) || size > maxBytes || total + size > maxRawBytes) fail("source_size_limit");
       const raw = cp.spawnSync("git", ["cat-file", "blob", entry.oid], { cwd: root, env, maxBuffer: maxBytes });
       if (raw.status !== 0 || raw.stdout.length !== size) fail("git_operation_failed");
       let text: string;
@@ -232,7 +234,7 @@ function editOpenSpec(input: SourceEditProgramInput, inspectTree: typeof inspect
         if (!match || !sourcePaths(match[3]!)) continue;
         if (!["100644", "100755"].includes(match[1]!)) fail("source_edit_recovery_invalid");
         const size = Number(git(["cat-file", "-s", match[2]!], candidate).trim());
-        if (!Number.isSafeInteger(size) || size > 5_000_000 || restoredBytes + size > maxBytes) fail("source_size_limit");
+        if (!Number.isSafeInteger(size) || size > maxBytes || restoredBytes + size > maxRawBytes) fail("source_size_limit");
         const text = git(["cat-file", "blob", match[2]!], candidate);
         if (Buffer.byteLength(text) !== size || text.includes("\0")) fail("source_not_utf8_text");
         const target = path.join(candidate, match[3]!); fs.mkdirSync(path.dirname(target), { recursive: true });
@@ -291,7 +293,7 @@ function editOpenSpec(input: SourceEditProgramInput, inspectTree: typeof inspect
       const snapshot = inspectTree({ ...input, commitSha: provisional }, candidate);
       if (snapshot.inputCommitSha !== inputCommitSha) fail("source_edit_inspection_invalid");
       if (rendering) snapshot.cli.rendering = rendering;
-      const checked = readInspection({ files: snapshot.files.map(({ path, sha256 }) => ({ path, sha256 })), cli: snapshot.cli }, input.changeId, hash);
+      const checked = readInspection({ files: snapshot.files.map((file) => "binary" in file ? file : { path: file.path, sha256: file.sha256 }), cli: snapshot.cli }, input.changeId, hash);
       // The commit binds the saved CLI results, allowing tool-free restoration
       // and preventing a retry from silently changing the validation outcome.
       const commitSha = git(["commit-tree", tree, "-p", inputCommitSha], candidate,
@@ -300,18 +302,24 @@ function editOpenSpec(input: SourceEditProgramInput, inspectTree: typeof inspect
       journal = { ...journal, commitSha, inputCommitSha, sourceDigest: snapshot.sourceDigest, ...checked }; save();
     }
     let candidateBytes = 0;
-    const readCandidate = (file: string): string | null => {
+    const readCandidate = (file: string, binary = false): string | Buffer | null => {
       const entry = git(["ls-tree", "-z", journal.commitSha!, "--", file], candidate);
       if (!entry) return null;
       const match = entry.match(/^(100644|100755) blob ([a-f0-9]{40})\t([^\0]+)\0$/);
       if (!match || match[3] !== file) fail("source_edit_recovery_invalid");
       const size = Number(git(["cat-file", "-s", match![2]!], candidate).trim());
-      if (!Number.isSafeInteger(size) || size > 5_000_000 || candidateBytes + size > maxBytes) fail("source_size_limit");
-      const text = git(["cat-file", "blob", match![2]!], candidate);
-      if (Buffer.byteLength(text) !== size || text.includes("\0")) fail("source_not_utf8_text");
-      candidateBytes += size; return text;
+      if (!Number.isSafeInteger(size) || size > maxBytes || candidateBytes + size > maxRawBytes) fail("source_size_limit");
+      const raw = cp.spawnSync("git", ["cat-file", "blob", match![2]!], { cwd: candidate, env, maxBuffer: maxBytes });
+      if (raw.error || raw.status !== 0 || raw.stdout.length !== size) fail("git_operation_failed");
+      candidateBytes += size;
+      if (binary) return raw.stdout;
+      let text: string;
+      try { text = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(raw.stdout); }
+      catch { return fail("source_not_utf8_text"); }
+      if (text.includes("\0")) fail("source_not_utf8_text");
+      return text;
     };
-    let source: { files: Array<{ path: string; sha256: string; text: string }>; cli: SourceEditInspection["cli"] } | undefined;
+    let source: Pick<PluginWorkspaceRevisionInspection, "files" | "cli"> | undefined;
     let deckContent: string | null = null;
     const recordedInspection = git(["show", "-s", "--format=%B", journal.commitSha!], candidate).match(/^Inspection: ([a-f0-9]{64})$/m)?.[1];
     if (recordedInspection !== journal.inspectionDigest) fail("source_edit_recovery_invalid");
@@ -320,19 +328,26 @@ function editOpenSpec(input: SourceEditProgramInput, inspectTree: typeof inspect
       if (checked.inspectionDigest !== journal.inspectionDigest
         || !git(["show", "-s", "--format=%B", journal.commitSha!], candidate).includes("\nInspection: " + checked.inspectionDigest + "\n")) fail("source_edit_recovery_invalid");
       const files = checked.inspection.files.map((file) => {
-        const text = readCandidate(file.path);
-        if (text === null || hash(text) !== file.sha256) fail("source_edit_recovery_invalid");
-        return { ...file, text: text! };
+        const bytes = readCandidate(file.path, "binary" in file);
+        if (bytes === null || hash(bytes) !== file.sha256) fail("source_edit_recovery_invalid");
+        if ("binary" in file) {
+          if (!Buffer.isBuffer(bytes) || bytes.length !== file.bytes) fail("source_edit_recovery_invalid");
+          return file;
+        }
+        if (typeof bytes !== "string") return fail("source_edit_recovery_invalid");
+        return { ...file, text: bytes };
       });
       const manifest = files.filter((file) => file.path !== changeRoot + "/review-deck.html")
         .map((file) => ({ path: path.posix.relative(changeRoot, file.path), sha256: file.sha256 }))
         .sort((a, b) => a.path < b.path ? -1 : a.path > b.path ? 1 : 0);
       if (hash(JSON.stringify(manifest).replace(/[\u007f-\uffff]/g, (c) => "\\u" + c.charCodeAt(0).toString(16).padStart(4, "0"))) !== journal.sourceDigest) fail("source_edit_recovery_invalid");
-      deckContent = files.find((file) => file.path === changeRoot + "/review-deck.html")?.text ?? null;
+      const deck = files.find((file) => file.path === changeRoot + "/review-deck.html");
+      deckContent = deck && "text" in deck ? deck.text : null;
       source = { files: files.filter((file) => file.path !== changeRoot + "/review-deck.html"), cli: checked.inspection.cli };
     }
     // The selected standard schema may leave an unrelated old deck untouched.
     const canonicalDeck = deckContent ?? readCandidate(changeRoot + "/review-deck.html");
+    if (canonicalDeck !== null && typeof canonicalDeck !== "string") return fail("source_edit_recovery_invalid");
     const deckHtml = source ? (source.cli.readiness?.deck === "verified" ? deckContent ?? "" : "") : canonicalDeck ?? "";
     const cliVersion = source?.cli.version ?? (input.mode === "restore" ? input.publication!.cliVersion : command("openspec", ["--version"], candidate).trim());
     const result = { operationId: input.operationId, baseCommitSha: input.commitSha, commitSha: journal.commitSha!, inputCommitSha: journal.inputCommitSha!,

@@ -4,6 +4,8 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { inspectOpenSpecTree } from "../services/workspace-openspec-tree.js";
+import { runLocalWorkspaceSourceEdit } from "../services/workspace-source-edit.js";
 import { runLocalRevisionInspection, sameWorkspaceRepository, workspaceRevisionRequestSchema } from "../services/workspace-revision-inspection.js";
 
 const originalPath = process.env.PATH ?? "";
@@ -12,7 +14,7 @@ let cliAvailable = true;
 try { execFileSync("openspec", ["--version"], { stdio: "ignore" }); } catch { cliAvailable = false; }
 const suite = cliAvailable ? describe : describe.skip;
 if (!cliAvailable) console.warn("Workspace CLI inspection tests need the installed OpenSpec CLI");
-const hash = (text: string) => createHash("sha256").update(text).digest("hex");
+const hash = (text: string | Buffer) => createHash("sha256").update(text).digest("hex");
 describe("bounded workspace inspection input", () => {
   it("accepts equivalent browser metadata for the canonical repository identity", () => {
     const repository = "git@github.com:fixture/spec.git";
@@ -37,7 +39,7 @@ suite("committed Git and native OpenSpec inspection", () => {
   let model: { templateVersion: string; changeId: string; metadata: { branch: string; sha: string; shaDirty: boolean };
     sources: Array<{ path: string; text: string; sha256: string }> };
   const git = (...args: string[]) => execFileSync(gitBinary, args, { cwd: repo, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
-  const write = async (file: string, text: string) => { await fs.mkdir(path.dirname(path.join(repo, file)), { recursive: true }); await fs.writeFile(path.join(repo, file), text); };
+  const write = async (file: string, text: string | Buffer) => { await fs.mkdir(path.dirname(path.join(repo, file)), { recursive: true }); await fs.writeFile(path.join(repo, file), text); };
   const deck = () => '<!doctype html><script id="review-data" type="application/json">' + JSON.stringify(model) + "</script>";
   const commit = () => { git("add", "."); git("commit", "-qm", "Fixture revision"); return git("rev-parse", "HEAD"); };
   const input = () => ({ caseId: randomUUID(), expectedVersion: 1, expectedTurn: 0, commitSha: git("rev-parse", "HEAD"),
@@ -53,6 +55,8 @@ suite("committed Git and native OpenSpec inspection", () => {
     // and strict OpenSpec validation run against real files and installed tools.
     await fs.writeFile(path.join(bin, "git"), "#!/usr/bin/env node\n" +
       "const cp=require('node:child_process');const args=process.argv.slice(2);" +
+      "if(process.env.INSPECTION_TEST_BARE&&(args.includes('ls-remote')||args.includes('push'))){" +
+      "args[args.indexOf(" + JSON.stringify(remote) + ")]=process.env.INSPECTION_TEST_BARE;const r=cp.spawnSync(" + JSON.stringify(gitBinary) + ",args,{stdio:'inherit'});process.exit(r.status??1);}" +
       "if(args.includes('ls-remote')){" +
       "if(!args.includes(process.env.INSPECTION_TEST_REMOTE_URL||" + JSON.stringify(remote) + "))process.exit(12);" +
       "const sha=process.env.INSPECTION_TEST_REMOTE_SHA||cp.execFileSync(" + JSON.stringify(gitBinary) + ",[\"rev-parse\",\"HEAD\"],{encoding:'utf8'}).trim();" +
@@ -85,6 +89,118 @@ suite("committed Git and native OpenSpec inspection", () => {
   });
   afterEach(() => { vi.unstubAllEnvs(); });
   afterAll(async () => { if (root) await fs.rm(root, { recursive: true, force: true }); });
+
+
+  const png = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aX1sAAAAASUVORK5CYII=", "base64");
+  const imagePath = "images/pixel.png";
+  const imageReceipt = (file: string, bytes: Buffer, mediaType = "image/png") =>
+    ({ path: file, sha256: hash(bytes), binary: true, bytes: bytes.length, mediaType });
+  const v3Deck = async (images: Array<{ path: string; bytes: Buffer }> = [], display = "", extraSources: typeof model.sources = []) => {
+    const changed = { ...structuredClone(model), templateVersion: "review-deck/v3",
+      metadata: { ...model.metadata, sha: git("rev-parse", "HEAD") === baseline ? model.metadata.sha : git("rev-parse", "HEAD") },
+      sources: [...model.sources, ...extraSources, ...images.map((image) => imageReceipt(image.path, image.bytes))] };
+    await write(changeRoot + "/review-deck.html", '<script id="review-data" type="application/json">' + JSON.stringify(changed) + "</script>" + display);
+    commit();
+  };
+  const snapshot = () => inspectOpenSpecTree(input(), repo);
+
+  it("returns digest-only binary receipts and tracks image addition and deletion", async () => {
+    await v3Deck(); const before = snapshot();
+    expect(png.length).toBe(68);
+    await write(changeRoot + "/" + imagePath, png); const addition = commit();
+    await v3Deck([{ path: imagePath, bytes: png }]);
+    const added = snapshot();
+    expect(added.files.find((file) => file.path === changeRoot + "/" + imagePath))
+      .toEqual(imageReceipt(changeRoot + "/" + imagePath, png));
+    expect(added.sourceDigest).not.toBe(before.sourceDigest);
+    expect(added.inputCommitSha).toBe(addition); expect(added.inputCommitSha).not.toBe(before.inputCommitSha);
+    expect(added.cli.readiness?.deck).toBe("verified");
+    expect(added.cli.artifacts?.filter((artifact) => artifact.id !== "review-deck"))
+      .toEqual(before.cli.artifacts?.filter((artifact) => artifact.id !== "review-deck"));
+    await fs.unlink(path.join(repo, changeRoot, imagePath)); const deletion = commit();
+    await v3Deck(); const removed = snapshot();
+    expect(removed.sourceDigest).toBe(before.sourceDigest); expect(removed.inputCommitSha).toBe(deletion);
+    expect(removed.cli.readiness?.deck).toBe("verified");
+  }, 60_000);
+  it.each([Buffer.from([0xff, 0xd8, 0xff]), Buffer.from("not a PNG")])("rejects invalid PNG magic %j", async (bytes) => {
+    await write(changeRoot + "/" + imagePath, bytes); commit(); await v3Deck([{ path: imagePath, bytes }]);
+    expect(await inspect()).toMatchObject({ ok: false, code: "source_image_invalid" });
+  });
+  it.each([
+    ["photo.jpg", Buffer.from([0xff, 0xd8, 0xff]), "image/jpeg"],
+    ["photo.jpeg", Buffer.from([0xff, 0xd8, 0xff]), "image/jpeg"],
+    ["old.gif", Buffer.from("GIF87a"), "image/gif"],
+    ["new.gif", Buffer.from("GIF89a"), "image/gif"],
+    ["photo.webp", Buffer.from("RIFF\0\0\0\0WEBP"), "image/webp"],
+  ] as const)("sniffs %s from committed bytes", async (name, bytes, mediaType) => {
+    const file = "images/" + name; await write(changeRoot + "/" + file, bytes); commit(); await v3Deck();
+    const result = await inspect(); expect(result.ok).toBe(true);
+    expect(result.result.files.find((entry: { path: string }) => entry.path === changeRoot + "/" + file))
+      .toEqual(imageReceipt(changeRoot + "/" + file, bytes, mediaType));
+  });
+  it.each(["per-image", "aggregate"])("enforces the %s image budget with its own refusal", async (budget) => {
+    const bytes = Buffer.alloc((budget === "per-image" ? 513 : 512) * 1024); png.copy(bytes);
+    const count = budget === "per-image" ? 1 : 7;
+    for (let i = 0; i < count; i++) await write(changeRoot + "/images/image" + i + ".png", bytes);
+    commit(); await v3Deck();
+    expect(await inspect()).toMatchObject({ ok: false, code: "source_image_budget" });
+  });
+  it("preserves v2 admission and requires images only for v3", async () => {
+    const before = snapshot(); await write(changeRoot + "/" + imagePath, png); commit();
+    const legacy = snapshot();
+    expect(legacy.cli.readiness?.deck).toBe("verified"); expect(legacy.files).toEqual(before.files);
+    expect(legacy.sourceDigest).toBe(before.sourceDigest); expect(legacy.inputCommitSha).toBe(before.inputCommitSha);
+    await v3Deck();
+    expect(await inspect()).toMatchObject({ ok: true, result: { cli: { readiness: { deck: "invalid", reasons: ["review_source_omitted"] } } } });
+  }, 60_000);
+  it.each(["sha256", "bytes", "mediaType", "text"])("rejects a forged binary source %s", async (field) => {
+    await write(changeRoot + "/" + imagePath, png); commit(); await v3Deck([{ path: imagePath, bytes: png }]);
+    const html = await fs.readFile(path.join(repo, changeRoot, "review-deck.html"), "utf8");
+    const data = JSON.parse(html.match(/<script[^>]*>([\s\S]*?)<\/script>/)![1]!);
+    const source = data.sources.at(-1);
+    if (field === "sha256") source.sha256 = "0".repeat(64);
+    else if (field === "bytes") source.bytes++;
+    else if (field === "mediaType") source.mediaType = "image/jpeg";
+    else source.text = "unexpected payload";
+    await write(changeRoot + "/review-deck.html", '<script id="review-data" type="application/json">' + JSON.stringify(data) + "</script>"); commit();
+    expect(await inspect()).toMatchObject({ ok: true, result: { cli: { readiness: { deck: "invalid", reasons: ["source_bytes_mismatch"] } } } });
+  });
+  it("transports the full image budget with a base64-bearing v3 deck and raw headroom", async () => {
+    const images = Array.from({ length: 6 }, (_, i) => ({ path: "images/image" + i + ".png", bytes: Buffer.alloc(512 * 1024, i) }));
+    for (const image of images) { png.copy(image.bytes); await write(changeRoot + "/" + image.path, image.bytes); }
+    const text = "Source context.\n" + "x".repeat(700 * 1024);
+    await write(changeRoot + "/research.md", text); commit();
+    await v3Deck(images, images.map((image) => '<img src="data:image/png;base64,' + image.bytes.toString("base64") + '">').join("") + " ".repeat(300 * 1024),
+      [{ path: "research.md", text, sha256: hash(text) }]);
+    const response = await inspect();
+    expect(response).toMatchObject({ ok: true, result: { cli: { readiness: { deck: "verified" } } } });
+    const receipts = response.result.files.filter((file: { binary?: boolean }) => file.binary);
+    expect(receipts).toHaveLength(6); expect(receipts.every((file: object) => !("text" in file) && !("base64" in file))).toBe(true);
+    expect(Buffer.byteLength(JSON.stringify(response.result))).toBeLessThan(8 * 1024 * 1024);
+  }, 60_000);
+  it("applies Markdown edits without dropping committed images and refuses image writes", async () => {
+    // A custom schema avoids invoking the separately pinned factory renderer.
+    const schemaRoot = "openspec/schemas/image-fixture";
+    await fs.cp(path.join(repo, "openspec/schemas/factory-pipeline-v2"), path.join(repo, schemaRoot), { recursive: true });
+    const schema = (await fs.readFile(path.join(repo, schemaRoot, "schema.yaml"), "utf8")).replace("name: factory-pipeline-v2", "name: image-fixture");
+    await write(schemaRoot + "/schema.yaml", schema);
+    await write(changeRoot + "/.openspec.yaml", "schema: image-fixture\ncreated: 2026-09-28\n");
+    await write(changeRoot + "/" + imagePath, png); commit(); await v3Deck([{ path: imagePath, bytes: png }]);
+    const bare = path.join(root, "image-remote.git"); git("init", "--bare", "-q", bare); git("push", bare, "HEAD:refs/heads/" + branch);
+    vi.stubEnv("INSPECTION_TEST_BARE", bare);
+    const proposal = model.sources.find((source) => source.path === "proposal.md")!;
+    const request = { ...input(), mode: "apply" as const, operationId: randomUUID(), actorUserId: "fixture-user", reason: "Clarify proposal",
+      files: [{ path: "proposal.md", baseSha256: proposal.sha256, text: proposal.text + "\nClarification.\n" }] };
+    const response = JSON.parse((await runLocalWorkspaceSourceEdit(repo, request)).stdout);
+    expect(response, JSON.stringify(response)).toMatchObject({ ok: true, result: { published: true } });
+    expect(response.result.source.files.find((file: { path: string }) => file.path === changeRoot + "/" + imagePath))
+      .toEqual(imageReceipt(changeRoot + "/" + imagePath, png));
+    expect(execFileSync(gitBinary, ["show", response.result.commitSha + ":" + changeRoot + "/" + imagePath], { cwd: repo })).toEqual(png);
+    expect(await fs.readFile(path.join(repo, changeRoot, imagePath))).toEqual(png); expect(git("status", "--porcelain")).toBe("");
+    const rejected = JSON.parse((await runLocalWorkspaceSourceEdit(repo, { ...request, ...input(), operationId: randomUUID(),
+      files: [{ path: imagePath, baseSha256: hash(png), text: "replacement" }] })).stdout);
+    expect(rejected).toMatchObject({ ok: false, code: "edit_path_not_markdown" });
+  }, 60_000);
 
   it.each(["https://github.com/fixture/spec.git", "https://github.com/fixture/spec"])("uses the existing HTTPS origin %s", async (url) => {
     git("remote", "set-url", "origin", url); vi.stubEnv("INSPECTION_TEST_REMOTE_URL", url);
