@@ -80,6 +80,7 @@ import {
   type DeferredOrphanCleanupRecord,
   type SandboxOrphanCleanupSpool,
 } from "./sandbox-orphan-cleanup-spool.js";
+import { unpersistedReleaseDrainOrphans } from "./release-drain-runtime.js";
 import { logger } from "../middleware/logger.js";
 
 // The constant error kind for the durable orphan-cleanup-write-failed log. The
@@ -1285,6 +1286,7 @@ function createSandboxEnvironmentDriver(
         // leaves the spooled copy for a later flush, which re-inserts a duplicate
         // the idempotent teardown handles. This order never loses the orphan.
         await orphanCleanupSpool.remove(record);
+        unpersistedReleaseDrainOrphans.delete(record);
         recovered += 1;
       } catch {
         // The database is still down. Re-queue the record for a later flush,
@@ -1420,6 +1422,7 @@ function createSandboxEnvironmentDriver(
     cause: unknown,
     cleanupWriteError: unknown,
   ): Promise<never> => {
+    unpersistedReleaseDrainOrphans.add(record);
     const persisted = await orphanCleanupSpool.append(record);
     const buffered = enqueueDeferredOrphanCleanup(record);
     logger.error(

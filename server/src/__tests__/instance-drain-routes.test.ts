@@ -1,14 +1,19 @@
 import express from "express";
+import { createHash } from "node:crypto";
 import request from "supertest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const mockInstanceSettingsService = vi.hoisted(() => ({
   getOperatorDrain: vi.fn(),
   setOperatorDrain: vi.fn(),
+  acquireReleaseDrain: vi.fn(),
+  observeOperatorDrain: vi.fn(),
+  clearReleaseDrain: vi.fn(),
   listCompanyIds: vi.fn(),
 }));
 const mockHeartbeatService = vi.hoisted(() => ({
   getOperatorDrainSnapshot: vi.fn(),
+  verifyReleaseDrain: vi.fn(),
   drainRunningRunsForShutdown: vi.fn(),
 }));
 const mockLogActivity = vi.hoisted(() => vi.fn());
@@ -54,6 +59,7 @@ const nonAdminBoardActor = {
 
 describe("instance operator drain routes", () => {
   beforeEach(() => {
+    vi.unstubAllEnvs();
     vi.resetModules();
     vi.doUnmock("../services/index.js");
     vi.doUnmock("../routes/instance-settings.js");
@@ -157,6 +163,56 @@ describe("instance operator drain routes", () => {
     await request(app).post("/api/instance/drain/interrupt").expect(403);
 
     expect(mockInstanceSettingsService.setOperatorDrain).not.toHaveBeenCalled();
+    expect(mockHeartbeatService.drainRunningRunsForShutdown).not.toHaveBeenCalled();
+  });
+});
+
+
+describe("external release drain authorization", () => {
+  const token = "fixture-release-credential";
+  const input = { ownerId: "release-service", generation: 12 };
+  beforeEach(() => {
+    vi.stubEnv("BACKLIT_RELEASE_DRAIN_OWNER_ID", input.ownerId);
+    vi.stubEnv("BACKLIT_RELEASE_DRAIN_TOKEN_SHA256", createHash("sha256").update(token).digest("hex"));
+    registerModuleMocks();
+    vi.clearAllMocks();
+    mockInstanceSettingsService.listCompanyIds.mockResolvedValue(["company-1"]);
+    mockInstanceSettingsService.acquireReleaseDrain.mockResolvedValue({ ...input, active: true, generation: 13 });
+  });
+
+  it("denies board and agent authority for every release verb", async () => {
+    for (const actor of [adminActor, nonAdminBoardActor, { type: "agent", agentId: "agent-1", companyId: "company-1" }]) {
+      const app = await createApp(actor);
+      for (const verb of ["acquire", "verify", "clear", "interrupt"]) {
+        await request(app).post(`/api/instance/drain/${verb}`).send(input).expect(401);
+      }
+      await request(app).get("/api/instance/drain/release").expect(401);
+    }
+    expect(mockInstanceSettingsService.acquireReleaseDrain).not.toHaveBeenCalled();
+    expect(mockInstanceSettingsService.clearReleaseDrain).not.toHaveBeenCalled();
+  });
+
+  it("accepts only the configured external identity and binds the owner", async () => {
+    const app = await createApp({ type: "none", source: "none" });
+    await request(app).post("/api/instance/drain/acquire").set("Authorization", "Release wrong").send(input).expect(401);
+    await request(app).post("/api/instance/drain/acquire").set("Authorization", `Release ${token}`).send({ ...input, ownerId: "other" }).expect(403);
+    const response = await request(app).post("/api/instance/drain/acquire").set("Authorization", `Release ${token}`).send(input).expect(200);
+    expect(response.body.generation).toBe(13);
+    expect(mockInstanceSettingsService.acquireReleaseDrain).toHaveBeenCalledWith(input);
+  });
+
+  it("does not clear when the real host receipt is not quiescent", async () => {
+    const app = await createApp({ type: "none", source: "none" });
+    mockHeartbeatService.verifyReleaseDrain.mockResolvedValue({ quiescent: false, localProcessRunIds: ["hidden-run"] });
+    await request(app).post("/api/instance/drain/clear").set("Authorization", `Release ${token}`).send(input).expect(409);
+    expect(mockInstanceSettingsService.clearReleaseDrain).not.toHaveBeenCalled();
+  });
+
+  it("rejects unbounded or malformed release interruption requests", async () => {
+    const app = await createApp({ type: "none", source: "none" });
+    for (const patch of [{}, { runIds: [] }, { runIds: ["not-a-run"] }, { runIds: ["00000000-0000-4000-8000-000000000000"], graceMs: 30001 }]) {
+      await request(app).post("/api/instance/drain/interrupt").set("Authorization", `Release ${token}`).send({ ...input, ...patch }).expect(400);
+    }
     expect(mockHeartbeatService.drainRunningRunsForShutdown).not.toHaveBeenCalled();
   });
 });

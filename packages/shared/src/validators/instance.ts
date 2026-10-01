@@ -92,6 +92,13 @@ export const instanceExperimentalSettingsSchema = z.object({
     .default(DEFAULT_PRODUCTIVITY_REVIEW_MAX_CREATIONS_PER_OWNER_PER_SWEEP),
   operatorDrainActive: z.boolean().default(false),
   operatorDrainStartedAt: z.string().datetime().nullable().default(null),
+  operatorDrainControl: z.object({
+    generation: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),
+    ownerId: z.string().min(1).max(200).nullable(),
+    hosts: z.record(z.string(), z.object({
+      quiescent: z.boolean(),
+    }).strict()),
+  }).strict().optional(),
   issueGraphLivenessAutoRecoveryLookbackHours: z
     .number()
     .int()
@@ -109,6 +116,7 @@ export const patchInstanceExperimentalSettingsSchema = z
           worktreeRunExecutionActivationInstanceId: true,
           operatorDrainActive: true,
           operatorDrainStartedAt: true,
+          operatorDrainControl: true,
         })
         .shape,
     ),
@@ -154,6 +162,7 @@ export type PatchInstanceExperimentalSettings = Partial<
     // Server-managed operator drain state; the drain routes are the only writers.
     | "operatorDrainActive"
     | "operatorDrainStartedAt"
+    | "operatorDrainControl"
   >
 >;
 export type PatchInstanceSettings = z.infer<typeof patchInstanceSettingsSchema>;

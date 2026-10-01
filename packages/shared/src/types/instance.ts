@@ -167,6 +167,12 @@ export interface InstanceExperimentalSettings {
    * deploy is visible and ageable. Null when not draining.
    */
   operatorDrainStartedAt: string | null;
+  /** Server-managed CAS generation and durable host quiescence acknowledgements. */
+  operatorDrainControl?: {
+    generation: number;
+    ownerId: string | null;
+    hosts: Record<string, { quiescent: boolean }>;
+  };
   issueGraphLivenessAutoRecoveryLookbackHours: number;
 }
 
