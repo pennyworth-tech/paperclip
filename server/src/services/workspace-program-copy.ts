@@ -55,18 +55,17 @@ export async function withWorkspaceProgramCopy<T>(cwd: string, input: unknown, d
     }
   };
   await unchanged();
-  const changeRoot = "openspec/changes/" + request.changeId, schemaRoot = "openspec/schemas/factory-pipeline-v2";
-  const sourceCommit = (await git(["log", "-1", "--format=%H", request.commitSha, "--", "openspec/config.yaml", changeRoot + "/.openspec.yaml",
-    ...["research", "proposal", "design", "tasks"].map((artifact) => changeRoot + "/" + artifact + ".md"),
-    ":(glob)" + changeRoot + "/specs/**/*.md", schemaRoot + "/schema.yaml", schemaRoot + "/tools/render_review.py", ":(glob)" + schemaRoot + "/templates/*"])).trim();
+  const changeRoot = "openspec/changes/" + request.changeId;
+  const sourceCommit = (await git(["log", "-1", "--format=%H", request.commitSha, "--",
+    "openspec/config.yaml", changeRoot, "openspec/schemas"])).trim();
   if (!/^[a-f0-9]{40}$/.test(sourceCommit)) throw conflict("The source history is missing", { code: "source_history_missing" });
   // Preserve all intervening commits and one parent beyond the last source
   // change. A depth-one copy treats the deck commit as a root and breaks the
   // inspector's path-history proof (including deletion-only source changes).
-  // A custom schema can declare outputs outside the factory artifact names.
+  // A custom schema can declare outputs outside the standard artifact names.
   // Retaining the change's creation boundary also preserves their path history,
-  // even when unrelated factory-schema edits are newer than this change.
-  const creation = (await git(["log", "--reverse", "--format=%H", request.commitSha, "--", changeRoot + "/.openspec.yaml"])).trim().split("\n")[0];
+  // even when unrelated schema edits are newer than this change.
+  const creation = (await git(["log", "--reverse", "--format=%H", request.commitSha, "--", changeRoot])).trim().split("\n")[0];
   const boundaries = [...new Set([sourceCommit, creation].filter((value): value is string => Boolean(value)))];
   const depths = await Promise.all(boundaries.map(async (sha) => Number((await git(["rev-list", "--count", request.commitSha, "^" + sha])).trim()) + 2));
   const historyDepth = Math.max(...depths);
@@ -99,7 +98,7 @@ export async function stageWorkspaceProgramCopy(input: {
   return withWorkspaceProgramCopy(input.cwd, input.request, input.deadline, async (snapshot, historyDepth) => {
     const remaining = input.deadline - Date.now();
     if (remaining < 1000) throw conflict("Workspace staging deadline expired", { code: "workspace_environment_unavailable" });
-    const staged = await prepareCommandManagedRuntime({ runner: input.runner, adapterKey: "openspec-studio", workspaceLocalDir: snapshot,
+    const staged = await prepareCommandManagedRuntime({ runner: input.runner, adapterKey: "workspace-openspec", workspaceLocalDir: snapshot,
       workspaceRemoteDir: input.remoteDirectory, syncWorkspace: true, gitHistoryDepth: historyDepth,
       spec: { remoteCwd: input.remoteDirectory, leaseId: input.leaseId, providerKey: input.provider, shellCommand: "sh", timeoutMs: remaining } });
     if (staged.workspaceRemoteDir !== input.remoteDirectory) throw conflict("Workspace staging changed its directory", { code: "workspace_mismatch" });

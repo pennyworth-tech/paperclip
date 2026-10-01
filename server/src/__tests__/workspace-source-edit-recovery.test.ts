@@ -110,7 +110,7 @@ describe("durable source edit publication", () => {
   it("cannot promote a saved draft through a changed copy publication receipt", async () => {
     const f = fixture(), restore = vi.fn(async (_request: SourceEditProgramInput, _cwd: string) => f.applied);
     f.recovery.inspection = { files: [{ path: "openspec/changes/fixture-change/proposal.md", sha256: "e".repeat(64) }], cli: {
-      version: "1.2.0", status: { schemaName: "factory-pipeline-v2", isComplete: false },
+      version: "1.2.0", status: { schemaName: "example-review", isComplete: false },
       validation: { items: [{ id: f.input.changeId, valid: false }] },
       readiness: { state: "draft", reasons: ["artifacts_incomplete"], deck: "missing" },
     } };

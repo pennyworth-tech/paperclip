@@ -24,7 +24,7 @@ export const workspaceEditAbortSchema = workspaceRevisionRequestSchema.extend(ed
  * until publication or proven abandonment completes. */
 export function runLocalWorkspaceSourceEdit(cwd: string, input: PluginWorkspaceEditRequest | (PluginWorkspaceEditAbortRequest & { mode: "abort" })) {
   return new Promise<{ stdout: string; exitCode: number | null }>((resolve, reject) => {
-    const child = execFile(process.execPath, ["-e", workspaceSourceEditProgram],
+    const child = execFile(process.execPath, ["-e", workspaceSourceEditProgram()],
       { cwd, timeout: 180_000, maxBuffer: 8 * 1024 * 1024, encoding: "utf8" }, (error, stdout) => {
         if (!stdout) { reject(unprocessable("Source editing did not return a receipt; resume the same operation", { code: "source_edit_unavailable" })); return; }
         resolve({ stdout, exitCode: error ? typeof error.code === "number" ? error.code : null : 0 });

@@ -96,6 +96,38 @@ preview, preparation, and restoration do not resolve or receive it.
 Repository-owned credential helpers, HTTP overrides, executable Git
 filters, and remote rewrites are rejected before worktree or remote checks.
 
+### Operator OpenSpec renderer policy
+
+The host supports committed OpenSpec schemas without approving repository code
+for execution. To enable a reviewed review-deck renderer, set
+`PAPERCLIP_OPENSPEC_POLICY_FILE` in the **server's** environment to an absolute
+path to an operator-owned JSON file outside agent-writable workspaces:
+
+```json
+{
+  "format": 1,
+  "schemas": [
+    { "schemaName": "example-review", "requireReviewDeck": true, "rendererSha256": "<64 lowercase hex characters>" }
+  ]
+}
+```
+
+Calculate the digest from the reviewed `tools/render_review.py` under that
+schema. Only those exact committed bytes can execute, through fixed
+`python3 -I` arguments. No command or alternate executable path is accepted.
+Omit `rendererSha256` to require a deck without enabling automatic rendering.
+No configured file means no renderer execution approval; an unreadable or
+invalid configured file fails closed. Keep this file read-only for the server
+and agents; changing it is an operator deployment action.
+
+The host validates and serializes the policy before dispatching a workspace
+program. A plugin request, repository file or remote environment cannot select
+another policy. Required decks remain required if a repository removes that
+artifact from its schema. The resulting requirement and CLI verdict are stored
+in the commit-bound inspection, so durable recovery preserves the original
+outcome without running authoring tools again. An existing recovery does not
+become a fresh validation under a later operator policy.
+
 ### Mobile-friendly preview (`pnpm dev:mobile`)
 
 The vite dev server serves an unbundled module graph. This is fast to reload on a local machine but too heavy for phones and tablets on slow links (airplane wifi, mobile data, distant tailnet peers). `pnpm dev:mobile` builds the UI once and serves the small production bundle on port `3101` via `vite preview`, proxying `/api` requests to the dev API on `3100`.

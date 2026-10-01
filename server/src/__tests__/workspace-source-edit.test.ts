@@ -44,7 +44,7 @@ describe("source edit request boundary", () => {
 suite("confined source editing with real Git and OpenSpec validation", { timeout: 60_000 }, () => {
   let root: string, repo: string, bare: string, bin: string, baseline: string;
   const change = "fixture-change", branch = "openspec/fixture-change", remote = "git@github.com:fixture/spec.git";
-  const changeRoot = "openspec/changes/" + change, schemaRoot = "openspec/schemas/factory-pipeline-v2";
+  const changeRoot = "openspec/changes/" + change, schemaRoot = "openspec/schemas/example-review";
   const proposal = "# Fixture source editor\n\n**Spec version:** 1\n\n## Why\nTest edits with an actual CLI.\n\n## What Changes\n- Add operator review.\n\n## Capabilities\n### New Capabilities\n- `review`: source editing.\n### Modified Capabilities\nNone.\n\n## Impact\nThe review interface.\n";
   const git = (...args: string[]) => execFileSync(gitBinary, args, { cwd: repo, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
   const remoteHead = () => git("--git-dir=" + bare, "rev-parse", "refs/heads/" + branch);
@@ -55,8 +55,8 @@ suite("confined source editing with real Git and OpenSpec validation", { timeout
     repositorySsh: remote, branch, changeId: change, operationId: randomUUID(), mode: "preview", actorUserId: "fixture-user",
     reason: "Clarify the proposal", files: [{ path: "proposal.md", baseSha256: hash(proposal), text: proposal + "\nProposed clarification.\n" }], ...patch,
   });
-  const execute = (request: SourceEditProgramInput, cwd = repo) => new Promise<any>((resolve, reject) => {
-    const child = execFile(process.execPath, ["-e", workspaceSourceEditProgram], { cwd, encoding: "utf8", maxBuffer: 8_000_000, timeout: 60_000 }, (_error, stdout, stderr) => {
+  const execute = (request: SourceEditProgramInput, cwd = repo, program = workspaceSourceEditProgram()) => new Promise<any>((resolve, reject) => {
+    const child = execFile(process.execPath, ["-e", program], { cwd, encoding: "utf8", maxBuffer: 8_000_000, timeout: 60_000 }, (_error, stdout, stderr) => {
       try { resolve(JSON.parse(stdout)); } catch { reject(new Error(stderr || stdout || "No source edit receipt")); }
     });
     child.stdin?.on("error", () => {}); child.stdin?.end(JSON.stringify(request));
@@ -85,14 +85,14 @@ suite("confined source editing with real Git and OpenSpec validation", { timeout
           const preflight = await runner.execute({ command: process.execPath, args: ["-e", workspaceSourceEditOriginProgram], cwd, stdin: JSON.stringify(request) });
           expect(JSON.parse(preflight.stdout)).toEqual({ ok: true, remoteUrl: publicationEnv.PAPERCLIP_WORKSPACE_EDIT_ORIGIN });
         }
-        return runner.execute({ command: process.execPath, args: ["-e", workspaceSourceEditProgram], cwd, stdin: JSON.stringify(request),
+        return runner.execute({ command: process.execPath, args: ["-e", workspaceSourceEditProgram()], cwd, stdin: JSON.stringify(request),
           env: request.mode === "apply" ? publicationEnv : undefined });
       },
     }));
     const restore = vi.fn(async (request: SourceEditProgramInput, cwd: string) => {
       expect(checkpoint.copyPublication?.commitSha).toBe(checkpoint.recovery!.commitSha);
       expect(cwd).toBe(repo);
-      return runner.execute({ command: process.execPath, args: ["-e", workspaceSourceEditProgram], cwd, stdin: JSON.stringify(request),
+      return runner.execute({ command: process.execPath, args: ["-e", workspaceSourceEditProgram()], cwd, stdin: JSON.stringify(request),
         env: { SOURCE_TEST_NO_NETWORK: "1", SOURCE_TEST_NO_SOURCE_TOOLS: "1" } });
     });
     return { execute, restore, save: async (value: SourceEditCheckpoint) => { checkpoint = structuredClone(value); }, checkpoint: () => structuredClone(checkpoint) };
@@ -136,14 +136,14 @@ suite("confined source editing with real Git and OpenSpec validation", { timeout
     }
     const artifacts = [["research", "research.md"], ["elaboration-proposal", "proposal.md"], ["elaboration-specs", "specs/**/*.md"],
       ["elaboration-design", "design.md"], ["elaboration-tasks", "tasks.md"], ["elaboration-review-deck", "review-deck.html"]];
-    const schema = "name: factory-pipeline-v2\nversion: 1\ndescription: Source editing fixture\nartifacts:\n" + artifacts.map(([id, generates], index) =>
+    const schema = "name: example-review\nversion: 1\ndescription: Source editing fixture\nartifacts:\n" + artifacts.map(([id, generates], index) =>
       "  - id: " + id + "\n    generates: " + generates + "\n    description: Fixture\n    template: " + id + ".md\n    instruction: Author the fixture\n    requires: [" + artifacts.slice(0, index).map(([name]) => name).join(", ") + "]\n").join("") +
       "apply:\n  requires: [elaboration-review-deck]\n  tracks: tasks.md\n  instruction: Implement the approved fixture\n";
     await write(schemaRoot + "/schema.yaml", schema);
     for (const [id] of artifacts) await write(schemaRoot + "/templates/" + id + ".md", "Fixture template\n");
     await write(schemaRoot + "/templates/review-deck.html", '<!doctype html><html><body><script id="review-data" type="application/json">{}</script></body></html>');
     await write(schemaRoot + "/tools/render_review.py", await fs.readFile(new URL("./fixtures/openspec-source-edit/render_review.py", import.meta.url), "utf8"));
-    await write(changeRoot + "/.openspec.yaml", "schema: factory-pipeline-v2\ncreated: 2026-09-28\n");
+    await write(changeRoot + "/.openspec.yaml", "schema: example-review\ncreated: 2026-09-28\n");
     await write(changeRoot + "/research.md", "# Research\nUse a single preparation task.\n");
     await write(changeRoot + "/proposal.md", proposal);
     await write(changeRoot + "/specs/review/spec.md", "## ADDED Requirements\n\n### Requirement: Operator approval\nThe system SHALL require operator approval.\n\n**Short title:** Require operator approval\n\n#### Scenario: Approval\n- **WHEN** the operator approves\n- **THEN** the proposal becomes approved\n");
@@ -158,17 +158,36 @@ suite("confined source editing with real Git and OpenSpec validation", { timeout
     git("reset", "--hard", baseline); git("clean", "-fd"); git("--git-dir=" + bare, "update-ref", "refs/heads/" + branch, baseline);
     await fs.rm(path.join(repo, ".git/paperclip-source-edits"), { recursive: true, force: true });
     vi.stubEnv("PATH", bin + path.delimiter + originalPath);
+    const policyFile = path.join(root, "host-openspec-policy.json");
+    await fs.writeFile(policyFile, JSON.stringify({ format: 1, schemas: [{ schemaName: "example-review", requireReviewDeck: true,
+      rendererSha256: hash(await fs.readFile(new URL("./fixtures/openspec-source-edit/render_review.py", import.meta.url), "utf8")) }] }));
+    vi.stubEnv("PAPERCLIP_OPENSPEC_POLICY_FILE", policyFile);
   });
   afterEach(() => { vi.unstubAllEnvs(); });
   afterAll(async () => { if (root) await fs.rm(root, { recursive: true, force: true }); });
 
+  it("does not run repository renderer bytes without operator approval", async () => {
+    vi.stubEnv("PAPERCLIP_OPENSPEC_POLICY_FILE", undefined);
+    const marker = path.join(root, "unapproved-renderer-executed");
+    await write(schemaRoot + "/tools/render_review.py", "from pathlib import Path\nPath(" + JSON.stringify(marker) + ").write_text('unsafe')\n");
+    const sha = commit();
+    const response = await execute(input({ commitSha: sha }));
+    expect(response).toMatchObject({ ok: true, result: { source: { cli: { readiness: { state: "draft", deck: "invalid" } } } } });
+    await expect(fs.access(marker)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+  it("uses policy captured by the host even when the execution environment replaces its path", async () => {
+    const program = workspaceSourceEditProgram();
+    vi.stubEnv("PAPERCLIP_OPENSPEC_POLICY_FILE", "/untrusted/remote/policy.json");
+    const response = await execute(input(), repo, program);
+    expect(response).toMatchObject({ ok: true, result: { source: { cli: { rendering: { passed: true }, readiness: { state: "ready" } } } } });
+  });
   it.each([remote, "https://github.com/fixture/spec.git", "https://github.com/fixture/spec"])("inspects a staged copy while preserving origin %s", async (url) => {
     git("remote", "set-url", "origin", url); vi.stubEnv("SOURCE_TEST_INSPECTION_ORIGIN", url);
     const result = await stageWorkspaceProgramCopy({ cwd: repo, request: input(),
       remoteDirectory: path.join(root, "inspect-copy-" + randomUUID()), leaseId: randomUUID(), provider: "test-command-runner",
       deadline: Date.now() + 60_000, runner, ready: async (cwd) => {
         expect(execFileSync(gitBinary, ["config", "--get", "remote.origin.url"], { cwd, encoding: "utf8" }).trim()).toBe(url);
-      }, execute: async (cwd) => runner.execute({ command: process.execPath, args: ["-e", workspaceRevisionInspectionProgram], cwd, stdin: JSON.stringify(input()) }),
+      }, execute: async (cwd) => runner.execute({ command: process.execPath, args: ["-e", workspaceRevisionInspectionProgram()], cwd, stdin: JSON.stringify(input()) }),
     });
     expect(JSON.parse(result.stdout)).toMatchObject({ ok: true, result: { commitSha: baseline, remoteCommitSha: baseline } });
     expect(git("config", "--get", "remote.origin.url")).toBe(url); expect(git("rev-parse", "HEAD")).toBe(baseline);
@@ -373,13 +392,13 @@ suite("confined source editing with real Git and OpenSpec validation", { timeout
     const execution = await stageWorkspaceProgramCopy({ cwd: repo, request: revision, remoteDirectory: path.join(root, "inspect-copy-" + randomUUID()),
       leaseId: randomUUID(), provider: "test-command-runner", deadline: Date.now() + 60_000, runner,
       ready: async (cwd) => { expect(execFileSync(gitBinary, ["rev-parse", "--is-shallow-repository"], { cwd, encoding: "utf8" }).trim()).toBe("true"); },
-      execute: async (cwd) => runner.execute({ command: process.execPath, args: ["-e", workspaceRevisionInspectionProgram], cwd, stdin: JSON.stringify(revision) }),
+      execute: async (cwd) => runner.execute({ command: process.execPath, args: ["-e", workspaceRevisionInspectionProgram()], cwd, stdin: JSON.stringify(revision) }),
     });
     const response = JSON.parse(execution.stdout);
     expect(response, response.code).toMatchObject({ ok: true, result: { commitSha: baseline, inputCommitSha: git("rev-parse", baseline + "^") } });
     expect(git("rev-parse", "HEAD")).toBe(baseline); expect(git("status", "--porcelain")).toBe("");
   }, 60_000);
-  it("retains standard-schema source ancestry across newer unrelated factory inputs in a copy", async () => {
+  it("retains standard-schema source ancestry across newer unrelated schema inputs in a copy", async () => {
     await write(changeRoot + "/.openspec.yaml", "schema: spec-driven\ncreated: 2026-09-28\n");
     await fs.unlink(path.join(repo, changeRoot, "review-deck.html"));
     const sourceSha = commit();
@@ -388,7 +407,7 @@ suite("confined source editing with real Git and OpenSpec validation", { timeout
     const request = { ...input(), commitSha: head };
     const execution = await stageWorkspaceProgramCopy({ cwd: repo, request, remoteDirectory: path.join(root, "standard-copy-" + randomUUID()),
       leaseId: randomUUID(), provider: "test-command-runner", deadline: Date.now() + 60_000, runner, ready: async () => {},
-      execute: async (cwd) => runner.execute({ command: process.execPath, args: ["-e", workspaceRevisionInspectionProgram], cwd, stdin: JSON.stringify(request) }),
+      execute: async (cwd) => runner.execute({ command: process.execPath, args: ["-e", workspaceRevisionInspectionProgram()], cwd, stdin: JSON.stringify(request) }),
     });
     const response = JSON.parse(execution.stdout);
     expect(response, response.code).toMatchObject({ ok: true, result: { inputCommitSha: sourceSha,

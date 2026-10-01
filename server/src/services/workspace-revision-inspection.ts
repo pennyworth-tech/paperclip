@@ -21,7 +21,7 @@ export const workspaceRevisionRequestSchema = z.object({
 
 /** No shell, arbitrary command, path, environment or executable argument is exposed to plugins. */
 export function runLocalRevisionInspection(cwd: string, input: z.infer<typeof workspaceRevisionRequestSchema>) {
-  return runLocalWorkspaceProgram(cwd, workspaceRevisionInspectionProgram, input);
+  return runLocalWorkspaceProgram(cwd, workspaceRevisionInspectionProgram(), input);
 }
 
 export function workspaceRevisionInspectionService(db: Db, producer: { pluginId: string; pluginKey: string },
@@ -61,7 +61,7 @@ export function workspaceRevisionInspectionService(db: Db, producer: { pluginId:
         }
         return resolved;
       };
-      const execution = await executeWorkspaceRevisionProgram(db, runtime, binding, workspaceRevisionInspectionProgram, input, { env });
+      const execution = await executeWorkspaceRevisionProgram(db, runtime, binding, workspaceRevisionInspectionProgram(), input, { env });
       let response: { ok: boolean; code?: string; result?: Omit<PluginWorkspaceRevisionInspection,
         "workspaceId" | "caseId" | "caseVersion" | "workTurn" | "inspectedAt" | "inspectionDigest"> };
       try { response = JSON.parse(execution.stdout); }

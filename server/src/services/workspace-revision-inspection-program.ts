@@ -1,3 +1,4 @@
+import { readWorkspaceOpenSpecPolicy, type WorkspaceOpenSpecPolicy } from "./workspace-openspec-policy.js";
 import type { PluginWorkspaceRevisionRequest } from "@paperclipai/plugin-sdk";
 import { inspectOpenSpecTree } from "./workspace-openspec-tree.js";
 import { readWorkspaceRevisionOrigin } from "./workspace-revision-origin.js";
@@ -5,7 +6,7 @@ import { sameWorkspaceRepository } from "./workspace-repository.js";
 
 /** Serialized and executed inside the resolved workspace environment, never in the plugin. */
 function inspectCommittedOpenSpec(input: PluginWorkspaceRevisionRequest, inspectTree: typeof inspectOpenSpecTree,
-  readOrigin: typeof readWorkspaceRevisionOrigin, matchesRepository: typeof sameWorkspaceRepository) {
+  readOrigin: typeof readWorkspaceRevisionOrigin, matchesRepository: typeof sameWorkspaceRepository, policy: WorkspaceOpenSpecPolicy) {
   const cp = require("node:child_process") as typeof import("node:child_process");
   const maxBytes = 8 * 1024 * 1024;
   const fail = (code: string): never => { throw new Error(code); };
@@ -23,7 +24,7 @@ function inspectCommittedOpenSpec(input: PluginWorkspaceRevisionRequest, inspect
     if (git(["status", "--porcelain=v1", "-z", "--untracked-files=all"])) fail("workspace_dirty");
     const remoteLine = git(["ls-remote", "--exit-code", remoteUrl, "refs/heads/" + input.branch]).trim().split(/\r?\n/);
     if (remoteLine.length !== 1 || remoteLine[0] !== input.commitSha + "\trefs/heads/" + input.branch) fail("remote_revision_conflict");
-    const snapshot = inspectTree(input, process.cwd());
+    const snapshot = inspectTree(input, process.cwd(), policy);
     if (git(["rev-parse", "HEAD"]).trim() !== input.commitSha || git(["symbolic-ref", "--short", "HEAD"]).trim() !== input.branch
       || git(["status", "--porcelain=v1", "-z", "--untracked-files=all"])) fail("workspace_changed_during_inspection");
     const result = { commitSha: input.commitSha, inputCommitSha: snapshot.inputCommitSha, repositorySsh: input.repositorySsh, branch: input.branch,
@@ -38,6 +39,9 @@ function inspectCommittedOpenSpec(input: PluginWorkspaceRevisionRequest, inspect
 
 // esbuild's keepNames transform can reference its name helper inside serialized
 // functions. Provide the same harmless helper when the server is bundled.
-export const workspaceRevisionInspectionProgram = "const __name=(fn,name)=>Object.defineProperty(fn,'name',{value:name,configurable:true}); ("
+export function workspaceRevisionInspectionProgram() {
+  const policy = readWorkspaceOpenSpecPolicy();
+  return "const __name=(fn,name)=>Object.defineProperty(fn,'name',{value:name,configurable:true}); ("
   + inspectCommittedOpenSpec.toString() + ")(JSON.parse(require('node:fs').readFileSync(0,'utf8')), "
-  + inspectOpenSpecTree.toString() + ", " + readWorkspaceRevisionOrigin.toString() + ", " + sameWorkspaceRepository.toString() + ")";
+  + inspectOpenSpecTree.toString() + ", " + readWorkspaceRevisionOrigin.toString() + ", " + sameWorkspaceRepository.toString() + ", " + JSON.stringify(policy) + ")";
+}

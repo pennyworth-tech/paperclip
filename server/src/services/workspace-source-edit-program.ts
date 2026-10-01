@@ -1,18 +1,16 @@
+import { readWorkspaceOpenSpecPolicy, type WorkspaceOpenSpecPolicy } from "./workspace-openspec-policy.js";
 import type { SourceEditProgramInput, SourceEditRecovery } from "./workspace-source-edit-recovery.js";
 import { inspectOpenSpecTree } from "./workspace-openspec-tree.js";
 import { readSourceEditInspection, type SourceEditInspection } from "./workspace-source-edit-inspection.js";
 import { sameWorkspaceRepository } from "./workspace-repository.js";
 
 /** Host-owned program. No command, executable, arbitrary path, or Git option is supplied by the caller. */
-function editOpenSpec(input: SourceEditProgramInput, inspectTree: typeof inspectOpenSpecTree, readInspection: typeof readSourceEditInspection, matchesRepository: typeof sameWorkspaceRepository) {
+function editOpenSpec(input: SourceEditProgramInput, inspectTree: typeof inspectOpenSpecTree, readInspection: typeof readSourceEditInspection, matchesRepository: typeof sameWorkspaceRepository, policy: WorkspaceOpenSpecPolicy) {
   const fs = require("node:fs") as typeof import("node:fs");
   const os = require("node:os") as typeof import("node:os");
   const path = require("node:path") as typeof import("node:path");
   const crypto = require("node:crypto") as typeof import("node:crypto");
   const cp = require("node:child_process") as typeof import("node:child_process");
-  // Execute only the reviewed, dependency-free renderer shipped in this release.
-  // Python isolated mode prevents imports from the repository or PYTHONPATH.
-  const rendererHash = "7585fbb9f5ec0543fc97f46fdf9ebe3fca1bcec42db4861449f3a62129243926";
   const root = process.cwd(), maxBytes = 8 * 1024 * 1024;
   const hash = (value: string) => crypto.createHash("sha256").update(value).digest("hex");
   const fail = (code: string, detail?: string): never => { throw Object.assign(new Error(code), { detail }); };
@@ -33,7 +31,6 @@ function editOpenSpec(input: SourceEditProgramInput, inspectTree: typeof inspect
   };
   const git = (args: string[], cwd = root, stdin?: string, extraEnv: Record<string, string> = {}) => command("git",
     ["-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null", "-c", "commit.gpgsign=false", ...args], cwd, stdin, extraEnv);
-  const schemaRoot = "openspec/schemas/factory-pipeline-v2";
   const editable = (file: string) => /^(?:research|proposal|design|tasks)\.md$/.test(file) || /^specs\/[a-z0-9][a-z0-9-]*\/spec\.md$/.test(file);
   let temporary: string | undefined, lock: string | undefined;
   let indexLock: { path: string; fd: number; dev: number; ino: number } | undefined;
@@ -266,8 +263,12 @@ function editOpenSpec(input: SourceEditProgramInput, inspectTree: typeof inspect
       git(["update-ref", "refs/heads/" + input.branch, inputCommitSha, input.commitSha], candidate);
       const status = JSON.parse(command("openspec", ["status", "--change", input.changeId, "--json"], candidate));
       let rendering: SourceEditInspection["cli"]["rendering"];
-      if (status.schemaName === "factory-pipeline-v2") {
-        if (hash(contents.get(schemaRoot + "/tools/render_review.py") ?? "") !== rendererHash) fail("renderer_version_unsupported");
+      if (typeof status.schemaName !== "string" || !/^[A-Za-z0-9_-]+$/.test(status.schemaName)) fail("artifact_graph_invalid");
+      const schemaPolicy = policy.schemas.find((entry) => entry.schemaName === status.schemaName);
+      if (schemaPolicy?.rendererSha256) {
+        const schemaRoot = "openspec/schemas/" + status.schemaName;
+        // Only operator-approved committed bytes execute, with Python imports isolated.
+        if (hash(contents.get(schemaRoot + "/tools/render_review.py") ?? "") !== schemaPolicy.rendererSha256) fail("renderer_version_unsupported");
         const rendered = cp.spawnSync("python3", ["-I", schemaRoot + "/tools/render_review.py", "--change", input.changeId],
           { cwd: candidate, env, encoding: "utf8", timeout: 90_000, maxBuffer: maxBytes });
         if (rendered.error || ![0, 1].includes(rendered.status ?? -1)) fail("edit_validation_failed");
@@ -288,7 +289,7 @@ function editOpenSpec(input: SourceEditProgramInput, inspectTree: typeof inspect
       const tree = git(["write-tree"], candidate).trim(), publicationMessage = "Record OpenSpec source inspection\n\nOperation: " + input.operationId;
       const provisional = git(["commit-tree", tree, "-p", inputCommitSha], candidate, publicationMessage, identity).trim();
       git(["update-ref", "refs/heads/" + input.branch, provisional, inputCommitSha], candidate);
-      const snapshot = inspectTree({ ...input, commitSha: provisional }, candidate);
+      const snapshot = inspectTree({ ...input, commitSha: provisional }, candidate, policy);
       if (snapshot.inputCommitSha !== inputCommitSha) fail("source_edit_inspection_invalid");
       if (rendering) snapshot.cli.rendering = rendering;
       const checked = readInspection({ files: snapshot.files.map(({ path, sha256 }) => ({ path, sha256 })), cli: snapshot.cli }, input.changeId, hash);
@@ -471,6 +472,9 @@ function editOpenSpec(input: SourceEditProgramInput, inspectTree: typeof inspect
   }
 }
 
-export const workspaceSourceEditProgram = "const __name=(fn,name)=>Object.defineProperty(fn,'name',{value:name,configurable:true}); ("
+export function workspaceSourceEditProgram() {
+  const policy = readWorkspaceOpenSpecPolicy();
+  return "const __name=(fn,name)=>Object.defineProperty(fn,'name',{value:name,configurable:true}); ("
   + editOpenSpec.toString() + ")(JSON.parse(require('node:fs').readFileSync(0,'utf8')), "
-  + inspectOpenSpecTree.toString() + ", " + readSourceEditInspection.toString() + ", " + sameWorkspaceRepository.toString() + ")";
+  + inspectOpenSpecTree.toString() + ", " + readSourceEditInspection.toString() + ", " + sameWorkspaceRepository.toString() + ", " + JSON.stringify(policy) + ")";
+}

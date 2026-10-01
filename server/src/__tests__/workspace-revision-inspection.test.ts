@@ -58,21 +58,21 @@ suite("committed Git and native OpenSpec inspection", () => {
       "const sha=process.env.INSPECTION_TEST_REMOTE_SHA||cp.execFileSync(" + JSON.stringify(gitBinary) + ",[\"rev-parse\",\"HEAD\"],{encoding:'utf8'}).trim();" +
       "process.stdout.write(sha+'\\trefs/heads/" + branch + "\\n');}else{" +
       "const r=cp.spawnSync(" + JSON.stringify(gitBinary) + ",args,{stdio:'inherit'});process.exit(r.status??1);}", { mode: 0o700 });
-    const schemaRoot = "openspec/schemas/factory-pipeline-v2";
+    const schemaRoot = "openspec/schemas/example-review";
     const artifacts = [["proposal", "proposal.md"], ["specs", "specs/**/*.md"], ["tasks", "tasks.md"], ["review-deck", "review-deck.html"]];
-    const schema = "name: factory-pipeline-v2\nversion: 1\ndescription: Inspection fixture\nartifacts:\n" + artifacts.map(([id, generates], index) =>
+    const schema = "name: example-review\nversion: 1\ndescription: Inspection fixture\nartifacts:\n" + artifacts.map(([id, generates], index) =>
       "  - id: " + id + "\n    generates: " + generates + "\n    description: Fixture\n    template: " + id + ".md\n    instruction: Author the fixture\n    requires: [" + (index ? artifacts[index - 1]![0] : "") + "]\n").join("") +
       "apply:\n  requires: [proposal, specs, tasks, review-deck]\n  tracks: tasks.md\n  instruction: Implement the approved fixture\n";
     const contents: Record<string, string> = {
       "proposal.md": "## Why\nTest source inspection.\n\n## What Changes\n- Add a safe review.\n\n## Capabilities\n### New Capabilities\n- `review`: operator review.\n### Modified Capabilities\nNone.\n\n## Impact\nThe review interface.\n",
       "specs/review/spec.md": "## ADDED Requirements\n\n### Requirement: Operator approval\nThe system SHALL require operator approval.\n\n#### Scenario: Approval\n- **WHEN** the operator approves\n- **THEN** the proposal becomes approved\n",
       "tasks.md": "## 1. Implement\n- [ ] 1.1 Require approval\n",
-      "../../schemas/factory-pipeline-v2/schema.yaml": schema,
-      ".openspec.yaml": "schema: factory-pipeline-v2\ncreated: 2026-09-28\n",
+      "../../schemas/example-review/schema.yaml": schema,
+      ".openspec.yaml": "schema: example-review\ncreated: 2026-09-28\n",
     };
-    for (const [id] of artifacts) contents["../../schemas/factory-pipeline-v2/templates/" + id + ".md"] = "Fixture template\n";
+    for (const [id] of artifacts) contents["../../schemas/example-review/templates/" + id + ".md"] = "Fixture template\n";
     for (const [file, text] of Object.entries(contents)) await write(path.posix.normalize(changeRoot + "/" + file), text);
-    await write(changeRoot + "/.openspec.yaml", "schema: factory-pipeline-v2\ncreated: 2026-09-28\n");
+    await write(changeRoot + "/.openspec.yaml", "schema: example-review\ncreated: 2026-09-28\n");
     await write(changeRoot + "/rollout.md", "Supplementary rollout notes are not a schema artifact.\n");
     const sourceSha = commit();
     model = { templateVersion: "review-deck/v2", changeId: change, metadata: { branch, sha: sourceSha, shaDirty: false },
@@ -86,6 +86,20 @@ suite("committed Git and native OpenSpec inspection", () => {
   afterEach(() => { vi.unstubAllEnvs(); });
   afterAll(async () => { if (root) await fs.rm(root, { recursive: true, force: true }); });
 
+  it("keeps the operator's deck requirement when repository metadata drops the artifact", async () => {
+    const schemaPath = "openspec/schemas/example-review/schema.yaml";
+    const schema = await fs.readFile(path.join(repo, schemaPath), "utf8");
+    await write(schemaPath, schema.replace(/  - id: review-deck\n[\s\S]*?(?=apply:)/, "").replace(", review-deck]", "]"));
+    await fs.rm(path.join(repo, changeRoot, "review-deck.html")); commit();
+    // Without installation policy this is a valid schema with no review deck.
+    vi.stubEnv("PAPERCLIP_OPENSPEC_POLICY_FILE", undefined);
+    expect(await inspect()).toMatchObject({ ok: true, result: { cli: { readiness: { state: "ready", deck: "not_required" } } } });
+    const policy = path.join(root, "host-policy.json");
+    await fs.writeFile(policy, JSON.stringify({ format: 1, schemas: [{ schemaName: "example-review", requireReviewDeck: true }] }));
+    vi.stubEnv("PAPERCLIP_OPENSPEC_POLICY_FILE", policy);
+    expect(await inspect()).toMatchObject({ ok: true, result: { cli: { status: { reviewDeckRequired: true },
+      readiness: { state: "draft", deck: "missing", reasons: ["review_deck_missing"] } } } });
+  });
   it.each(["https://github.com/fixture/spec.git", "https://github.com/fixture/spec"])("uses the existing HTTPS origin %s", async (url) => {
     git("remote", "set-url", "origin", url); vi.stubEnv("INSPECTION_TEST_REMOTE_URL", url);
     expect(await inspect()).toMatchObject({ ok: true, result: { commitSha: baseline, remoteCommitSha: baseline } });
@@ -120,7 +134,7 @@ suite("committed Git and native OpenSpec inspection", () => {
   it("returns immutable blob bytes, the source commit, and actual CLI validation", async () => {
     const result = await inspect();
     expect(result).toMatchObject({ ok: true, result: { commitSha: baseline, remoteCommitSha: baseline,
-      inputCommitSha: model.metadata.sha, cli: { status: { isComplete: true, schemaName: "factory-pipeline-v2" },
+      inputCommitSha: model.metadata.sha, cli: { status: { isComplete: true, schemaName: "example-review" },
         validation: { summary: { totals: { failed: 0, passed: 1 } } } } } });
     expect(result.result.files.find((file: { path: string }) => file.path === changeRoot + "/proposal.md").sha256).toBe(hash(model.sources[0]!.text));
     expect(result.result.cli.artifacts.map((artifact: { id: string; dependsOn: string[] }) => ({ id: artifact.id, dependsOn: artifact.dependsOn })))
@@ -144,7 +158,7 @@ suite("committed Git and native OpenSpec inspection", () => {
     }
   });
   it("includes deleted template inputs when identifying the source commit", async () => {
-    const extra = "openspec/schemas/factory-pipeline-v2/templates/optional.json";
+    const extra = "openspec/schemas/example-review/templates/optional.json";
     await write(extra, '{"optional":true}\n'); commit();
     await fs.unlink(path.join(repo, extra)); const deletion = commit();
     const changed = structuredClone(model); changed.metadata.sha = deletion;
@@ -199,7 +213,7 @@ suite("committed Git and native OpenSpec inspection", () => {
     await fs.writeFile(path.join(repo, changeRoot, "proposal.md"), Buffer.from([0xf0, 0x90, 0x80])); commit();
     expect(await inspect()).toMatchObject({ ok: false, code: "source_not_utf8_text" });
   });
-  it("inspects a factory draft before its required review deck exists", async () => {
+  it("inspects a review draft before its required review deck exists", async () => {
     await fs.unlink(path.join(repo, changeRoot, "review-deck.html")); commit();
     const response = await inspect();
     expect(response).toMatchObject({ ok: true, result: { cli: { status: { isComplete: false },
@@ -228,7 +242,7 @@ suite("committed Git and native OpenSpec inspection", () => {
     expect(response).toMatchObject({ ok: true, result: { inputCommitSha: sha, cli: { status: { schemaName: "spec-driven", isComplete: true },
       readiness: { state: "ready", deck: "not_required", reasons: [] } } } });
     expect(response.result.cli.artifacts).toHaveLength(4);
-    expect(response.result.files.some((file: { path: string }) => file.path.includes("factory-pipeline-v2"))).toBe(false);
+    expect(response.result.files.some((file: { path: string }) => file.path.includes("example-review"))).toBe(false);
   });
   it("keeps file presence separate from invalid Markdown", async () => {
     await write(changeRoot + "/.openspec.yaml", "schema: spec-driven\ncreated: 2026-09-28\n");

@@ -165,7 +165,7 @@ export function workspaceSourceWritingService(db: Db, producer: Producer, runtim
           }
           return { issueId: current.issue.id, heartbeatRunId: current.issue.checkoutRunId, responsibleUserId: input.actorUserId };
         }) : undefined;
-        return executeWorkspaceRevisionProgram(db, runtime, binding!, workspaceSourceEditProgram, request, { deadline, env });
+        return executeWorkspaceRevisionProgram(db, runtime, binding!, workspaceSourceEditProgram(), request, { deadline, env });
       };
       // Previously started operations retain their workspace journal protocol;
       // absence of a new checkpoint must not be mistaken for proof of no push.
@@ -174,7 +174,7 @@ export function workspaceSourceWritingService(db: Db, producer: Producer, runtim
           execute,
           restore: async (request, cwd) => {
             if (cwd !== binding!.workspace.cwd) throw conflict("The canonical copy directory changed", { code: "workspace_mismatch" });
-            return runLocalWorkspaceProgram(cwd, workspaceSourceEditProgram, request, deadline - Date.now());
+            return runLocalWorkspaceProgram(cwd, workspaceSourceEditProgram(), request, deadline - Date.now());
           },
           save: async (checkpoint) => {
             if (Date.now() >= deadline) throw conflict("Source edit execution deadline expired", { code: "operation_lease_lost" });
@@ -241,7 +241,7 @@ export function workspaceSourceWritingService(db: Db, producer: Producer, runtim
       if (mode === "apply") return await mutate(companyId, workspaceId, request, false) as PluginWorkspaceEditReceipt;
       const binding = await readWorkspaceRevisionBinding(db, producer, workspaceId, companyId, input);
       if (binding.work.sourceRevisionId !== input.commitSha) throw conflict("Preview requires the published source", { code: "edit_base_conflict" });
-      const execution = await executeWorkspaceRevisionProgram(db, runtime, binding, workspaceSourceEditProgram, input);
+      const execution = await executeWorkspaceRevisionProgram(db, runtime, binding, workspaceSourceEditProgram(), input);
       const result = parseResponse(execution, request);
       if (result.published !== false) throw unprocessable("Preview receipt reported publication", { code: "source_edit_receipt_mismatch" });
       await readWorkspaceRevisionBinding(db, producer, workspaceId, companyId, input);

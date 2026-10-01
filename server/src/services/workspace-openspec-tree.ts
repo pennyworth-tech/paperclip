@@ -1,8 +1,9 @@
+import type { WorkspaceOpenSpecPolicy } from "./workspace-openspec-policy.js";
 import type { PluginWorkspaceRevisionInspection, PluginWorkspaceRevisionRequest } from "@paperclipai/plugin-sdk";
 
 /** Read only committed source; the enclosing host program owns workspace/CAS checks.
  * This function is serialized into both the inspector and the editor. */
-export function inspectOpenSpecTree(input: Pick<PluginWorkspaceRevisionRequest, "commitSha" | "branch" | "changeId">, root: string):
+export function inspectOpenSpecTree(input: Pick<PluginWorkspaceRevisionRequest, "commitSha" | "branch" | "changeId">, root: string, policy: WorkspaceOpenSpecPolicy):
   Pick<PluginWorkspaceRevisionInspection, "inputCommitSha" | "files" | "cli"> & { sourceDigest: string } {
   const fs = require("node:fs") as typeof import("node:fs");
   const os = require("node:os") as typeof import("node:os");
@@ -85,7 +86,10 @@ export function inspectOpenSpecTree(input: Pick<PluginWorkspaceRevisionRequest, 
       items?: Array<{ id: string; valid: boolean }> };
     if (validation.items?.length !== 1 || validation.items[0]?.id !== input.changeId || typeof validation.items[0]?.valid !== "boolean"
       || status.isComplete !== observed.every((artifact) => artifact.status === "done")) fail("openspec_validation_failed");
-    const deckRequired = status.schemaName === "factory-pipeline-v2" || definitions.some((artifact) => artifact.outputPath === "review-deck.html");
+    const deckRequired = policy.schemas.some((entry) => entry.schemaName === status.schemaName && entry.requireReviewDeck) || definitions.some((artifact) => artifact.outputPath === "review-deck.html");
+    // Persist the operator requirement inside the commit-bound inspection, so
+    // recovery validates the original result without re-reading changed policy.
+    status.reviewDeckRequired = deckRequired;
     const paths = [...snapshotPaths].filter((file) => file !== changeRoot + "/review-deck.html");
     const inputCommitSha = git(["log", "-1", "--format=%H", input.commitSha, "--", ...new Set([...paths, "openspec/config.yaml", changeRoot + "/.openspec.yaml",
       ":(glob)" + changeRoot + "/specs/**/*.md", ":(glob)" + schemaRoot + "templates/*",
