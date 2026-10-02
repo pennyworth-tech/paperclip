@@ -420,6 +420,7 @@ class OpenCodeHarnessSession implements HarnessSession {
   #resultTurnId: string | null;
   #semanticResultTextBoundary: number | null = null;
   #semanticResultProviderMessageId: string | null = null;
+  #semanticResultProviderTextBoundary: number | null = null;
   #lastNonTerminalToolSourceSeq = 0;
   #usage: Record<string, unknown> | null = null;
   #sendFullContext: boolean;
@@ -514,6 +515,7 @@ class OpenCodeHarnessSession implements HarnessSession {
     this.#resultTurnId = null;
     this.#semanticResultTextBoundary = null;
     this.#semanticResultProviderMessageId = null;
+    this.#semanticResultProviderTextBoundary = null;
     this.#lastNonTerminalToolSourceSeq = 0;
     this.#completedTextPartIds.clear();
     this.#completedReasoningPartIds.clear();
@@ -1541,7 +1543,14 @@ class OpenCodeHarnessSession implements HarnessSession {
       // part from the same assistant message complete. Correlating by native
       // message identity selects that response while excluding both earlier
       // commentary messages and later acknowledgement-only messages.
-      this.#semanticResultProviderMessageId = messageId;
+      // The MCP response and provider SSE stream can arrive in either order.
+      // Anchor text ordering to the first terminal part in the provider stream;
+      // an earlier MCP callback cannot establish where that stream's commentary
+      // ends. Repeated terminal-part updates must not move this boundary.
+      if (this.#semanticResultProviderMessageId === null) {
+        this.#semanticResultProviderMessageId = messageId;
+        this.#semanticResultProviderTextBoundary = this.#completedTextParts.length;
+      }
     }
     for (const canonical of canonicalProviderEventsFromOpenCodePart(part)) {
       this.#emit(canonical.eventType, canonical.payload, {
@@ -1733,7 +1742,7 @@ class OpenCodeHarnessSession implements HarnessSession {
       part,
       index: this.#completedTextParts.indexOf(part),
     }));
-    const boundary = this.#semanticResultTextBoundary;
+    const boundary = this.#semanticResultProviderTextBoundary ?? this.#semanticResultTextBoundary;
     const beforeResult = indexed.filter(
       ({ index }) => boundary !== null && index < boundary,
     );

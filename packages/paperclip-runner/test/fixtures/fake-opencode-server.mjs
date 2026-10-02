@@ -560,6 +560,44 @@ const server = createServer(async (request, response) => {
               },
             },
           });
+          if (String(parsedPrompt.message ?? "").includes("repeat-terminal")) {
+            emit({
+              type: "message.part.updated",
+              id: "event-tool-part-repeated",
+              properties: {
+                sessionID: session.id,
+                part: {
+                  id: "part-tool",
+                  messageID: "message-assistant",
+                  type: "tool",
+                  tool: "paperclip_paperclip_finish",
+                  state: { status: "completed", output: "accepted" },
+                },
+              },
+            });
+            emit({
+              type: "message.updated",
+              id: "event-post-tool-ack-message",
+              properties: {
+                sessionID: session.id,
+                info: { id: "message-post-tool-ack", sessionID: session.id, role: "assistant" },
+              },
+            });
+            emit({
+              type: "message.part.updated",
+              id: "event-post-tool-ack",
+              properties: {
+                sessionID: session.id,
+                part: {
+                  id: "part-post-tool-ack",
+                  messageID: "message-post-tool-ack",
+                  type: "text",
+                  text: "Acknowledged.",
+                  time: { start: 5, end: 6 },
+                },
+              },
+            });
+          }
         } else if (correlatedFinal) {
           emit({
             type: "message.part.updated",
