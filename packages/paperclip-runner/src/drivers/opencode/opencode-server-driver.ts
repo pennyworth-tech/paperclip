@@ -421,6 +421,7 @@ class OpenCodeHarnessSession implements HarnessSession {
   #semanticResultTextBoundary: number | null = null;
   #semanticResultProviderMessageId: string | null = null;
   #semanticResultProviderTextBoundary: number | null = null;
+  #semanticResultProviderPartBoundaries = new Map<string, number>();
   #lastNonTerminalToolSourceSeq = 0;
   #usage: Record<string, unknown> | null = null;
   #sendFullContext: boolean;
@@ -516,6 +517,7 @@ class OpenCodeHarnessSession implements HarnessSession {
     this.#semanticResultTextBoundary = null;
     this.#semanticResultProviderMessageId = null;
     this.#semanticResultProviderTextBoundary = null;
+    this.#semanticResultProviderPartBoundaries.clear();
     this.#lastNonTerminalToolSourceSeq = 0;
     this.#completedTextPartIds.clear();
     this.#completedReasoningPartIds.clear();
@@ -1544,12 +1546,15 @@ class OpenCodeHarnessSession implements HarnessSession {
       // message identity selects that response while excluding both earlier
       // commentary messages and later acknowledgement-only messages.
       // The MCP response and provider SSE stream can arrive in either order.
-      // Anchor text ordering to the first terminal part in the provider stream;
-      // an earlier MCP callback cannot establish where that stream's commentary
-      // ends. Repeated terminal-part updates must not move this boundary.
-      if (this.#semanticResultProviderMessageId === null) {
+      // Remember each attempt's first position in the provider stream. Only a
+      // completed call establishes the result identity; rejected attempts and
+      // repeated completion frames must not move its text boundary.
+      if (!this.#semanticResultProviderPartBoundaries.has(partId)) {
+        this.#semanticResultProviderPartBoundaries.set(partId, this.#completedTextParts.length);
+      }
+      if (record(part.state).status === "completed" && this.#semanticResultProviderMessageId === null) {
         this.#semanticResultProviderMessageId = messageId;
-        this.#semanticResultProviderTextBoundary = this.#completedTextParts.length;
+        this.#semanticResultProviderTextBoundary = this.#semanticResultProviderPartBoundaries.get(partId)!;
       }
     }
     for (const canonical of canonicalProviderEventsFromOpenCodePart(part)) {
