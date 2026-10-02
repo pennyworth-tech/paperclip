@@ -8,6 +8,7 @@ import {
   companyMemberships,
   createDb,
   heartbeatRuns,
+  issueComments,
   issues,
 } from "@paperclipai/db";
 import {
@@ -260,14 +261,23 @@ describeEmbeddedPostgres("enqueueWakeup legacy execution lock candidate", () => 
     expect(assigneeRuns.map((row) => row.id)).toEqual([candidateRunId]);
   });
 
-  it("defers to a live foreign run without handing it the lock, so a comment on a done issue leaves executionRunId null", async () => {
-    const { assigneeAgentId, issueId, candidateRunId } = await seedNeverStartedCandidate({
+  it.each([false, true])("defers to a live foreign run without assigning its lock; resumes only with safe cancellation evidence (%s)", async (providerWorkNeverStarted) => {
+    const { companyId, assigneeAgentId, issueId, candidateRunId } = await seedNeverStartedCandidate({
       candidateIsAssignee: false,
       candidateStatus: "running",
       issueStatus: "done",
     });
 
     const wakeCommentId = randomUUID();
+    // Promotion of a terminal task requires a real external comment; a random
+    // absent comment ID is deliberately not authority to reopen it.
+    await db.insert(issueComments).values({
+      id: wakeCommentId,
+      companyId,
+      issueId,
+      authorUserId: "local-board",
+      body: "Please continue with this additional requirement.",
+    });
     const wokenRun = await heartbeat.wakeup(assigneeAgentId, {
       source: "automation",
       triggerDetail: "system",
@@ -323,23 +333,23 @@ describeEmbeddedPostgres("enqueueWakeup legacy execution lock candidate", () => 
     expect(candidate?.status).toBe("running");
     expect(candidate?.finishedAt).toBeNull();
 
-    // ---- the resume half of the same trade --------------------------------
-    //
-    // Everything above only says the wake was parked and the stamp refused.
-    // That is an improvement on re-arming the fence *only* if the parked wake
-    // still resumes once the foreign run ends. If it does not, this patch
-    // trades a transient fence for a permanently parked wake, which is
-    // strictly worse than the bug it fixes — so the deferral and the promotion
-    // are pinned here as one trade rather than in a separate test.
-    //
-    // Promotion in releaseIssueExecutionAndPromote is keyed on issue identity,
-    // never on the lock column: the candidate scan finds the context issue by
-    // `issues.id` disjoined with (not gated on) the lock columns, the
-    // ownership guard is `issue.executionRunId && issue.executionRunId !==
-    // run.id` so a null lock short-circuits past it, and the deferred scan
-    // matches `payload ->> 'issueId'`. A null lock is therefore promotable by
-    // construction. Re-key any one of those three on executionRunId and this
-    // wake strands forever with nothing else in the suite noticing.
+    // Unknown provider outcomes must retain the deferred receipt without
+    // launching more work. A running preparation that proves provider work
+    // never started can release it through the normal cancellation path.
+    if (!providerWorkNeverStarted) {
+      await heartbeat.cancelRun(candidateRunId, "Foreign provider outcome unknown");
+      const parked = await db.select().from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.id, deferred[0]!.id));
+      expect(parked[0]?.status).toBe("deferred_issue_execution");
+      expect(parked[0]?.runId).toBeNull();
+      const successorRuns = await db.select().from(heartbeatRuns)
+        .where(eq(heartbeatRuns.agentId, assigneeAgentId));
+      expect(successorRuns).toHaveLength(0);
+      const heldIssue = await db.select().from(issues).where(eq(issues.id, issueId));
+      expect(heldIssue[0]?.executionRunId).toBeNull();
+      expect(heldIssue[0]?.status).toBe("done");
+      return;
+    }
 
     // startNextQueuedRunForAgent starts the promoted run for real, and the
     // default adapter mock resolves immediately — so without a gate the
@@ -365,7 +375,9 @@ describeEmbeddedPostgres("enqueueWakeup legacy execution lock candidate", () => 
     // Terminal through a real finalize path, not an UPDATE: cancelRun is the
     // public entry point that reaches releaseIssueExecutionAndPromote for a
     // `running` run.
-    await heartbeat.cancelRun(candidateRunId, "Foreign mention run finished");
+    await heartbeat.cancelRun(candidateRunId, "Foreign preparation cancelled before provider dispatch", {
+      resultJson: { executionRecovery: { kind: "bootstrap", providerWorkStarted: false } },
+    });
 
     try {
       // The parked agent had no run of its own — the seeded candidate belongs
