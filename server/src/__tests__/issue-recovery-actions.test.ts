@@ -1286,6 +1286,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       agentId: coderId,
       invocationSource: "manual",
       status: "failed",
+      resultJson: { executionRecovery: { kind: "bootstrap", providerWorkStarted: false } },
       error: "Missing OPENAI_API key in the agent runtime; no api key configured",
       errorCode: "adapter_failed",
       startedAt: new Date("2026-07-15T20:00:00.000Z"),
@@ -1319,6 +1320,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       finishedAt: new Date("2026-07-15T20:01:00.000Z"),
       contextSnapshot: { issueId: sourceIssueId },
       resultJson: {
+        executionRecovery: { kind: "bootstrap", providerWorkStarted: false },
         configurationIncomplete: {
           reason: "secret_binding_missing",
           missingBindings: [
@@ -1355,6 +1357,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       agentId: coderId,
       invocationSource: "manual",
       status: "failed",
+      resultJson: { executionRecovery: { kind: "bootstrap", providerWorkStarted: false } },
       error: "adapter process exited before the prompt was answered",
       errorCode: "configuration_incomplete",
       startedAt: new Date("2026-07-15T20:00:00.000Z"),
