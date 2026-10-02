@@ -189,6 +189,48 @@ export const experimentalApiMetadata: Record<string, { successStatuses: number[]
     "boardOnly": false,
     "source": "server/src/routes/pipelines.ts"
   },
+  "GET /api/cases/{caseId}/documents/{key}/annotations": {
+    "successStatuses": [
+      200
+    ],
+    "boardOnly": false,
+    "source": "server/src/routes/pipelines.ts"
+  },
+  "GET /api/cases/{caseId}/annotations": {
+    "successStatuses": [
+      200
+    ],
+    "boardOnly": false,
+    "source": "server/src/routes/pipelines.ts"
+  },
+  "POST /api/cases/{caseId}/documents/{key}/annotations": {
+    "successStatuses": [
+      201
+    ],
+    "boardOnly": false,
+    "source": "server/src/routes/pipelines.ts"
+  },
+  "POST /api/cases/{caseId}/documents/{key}/annotations/{threadId}/comments": {
+    "successStatuses": [
+      201
+    ],
+    "boardOnly": false,
+    "source": "server/src/routes/pipelines.ts"
+  },
+  "PATCH /api/cases/{caseId}/documents/{key}/annotations/{threadId}": {
+    "successStatuses": [
+      200
+    ],
+    "boardOnly": false,
+    "source": "server/src/routes/pipelines.ts"
+  },
+  "POST /api/cases/{caseId}/documents/{key}/annotations/{threadId}/reanchor": {
+    "successStatuses": [
+      200
+    ],
+    "boardOnly": false,
+    "source": "server/src/routes/pipelines.ts"
+  },
   "POST /api/cases/{caseId}/documents/{key}/revisions/{revisionId}/restore": {
     "successStatuses": [
       200

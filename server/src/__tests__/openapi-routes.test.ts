@@ -224,6 +224,29 @@ function loadSpecRoutes() {
 }
 
 describe("openapi routes", () => {
+  it("documents pipeline annotation payloads and created responses", () => {
+    const spec = buildOpenApiSpec();
+    const base = "/api/cases/{caseId}/documents/{key}/annotations";
+    const create = spec.paths[base].post;
+    const reply = spec.paths[`${base}/{threadId}/comments`].post;
+    expect(create.responses["201"]).toBeDefined();
+    expect(reply.responses["201"]).toBeDefined();
+    const createBody = create.requestBody.content["application/json"].schema;
+    expect(createBody.properties.feedbackKind.enum).toEqual(["question", "suggestion", "blocker"]);
+    expect(createBody.properties.issueCommentId).toBeUndefined();
+    expect(createBody.properties.blocking).toBeUndefined();
+    const replyBody = reply.requestBody.content["application/json"].schema;
+    expect(replyBody.required).toEqual(["body"]);
+    expect(replyBody.additionalProperties).toBe(false);
+    expect(replyBody.properties.issueCommentId).toBeUndefined();
+    const update = spec.paths[`${base}/{threadId}`].patch.requestBody.content["application/json"].schema;
+    expect(update.required).toEqual(expect.arrayContaining(["status", "expectedUpdatedAt"]));
+    const reanchor = spec.paths[`${base}/{threadId}/reanchor`].post.requestBody.content["application/json"].schema;
+    expect(reanchor.required).toEqual(expect.arrayContaining(["baseRevisionId", "baseRevisionNumber", "selector", "expectedUpdatedAt"]));
+    expect(reanchor.properties.body).toBeUndefined();
+    expect(spec.paths["/api/cases/{caseId}/annotations"].get).toBeDefined();
+  });
+
   it("documents personal board-only announcements and private responses", () => {
     const { spec } = loadSpecRoutes();
     const current = spec.paths["/api/announcements/current"].get;
