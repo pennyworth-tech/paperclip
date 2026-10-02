@@ -6,7 +6,7 @@ import { runChildProcess } from "@paperclipai/adapter-utils/server-utils";
 import { execute } from "@paperclipai/adapter-cursor-local/server";
 
 async function writeFakeCursorCommand(commandPath: string): Promise<void> {
-  const script = `#!/usr/bin/env node
+  const script = `#!${process.execPath}
 const fs = require("node:fs");
 
 const capturePath = process.env.PAPERCLIP_TEST_CAPTURE_PATH;
@@ -42,7 +42,7 @@ console.log(JSON.stringify({
 }
 
 async function writeFakeSandboxCursorAgent(commandPath: string, capturePath: string): Promise<void> {
-  const script = `#!/usr/bin/env node
+  const script = `#!${process.execPath}
 const fs = require("node:fs");
 
 const payload = {
@@ -162,7 +162,7 @@ describe("cursor execute", () => {
         },
       });
 
-      expect(result.exitCode).toBe(0);
+      expect(result.exitCode, JSON.stringify(result)).toBe(0);
       expect(result.errorMessage).toBeNull();
 
       const capture = JSON.parse(await fs.readFile(capturePath, "utf8")) as CapturePayload;
@@ -234,7 +234,7 @@ describe("cursor execute", () => {
         onLog: async () => {},
       });
 
-      expect(result.exitCode).toBe(0);
+      expect(result.exitCode, JSON.stringify(result)).toBe(0);
       expect(result.errorMessage).toBeNull();
 
       const capture = JSON.parse(await fs.readFile(capturePath, "utf8")) as CapturePayload;
@@ -308,7 +308,7 @@ describe("cursor execute", () => {
         onMeta: async () => {},
       });
 
-      expect(result.exitCode).toBe(0);
+      expect(result.exitCode, JSON.stringify(result)).toBe(0);
       expect(result.errorMessage).toBeNull();
       const installedSkill = path.join(configuredHome, ".cursor", "skills", "ascii-heart");
       expect((await fs.lstat(installedSkill)).isSymbolicLink()).toBe(true);
@@ -373,7 +373,7 @@ describe("cursor execute", () => {
         onLog: async () => {},
       });
 
-      expect(result.exitCode).toBe(0);
+      expect(result.exitCode, JSON.stringify(result)).toBe(0);
       const capture = JSON.parse(await fs.readFile(capturePath, "utf8")) as {
         command: string;
         argv: string[];
@@ -439,7 +439,7 @@ describe("cursor execute", () => {
         onLog: async () => {},
       });
 
-      expect(result.exitCode).toBe(0);
+      expect(result.exitCode, JSON.stringify(result)).toBe(0);
       const capture = JSON.parse(await fs.readFile(capturePath, "utf8")) as { command: string };
       expect(capture.command).toBe(customCommandPath);
     } finally {

@@ -7,7 +7,7 @@ import { testEnvironment } from "@paperclipai/adapter-cursor-local/server";
 
 async function writeFakeAgentCommand(binDir: string, argsCapturePath: string): Promise<string> {
   const commandPath = path.join(binDir, "agent");
-  const script = `#!/usr/bin/env node
+  const script = `#!${process.execPath}
 const fs = require("node:fs");
 const outPath = process.env.PAPERCLIP_TEST_ARGS_PATH;
 if (outPath) {
@@ -29,7 +29,7 @@ console.log(JSON.stringify({
 }
 
 async function writeFakeCursorAgentCommand(commandPath: string): Promise<void> {
-  const script = `#!/usr/bin/env node
+  const script = `#!${process.execPath}
 const fs = require("node:fs");
 const outPath = process.env.PAPERCLIP_TEST_ARGS_PATH;
 if (outPath) {
@@ -141,7 +141,7 @@ describe("cursor environment diagnostics", () => {
       },
     });
 
-    expect(result.status).toBe("pass");
+    expect(result.status, JSON.stringify(result)).toBe("pass");
     const args = JSON.parse(await fs.readFile(argsCapturePath, "utf8")) as string[];
     expect(args).toContain("--yolo");
     await fs.rm(root, { recursive: true, force: true });
@@ -173,7 +173,7 @@ describe("cursor environment diagnostics", () => {
       },
     });
 
-    expect(result.status).toBe("pass");
+    expect(result.status, JSON.stringify(result)).toBe("pass");
     const args = JSON.parse(await fs.readFile(argsCapturePath, "utf8")) as string[];
     expect(args).toContain("--yolo");
     expect(args).not.toContain("--trust");
@@ -216,7 +216,7 @@ describe("cursor environment diagnostics", () => {
         },
       });
 
-      expect(result.status).toBe("pass");
+      expect(result.status, JSON.stringify(result)).toBe("pass");
       const capture = JSON.parse(await fs.readFile(argsCapturePath, "utf8")) as {
         command: string;
         argv: string[];
