@@ -12,8 +12,17 @@ it("runs every active nested/parameterized fixture case exactly once through the
   try {
     const tests = path.join(root, "server/src/__tests__");
     mkdirSync(tests, { recursive: true });
-    symlinkSync(path.join(repoRoot, "node_modules"), path.join(root, "node_modules"), "junction");
-    writeFileSync(path.join(root, "package.json"), JSON.stringify({ private: true }));
+    // pnpm may reconcile a project's module metadata before exec. Give the
+    // fixture its own directory so that reconciliation cannot rewrite the
+    // parent suite's dependencies through a shared node_modules symlink.
+    const modules = path.join(root, "node_modules");
+    mkdirSync(modules);
+    for (const name of [".bin", "vitest"]) {
+      symlinkSync(path.join(repoRoot, "node_modules", name), path.join(modules, name), "junction");
+    }
+    const packageManager = JSON.parse(readFileSync(path.join(repoRoot, "package.json"), "utf8")).packageManager;
+    const parentModulesMetadata = readFileSync(path.join(repoRoot, "node_modules/.modules.yaml"), "utf8");
+    writeFileSync(path.join(root, "package.json"), JSON.stringify({ private: true, packageManager }));
     writeFileSync(path.join(root, "vitest.config.mjs"), `export default {
       test: { projects: [{ test: { name: "@paperclipai/server", root: ${JSON.stringify(path.join(root, "server"))},
         include: ["src/**/*.test.ts"], pool: "forks", maxWorkers: 1 } }] }
@@ -54,6 +63,7 @@ it("runs every active nested/parameterized fixture case exactly once through the
     expect(failed.stdout).toContain("exact filter coverage verified");
     expect(failed.status).not.toBe(0);
     expect(failed.stdout + failed.stderr).toContain("fixture failure");
+    expect(readFileSync(path.join(repoRoot, "node_modules/.modules.yaml"), "utf8")).toBe(parentModulesMetadata);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
