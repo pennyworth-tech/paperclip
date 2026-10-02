@@ -282,6 +282,7 @@ describeEmbeddedPostgres("deleted issue comment redaction", () => {
       requestedCount: 2,
       includedCount: 1,
       missingCount: 1,
+      issueCommentTotal: 1,
     });
     expect(JSON.stringify(wakePayload)).not.toContain("FOREIGN-ISSUE-SECRET");
   });
