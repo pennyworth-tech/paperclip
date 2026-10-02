@@ -16,6 +16,7 @@ import {
   heartbeatRunEvents,
   heartbeatRuns,
   issueComments,
+  issueRecoveryActions,
   issueRelations,
   issues,
 } from "@paperclipai/db";
@@ -428,13 +429,7 @@ describeEmbeddedPostgres("mid-run session checkpoint sink", () => {
     expect(taskSessionDuringRun?.taskKey).toBe(issueId);
   });
 
-  it("hands the checkpointed session back as the resume argument on the next wake", async () => {
-    // The acceptance test the spec actually asks for (spec.md: "the retry
-    // SHALL pass the interrupted run's harness session id to the harness as a
-    // resume argument"): a checkpoint that merely looks right in the row is
-    // not the same claim as the NEXT dispatch honouring it. This drives a
-    // second run for the same agent/issue and reads what the adapter itself
-    // was handed.
+  it.each([false, true])("a checkpoint permits a new wake only with pre-execution evidence: %s", async (providerWorkNeverStarted) => {
     const { agentId, issueId } = await seedFixture();
     adapterBehavior = async (input) => {
       await input.onEvent?.({
@@ -445,27 +440,41 @@ describeEmbeddedPostgres("mid-run session checkpoint sink", () => {
           sessionParams: { sessionId: "resume-me-session" },
         },
       });
+      // A harness can allocate a session before provider work starts. An ID
+      // alone says nothing about whether external actions already happened.
+      if (providerWorkNeverStarted) return {
+        exitCode: 1, signal: null, timedOut: false,
+        executionRecovery: { kind: "bootstrap", providerWorkStarted: false },
+      };
       throw new Error("harness was killed mid-run");
     };
     await invokeAndSettle(agentId, issueId);
+    expect((await readTaskSession(agentId))?.sessionDisplayId).toBe("resume-me-session");
 
     let resumeRuntime: AdapterExecutionContext["runtime"] | undefined;
     adapterBehavior = async (input) => {
       resumeRuntime = input.runtime;
       return { exitCode: 0, signal: null, timedOut: false, summary: "Resumed cleanly." };
     };
-    // A plain "issue_assigned" wake is a fresh assignment and always resets
-    // the task session (shouldResetTaskSessionForWake) -- unrelated to this
-    // sink and not the scenario the spec is about. "process_lost_retry" is
-    // the actual acceptance scenario: the wake reason the process-loss retry
-    // itself carries (enqueueProcessLossRetry sets it), so this is the real
-    // resume path, not a synthetic stand-in for it.
-    const finishedRun = await invokeAndSettle(agentId, issueId, "process_lost_retry");
-
+    // A fresh assignment resets sessions. This is an explicit subsequent wake
+    // for the same task; current execution admission still owns retry safety.
+    const next = await heartbeat.invoke(agentId, "on_demand",
+      { issueId, wakeReason: "manual", skipIssueComment: true }, "manual");
+    if (!providerWorkNeverStarted) {
+      expect(next).toBeNull();
+      expect(resumeRuntime).toBeUndefined();
+      expect(await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, issueId)))
+        .toEqual(expect.arrayContaining([expect.objectContaining({
+          cause: "legacy_execution_requires_reconciliation", status: "active",
+        })]));
+      expect((await readTaskSession(agentId))?.sessionDisplayId).toBe("resume-me-session");
+      return;
+    }
+    expect(next).not.toBeNull();
+    const finishedRun = await waitForRunToLeaveActiveStates(next!.id);
+    await heartbeat.drainActiveRunExecutions();
     expect(finishedRun?.status).toBe("succeeded");
-    expect(resumeRuntime?.sessionDisplayId ?? resumeRuntime?.sessionParams?.sessionId).toBe(
-      "resume-me-session",
-    );
+    expect(resumeRuntime?.sessionDisplayId ?? resumeRuntime?.sessionParams?.sessionId).toBe("resume-me-session");
   });
 
   it("ignores a checkpoint that carries neither session params nor a session id", async () => {
