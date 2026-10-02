@@ -3366,6 +3366,43 @@ export function rewriteWorkspaceCwdEnvVarsForExecution(input: {
   return nextEnv;
 }
 
+/**
+ * Apply explicit configuration and record only its admitted keys for child spawning.
+ * Call before merging ambient process.env; inherited service credentials must not
+ * acquire configuration provenance. Probes and execution share this boundary.
+ */
+export function applyConfiguredChildEnv(
+  env: Record<string, string>,
+  envConfig: Record<string, unknown>,
+): void {
+  const forwardedConfigKeys: string[] = [];
+  for (const [key, value] of Object.entries(envConfig)) {
+    // Adapter/user-configured env must never override a Paperclip-managed
+    // runtime variable. Non-PAPERCLIP_* keys (plain values and resolved
+    // secret_ref values) always forward to the spawned process; a PAPERCLIP_*
+    // key from config only applies when Paperclip has NOT already assigned it
+    // for this run. PAPERCLIP_API_KEY is never accepted from config — the
+    // harness-minted run token is the only source. This keeps runtime
+    // identity, wake, and workspace vars authoritative regardless of what a
+    // config binding sets.
+    if (typeof value !== "string" || key === CHILD_ENV_CONFIG_KEYS_VAR || isForbiddenConfigEnvKey(key)) continue;
+    if (isPaperclipRuntimeEnvKey(key) && key in env) continue;
+    env[key] = value;
+    forwardedConfigKeys.push(key);
+  }
+
+  // Record the config-bound keys this loop forwarded so the deny-by-default
+  // child env allowlist does not silently sever them: a config binding may
+  // name any variable (a resolved `secret_ref` such as GH_TOKEN is the common
+  // case) and no static list can anticipate those names. The marker is
+  // rewritten unconditionally from what this loop actually forwarded, so a
+  // config binding that names the marker itself cannot widen the allowlist.
+  delete env[CHILD_ENV_CONFIG_KEYS_VAR];
+  if (forwardedConfigKeys.length > 0) {
+    env[CHILD_ENV_CONFIG_KEYS_VAR] = forwardedConfigKeys.join(",");
+  }
+}
+
 export function refreshPaperclipWorkspaceEnvForExecution(input: {
   env: Record<string, string>;
   envConfig?: Record<string, unknown>;
@@ -3425,32 +3462,7 @@ export function refreshPaperclipWorkspaceEnvForExecution(input: {
     executionCwd: shapedWorkspaceEnv.workspaceCwd,
     executionTargetIsRemote: input.executionTargetIsRemote,
   });
-  const forwardedConfigKeys: string[] = [];
-  for (const [key, value] of Object.entries(shapedEnvConfig)) {
-    // Adapter/user-configured env must never override a Paperclip-managed
-    // runtime variable. Non-PAPERCLIP_* keys (plain values and resolved
-    // secret_ref values) always forward to the spawned process; a PAPERCLIP_*
-    // key from config only applies when Paperclip has NOT already assigned it
-    // for this run. PAPERCLIP_API_KEY is never accepted from config — the
-    // harness-minted run token is the only source. This keeps runtime
-    // identity, wake, and workspace vars authoritative regardless of what a
-    // config binding sets.
-    if (isForbiddenConfigEnvKey(key)) continue;
-    if (isPaperclipRuntimeEnvKey(key) && key in input.env) continue;
-    input.env[key] = value;
-    forwardedConfigKeys.push(key);
-  }
-
-  // Record the config-bound keys this loop forwarded so the deny-by-default
-  // child env allowlist does not silently sever them: a config binding may
-  // name any variable (a resolved `secret_ref` such as GH_TOKEN is the common
-  // case) and no static list can anticipate those names. The marker is
-  // rewritten unconditionally from what this loop actually forwarded, so a
-  // config binding that names the marker itself cannot widen the allowlist.
-  delete input.env[CHILD_ENV_CONFIG_KEYS_VAR];
-  if (forwardedConfigKeys.length > 0) {
-    input.env[CHILD_ENV_CONFIG_KEYS_VAR] = forwardedConfigKeys.join(",");
-  }
+  applyConfiguredChildEnv(input.env, shapedEnvConfig);
 
   return shapedWorkspaceEnv;
 }

@@ -8,6 +8,7 @@ import type {
 } from "@paperclipai/adapter-utils";
 import type { AdapterExecutionTarget } from "@paperclipai/adapter-utils/execution-target";
 import {
+  applyConfiguredChildEnv,
   asBoolean,
   asNumber,
   asString,
@@ -110,9 +111,7 @@ export async function testEnvironment(
 
   const envConfig = parseObject(config.env);
   const env: Record<string, string> = {};
-  for (const [key, value] of Object.entries(envConfig)) {
-    if (typeof value === "string") env[key] = value;
-  }
+  applyConfiguredChildEnv(env, envConfig);
 
   const openaiKeyOverride = "OPENAI_API_KEY" in envConfig ? asString(envConfig.OPENAI_API_KEY, "") : null;
   if (!config.managedAiConnection && openaiKeyOverride !== null && openaiKeyOverride.trim() === "") {

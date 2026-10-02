@@ -4,6 +4,7 @@ import type {
   AdapterEnvironmentTestResult,
 } from "@paperclipai/adapter-utils";
 import {
+  applyConfiguredChildEnv,
   asString,
   asBoolean,
   asNumber,
@@ -122,9 +123,7 @@ export async function testEnvironment(
 
   const envConfig = parseObject(config.env);
   const env: Record<string, string> = {};
-  for (const [key, value] of Object.entries(envConfig)) {
-    if (typeof value === "string") env[key] = value;
-  }
+  applyConfiguredChildEnv(env, envConfig);
   // For a local probe, resolve the trusted `claude` executable and a
   // deny-by-default child env from the shared builder, so a hostile caller
   // value can neither select the executable nor reach the child. A remote

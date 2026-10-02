@@ -7,6 +7,7 @@ import type {
   AdapterEnvironmentTestResult,
 } from "@paperclipai/adapter-utils";
 import {
+  applyConfiguredChildEnv,
   asNumber,
   asString,
   asStringArray,
@@ -164,9 +165,7 @@ export async function testEnvironment(
 
   const envConfig = parseObject(config.env);
   const env: Record<string, string> = {};
-  for (const [key, value] of Object.entries(envConfig)) {
-    if (typeof value === "string") env[key] = value;
-  }
+  applyConfiguredChildEnv(env, envConfig);
   const runtimeEnv = ensurePathInEnv({ ...process.env, ...env });
   const installCheck = await maybeRunSandboxInstallCommand({
     runId,

@@ -4,6 +4,7 @@ import type {
   AdapterEnvironmentTestResult,
 } from "@paperclipai/adapter-utils";
 import {
+  applyConfiguredChildEnv,
   asNumber,
   asString,
   asStringArray,
@@ -56,14 +57,6 @@ function summarizeProbeDetail(stdout: string, stderr: string, parsedError: strin
   return clean.length > max ? `${clean.slice(0, max - 3)}...` : clean;
 }
 
-function normalizeEnv(input: unknown): Record<string, string> {
-  if (typeof input !== "object" || input === null || Array.isArray(input)) return {};
-  const env: Record<string, string> = {};
-  for (const [key, value] of Object.entries(input as Record<string, unknown>)) {
-    if (typeof value === "string") env[key] = value;
-  }
-  return env;
-}
 
 const GROK_AUTH_REQUIRED_RE =
   /(?:not\s+logged\s+in|login\s+required|run\s+`?grok\s+login`?|authentication\s+required|unauthorized|invalid\s+credentials)/i;
@@ -150,7 +143,8 @@ export async function testEnvironment(
     });
   }
 
-  const env = normalizeEnv(config.env);
+  const env: Record<string, string> = {};
+  applyConfiguredChildEnv(env, parseObject(config.env));
   let stagedHome: string | undefined;
   let runtimeWorkspaceLocalDir: string | undefined;
   let restore: (() => Promise<void>) | undefined;

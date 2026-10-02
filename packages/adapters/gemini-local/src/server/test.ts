@@ -5,6 +5,7 @@ import type {
   AdapterEnvironmentTestResult,
 } from "@paperclipai/adapter-utils";
 import {
+  applyConfiguredChildEnv,
   asBoolean,
   asNumber,
   asString,
@@ -115,9 +116,7 @@ export async function testEnvironment(
 
   const envConfig = parseObject(config.env);
   const env: Record<string, string> = {};
-  for (const [key, value] of Object.entries(envConfig)) {
-    if (typeof value === "string") env[key] = value;
-  }
+  applyConfiguredChildEnv(env, envConfig);
   if (targetIsRemote && typeof env.GEMINI_CLI_TRUST_WORKSPACE !== "string") {
     env.GEMINI_CLI_TRUST_WORKSPACE = "true";
   }

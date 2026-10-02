@@ -13,7 +13,7 @@ async function runProbeFixture(options: { failCleanup?: boolean; error?: string 
   const command = path.join(root, "codex");
   await fs.writeFile(command, `#!${process.execPath}
 const fs = require('node:fs');
-fs.writeFileSync(process.env.PROBE_CAPTURE, JSON.stringify({ args: process.argv.slice(2), home: process.env.CODEX_HOME }));
+fs.writeFileSync(process.env.PROBE_CAPTURE, JSON.stringify({ args: process.argv.slice(2), home: process.env.CODEX_HOME, hostSecretPresent: !!process.env.UNRELATED_SERVICE_SECRET, configMarkerPresent: !!process.env.PAPERCLIP_CHILD_ENV_CONFIG_KEYS }));
 console.error('WARN codex_core_plugins::manager: remote installed plugin bundle sync failed error=chatgpt authentication required for remote plugin catalog');
 const error = process.env.PROBE_ERROR;
 if (error) { console.error(error); process.exit(1); }
@@ -29,10 +29,11 @@ console.log(JSON.stringify({type:'turn.completed',usage:{input_tokens:1,output_t
       companyId: "company-1", adapterType: "codex_local",
       config: { engine: "cli", command, cwd: root, env: {
         OPENAI_API_KEY: "fixture-key", PROBE_CAPTURE: capture,
+        PAPERCLIP_CHILD_ENV_CONFIG_KEYS: "UNRELATED_SERVICE_SECRET",
         PROBE_ERROR: options.error ?? "", PATH: `${root}${path.delimiter}${process.env.PATH ?? ""}`,
       } },
     });
-    return { result, capture: JSON.parse(await fs.readFile(capture, "utf8")) as { args: string[]; home: string } };
+    return { result, capture: JSON.parse(await fs.readFile(capture, "utf8")) as { args: string[]; home: string; hostSecretPresent: boolean; configMarkerPresent: boolean } };
   } finally {
     const recorded = await fs.readFile(capture, "utf8").then(JSON.parse).catch(() => null);
     if (recorded?.home) await fs.rm(recorded.home, { recursive: true, force: true });
@@ -47,6 +48,14 @@ describe("codex_local environment diagnostics", () => {
   afterEach(() => {
     vi.unstubAllEnvs();
   });
+  itPosix("preserves configured probe variables without admitting ambient secrets or a forged config marker", async () => {
+    vi.stubEnv("UNRELATED_SERVICE_SECRET", "fixture-host-only");
+    const { result, capture } = await runProbeFixture();
+    expect(result.status).toBe("pass");
+    expect(capture.hostSecretPresent).toBe(false);
+    expect(capture.configMarkerPresent).toBe(false);
+  });
+
   itPosix("preserves a successful hello when probe cleanup races a background writer", async () => {
     const { result } = await runProbeFixture({ failCleanup: true });
     expect(result.status).toBe("pass");
